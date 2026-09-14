@@ -752,8 +752,14 @@ fn read_keychain_access_token(budget: Duration) -> Option<String> {
 }
 
 /// Return stdout if `command` exits successfully within `budget`. A timeout
-/// kills the child so a Keychain ACL prompt cannot block the caller.
+/// kills the process group so a Keychain ACL prompt (or a helper it started)
+/// cannot block the caller.
 fn run_command_with_deadline(command: &mut Command, budget: Duration) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = thread::spawn(move || {
@@ -769,8 +775,7 @@ fn run_command_with_deadline(command: &mut Command, budget: Duration) -> Option<
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < budget => thread::sleep(Duration::from_millis(20)),
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_command(&mut child);
                 let _ = reader.join();
                 return None;
             }
@@ -778,6 +783,15 @@ fn run_command_with_deadline(command: &mut Command, budget: Duration) -> Option<
     };
     let stdout = reader.join().ok()?;
     status.success().then_some(stdout)
+}
+
+fn terminate_command(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Only an OAuth account login has a subscription. An API-key login bills
@@ -1098,7 +1112,7 @@ mod tests {
     fn a_keychain_prompt_that_does_not_return_is_abandoned() {
         let dir = tempdir().unwrap();
         let stub = dir.path().join("security-stub");
-        fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
