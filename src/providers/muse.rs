@@ -4,8 +4,10 @@
 //! `$XDG_CONFIG_HOME/muse/auth.json`, or `$MUSE_AUTH_PATH`, the same order its
 //! launcher uses). A `storage: "keychain"` login (typical macOS `muse login`)
 //! keeps the OAuth token out of that file; the collector then reads the CLI's
-//! own Keychain item through `security find-generic-password`, with a short
-//! deadline so a prompt cannot stall a refresh. A successful token is kept
+//! own Keychain item through `security find-generic-password`. Background
+//! processes never prompt: without a recorded approval marker the keychain
+//! branch is skipped outright, and the user approves once via
+//! `refresh --provider muse --keychain-approve`. A successful token is kept
 //! in-process so a watch pulse does not prompt Keychain for every Muse pane;
 //! a failed lookup is not remembered. The quota is the `subs_usage`
 //! block of the same `POST https://api.meta.ai/muse-code/key` call the CLI
@@ -736,11 +738,15 @@ fn set_keychain_approve_attempt_for_test(value: bool) {
 }
 
 /// Marker proving a keychain read succeeded at least once — i.e. macOS trusts
-/// this lookup and future reads return instantly without prompting.
+/// this lookup and future reads return instantly without prompting. Anchored
+/// beside the Muse config dir, not the plugin state dir: `CacheStore::from_env`
+/// resolves differently under `HERDR_PLUGIN_STATE_DIR` (herdr hooks) versus a
+/// plain terminal (where the user runs `--keychain-approve`), and a marker only
+/// one side can see splits the approval. `muse_config_dir()` is env-stable.
 fn keychain_approval_marker() -> Option<PathBuf> {
-    CacheStore::from_env()
+    muse_config_dir()
         .ok()
-        .map(|cache| cache.root().join(".muse-keychain-approved"))
+        .map(|dir| dir.join(".herdr-keychain-approved"))
 }
 
 /// The approval marker's mtime, for the credential cache key: creating the
@@ -762,17 +768,16 @@ fn keychain_approval_mtime() -> Option<u64> {
 /// every success would invalidate the cache on every poll.
 fn record_keychain_approval() {
     if let Some(marker) = keychain_approval_marker() {
-        if !marker.exists() {
-            let _ = fs::write(marker, CacheStore::now_unix().to_string());
+        // `create_new` so two concurrent approvers cannot race a partial
+        // write; the content is idempotent either way.
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            use std::io::Write;
+            let _ = write!(file, "{}", CacheStore::now_unix());
         }
-    }
-}
-
-/// Revoke the approval marker. A failed read means macOS no longer trusts
-/// the lookup, so the next one would only prompt again.
-fn clear_keychain_approval() {
-    if let Some(marker) = keychain_approval_marker() {
-        let _ = fs::remove_file(marker);
     }
 }
 
@@ -839,13 +844,7 @@ fn invalidate_credentials() {
 /// keychain helper override, so a cached result never outlives the stub it
 /// was read with, plus the approval marker's mtime, so recording an
 /// approval invalidates a cached skip.
-type CredentialCacheKey = (
-    PathBuf,
-    u64,
-    u64,
-    Option<std::ffi::OsString>,
-    Option<u64>,
-);
+type CredentialCacheKey = (PathBuf, u64, u64, Option<std::ffi::OsString>, Option<u64>);
 
 static CREDENTIAL_CACHE: LazyLock<Mutex<Option<(CredentialCacheKey, MuseCredentials)>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -854,19 +853,27 @@ static CREDENTIAL_CACHE: LazyLock<Mutex<Option<(CredentialCacheKey, MuseCredenti
 /// a human-scale budget, then record the marker only if the grant provably
 /// stuck. A one-time Allow also succeeds — but recording it would poison
 /// the daemon into re-prompting, so a slow success works for this run only
-/// and says so.
+/// and says so. A failed attempt never clears an existing marker: deny and
+/// timeout are indistinguishable, and a transient failure must not revoke a
+/// grant that already worked.
+///
+/// The `eprintln!` calls are a deliberate exception to the provider layer's
+/// no-printing convention: this path only runs under an explicit CLI flag
+/// with a human watching, and the approval flow needs progress output.
 fn approve_keychain_interactive() -> Option<MuseCredentials> {
-    if std::io::stderr().is_terminal() {
-        eprintln!(
-            "muse: macOS will prompt for keychain access — click Always Allow (not Allow). You have up to 5 minutes."
-        );
+    // No human can see the prompt or the guidance without a terminal —
+    // refuse rather than burn the 300s budget on a read nobody can approve.
+    // Tests stub `security` and have no tty, so the check is skipped there.
+    #[cfg(not(test))]
+    if !std::io::stderr().is_terminal() {
+        return None;
     }
+    eprintln!(
+        "muse: macOS will prompt for keychain access — click Always Allow (not Allow). You have up to 5 minutes."
+    );
     let started = Instant::now();
     let Some(access_token) = read_keychain_access_token(KEYCHAIN_APPROVE_BUDGET) else {
-        clear_keychain_approval();
-        if std::io::stderr().is_terminal() {
-            eprintln!("muse: keychain approval denied or timed out — no changes made.");
-        }
+        eprintln!("muse: keychain approval denied or timed out — no changes made.");
         return None;
     };
     let credentials = MuseCredentials { access_token };
@@ -874,25 +881,19 @@ fn approve_keychain_interactive() -> Option<MuseCredentials> {
         // No prompt appeared: a persistent grant already covers this
         // lookup, so future background reads are safe to attempt.
         record_keychain_approval();
-        if std::io::stderr().is_terminal() {
-            eprintln!("muse: keychain approval recorded — future refreshes won't prompt.");
-        }
+        eprintln!("muse: keychain approval recorded — future refreshes won't prompt.");
         return Some(credentials);
     }
     // A prompt was handled; only a second instant read proves Always Allow
     // stuck. If this one prompts, the first was one-time — let it expire.
-    if std::io::stderr().is_terminal() {
-        eprintln!("muse: verifying the grant stuck (no prompt expected)...");
-    }
+    eprintln!("muse: verifying the grant stuck (no prompt expected)...");
     let verified = Instant::now();
     if read_keychain_access_token(KEYCHAIN_COMMAND_BUDGET).is_some()
         && verified.elapsed() < KEYCHAIN_NO_PROMPT_THRESHOLD
     {
         record_keychain_approval();
-        if std::io::stderr().is_terminal() {
-            eprintln!("muse: Always Allow confirmed — future refreshes won't prompt.");
-        }
-    } else if std::io::stderr().is_terminal() {
+        eprintln!("muse: Always Allow confirmed — future refreshes won't prompt.");
+    } else {
         eprintln!(
             "muse: that approval didn't stick (one-time Allow?). Continuing with one-time access; re-run with --keychain-approve and click Always Allow to stop future prompts."
         );
@@ -916,23 +917,26 @@ fn read_credentials_uncached(path: &Path) -> std::result::Result<MuseCredentials
                     // No prompt from background processes, ever: without a
                     // recorded approval the lookup would only flash a prompt
                     // no human can approve inside of the background budget.
+                    // The skip is a distinct error — not MissingCredentials —
+                    // so `resolve_subscription` propagates it and refresh
+                    // keeps the last-good snapshot instead of overwriting it
+                    // with an empty one.
                     if std::io::stderr().is_terminal() {
                         eprintln!(
                             "muse: macOS Keychain approval needed — run `herdr-agent-quota refresh --provider muse --keychain-approve` and click Always Allow (not Allow) on the prompt."
                         );
                     }
-                    return Err(error);
+                    return Err(ProviderError::Unavailable(
+                        "macOS Keychain approval needed — run `herdr-agent-quota refresh --provider muse --keychain-approve`".to_string(),
+                    ));
                 }
                 match read_keychain_access_token(KEYCHAIN_COMMAND_BUDGET) {
                     Some(access_token) => Ok(MuseCredentials { access_token }),
-                    None => {
-                        // Distrust (or a missed prompt) revokes the marker:
-                        // at most one prompt-flash per episode, then
-                        // background reads skip silently again until the user
-                        // re-approves.
-                        clear_keychain_approval();
-                        Err(error)
-                    }
+                    // A failed read — timeout, hiccup, or an explicit Deny —
+                    // is indistinguishable here, so the marker stays: the
+                    // next poll retries, and a transient failure cannot
+                    // permanently de-authorize background reads.
+                    None => Err(error),
                 }
             } else {
                 Err(error)
@@ -1179,6 +1183,29 @@ mod tests {
         LOCK.lock().unwrap_or_else(|error| error.into_inner())
     }
 
+    /// Point `muse_config_dir` at a tempdir and return the approval marker's
+    /// path inside it. The marker lives beside the Muse config dir (not the
+    /// plugin state dir), so tests drive it through `XDG_CONFIG_HOME`.
+    fn keychain_marker_in(config_home: &std::path::Path) -> PathBuf {
+        std::env::set_var("XDG_CONFIG_HOME", config_home);
+        config_home.join("muse").join(".herdr-keychain-approved")
+    }
+
+    /// Reset `KEYCHAIN_APPROVE_ATTEMPT` on drop so a panicking test cannot
+    /// leak a 300s-budget approval attempt into the next test.
+    struct KeychainApproveGuard;
+    impl KeychainApproveGuard {
+        fn new(value: bool) -> Self {
+            set_keychain_approve_attempt_for_test(value);
+            Self
+        }
+    }
+    impl Drop for KeychainApproveGuard {
+        fn drop(&mut self) {
+            set_keychain_approve_attempt_for_test(false);
+        }
+    }
+
     fn power_fixture() -> Value {
         serde_json::from_str(include_str!(
             "../../tests/fixtures/muse/subscription-power.json"
@@ -1314,9 +1341,10 @@ mod tests {
     fn a_keychain_login_reads_its_token_from_the_keychain() {
         let _guard = security_env_guard();
         set_keychain_approve_attempt_for_test(false);
-        let state = tempdir().unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state.path());
-        fs::write(state.path().join(".muse-keychain-approved"), "1").unwrap();
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "1").unwrap();
         let dir = tempdir().unwrap();
         let stub = dir.path().join("security-stub");
         fs::write(
@@ -1343,10 +1371,7 @@ mod tests {
         );
         // A success must not rewrite the marker: its mtime is cache-key
         // material, and churning it would re-run `security` every poll.
-        assert_eq!(
-            fs::read_to_string(state.path().join(".muse-keychain-approved")).unwrap(),
-            "1"
-        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "1");
 
         let file_auth = dir.path().join("auth-file.json");
         fs::write(
@@ -1359,7 +1384,7 @@ mod tests {
             read_credentials(&file_auth),
             Err(ProviderError::MissingCredentials)
         ));
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     /// A failed `security` lookup must not stick: the first call is allowed to
@@ -1369,6 +1394,10 @@ mod tests {
     fn a_failed_keychain_lookup_is_retried_and_a_success_is_reused() {
         let _guard = security_env_guard();
         invalidate_credentials();
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "1").unwrap();
         let dir = tempdir().unwrap();
         let count = dir.path().join("calls");
         let stub = dir.path().join("security-stub");
@@ -1420,7 +1449,7 @@ mod tests {
             "cached-token"
         );
         std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
-        assert_eq!(fs::read_to_string(&count).unwrap().trim(), "3");
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
@@ -1446,8 +1475,8 @@ mod tests {
     fn keychain_reads_are_skipped_without_an_approval() {
         let _guard = security_env_guard();
         set_keychain_approve_attempt_for_test(false);
-        let state = tempdir().unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state.path());
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
         let dir = tempdir().unwrap();
         let log = dir.path().join("calls.log");
         let stub = dir.path().join("security-stub");
@@ -1471,14 +1500,16 @@ mod tests {
             r#"{"providers":{"meta":{"mechanism":"oauth","storage":"keychain"}}}"#,
         )
         .unwrap();
+        // The skip is a distinct error, not MissingCredentials, so refresh
+        // keeps the last-good snapshot instead of overwriting it with empty.
         assert!(matches!(
             read_credentials(&auth),
-            Err(ProviderError::MissingCredentials)
+            Err(ProviderError::Unavailable(_))
         ));
         assert!(!log.exists());
-        assert!(!state.path().join(".muse-keychain-approved").exists());
+        assert!(!marker.exists());
         std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     /// An explicit approval attempt runs the lookup and records the marker,
@@ -1486,9 +1517,10 @@ mod tests {
     #[test]
     fn a_keychain_approve_attempt_records_its_approval() {
         let _guard = security_env_guard();
-        set_keychain_approve_attempt_for_test(true);
-        let state = tempdir().unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state.path());
+        let _approve = KeychainApproveGuard::new(true);
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
         let dir = tempdir().unwrap();
         let stub = dir.path().join("security-stub");
         fs::write(
@@ -1512,23 +1544,22 @@ mod tests {
             read_credentials(&auth).unwrap().access_token,
             "keychain-token"
         );
-        let marker = state.path().join(".muse-keychain-approved");
         assert!(marker.exists());
         assert!(fs::read_to_string(&marker).unwrap().parse::<u64>().is_ok());
         std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
-        set_keychain_approve_attempt_for_test(false);
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
-    /// A failed lookup revokes the marker: the next background read skips
-    /// instead of flashing another prompt.
+    /// A failed lookup keeps the marker: a timeout, a hiccup, and an explicit
+    /// Deny are indistinguishable here, so a transient failure must not
+    /// permanently de-authorize background reads. The next poll retries.
     #[test]
-    fn a_failed_keychain_read_clears_its_approval() {
+    fn a_failed_keychain_read_keeps_its_approval() {
         let _guard = security_env_guard();
         set_keychain_approve_attempt_for_test(false);
-        let state = tempdir().unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state.path());
-        let marker = state.path().join(".muse-keychain-approved");
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
         fs::write(&marker, "1").unwrap();
         let dir = tempdir().unwrap();
         let stub = dir.path().join("security-stub");
@@ -1549,9 +1580,9 @@ mod tests {
             read_credentials(&auth),
             Err(ProviderError::MissingCredentials)
         ));
-        assert!(!marker.exists());
+        assert!(marker.exists());
         std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     /// Recording an approval invalidates the cached skip: the daemon picks
@@ -1560,8 +1591,8 @@ mod tests {
     fn recording_an_approval_invalidates_the_cached_skip() {
         let _guard = security_env_guard();
         set_keychain_approve_attempt_for_test(false);
-        let state = tempdir().unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state.path());
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
         let dir = tempdir().unwrap();
         let log = dir.path().join("calls.log");
         let stub = dir.path().join("security-stub");
@@ -1587,25 +1618,27 @@ mod tests {
         .unwrap();
         assert!(matches!(
             read_credentials(&auth),
-            Err(ProviderError::MissingCredentials)
+            Err(ProviderError::Unavailable(_))
         ));
-        fs::write(state.path().join(".muse-keychain-approved"), "1").unwrap();
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, "1").unwrap();
         assert_eq!(
             read_credentials(&auth).unwrap().access_token,
             "keychain-token"
         );
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
         std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
     /// A slow approval (a prompt was handled) records the marker only after
     /// a second instant read proves the grant stuck.
     #[test]
     fn a_slow_approval_verifies_before_recording() {
         let _guard = security_env_guard();
-        set_keychain_approve_attempt_for_test(true);
-        let state = tempdir().unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state.path());
+        let _approve = KeychainApproveGuard::new(true);
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
         let dir = tempdir().unwrap();
         let log = dir.path().join("calls.log");
         let flag = dir.path().join("slow-once.flag");
@@ -1636,11 +1669,10 @@ mod tests {
             read_credentials(&auth).unwrap().access_token,
             "keychain-token"
         );
-        assert!(state.path().join(".muse-keychain-approved").exists());
+        assert!(marker.exists());
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 2);
         std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
-        set_keychain_approve_attempt_for_test(false);
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     /// A one-time approval works for that run but records nothing: a marker
@@ -1648,9 +1680,9 @@ mod tests {
     #[test]
     fn a_one_time_approval_works_for_that_run_only() {
         let _guard = security_env_guard();
-        set_keychain_approve_attempt_for_test(true);
-        let state = tempdir().unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", state.path());
+        let _approve = KeychainApproveGuard::new(true);
+        let config_home = tempdir().unwrap();
+        let marker = keychain_marker_in(config_home.path());
         let dir = tempdir().unwrap();
         let flag = dir.path().join("slow-once.flag");
         let stub = dir.path().join("security-stub");
@@ -1679,10 +1711,9 @@ mod tests {
             read_credentials(&auth).unwrap().access_token,
             "keychain-token"
         );
-        assert!(!state.path().join(".muse-keychain-approved").exists());
+        assert!(!marker.exists());
         std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
-        set_keychain_approve_attempt_for_test(false);
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]

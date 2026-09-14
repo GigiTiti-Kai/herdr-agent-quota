@@ -15,10 +15,11 @@ OMP quota through its usage CLI. OMP's credential database is never opened.
 Local SQLite reads are read-only and limited to session/model data. On macOS, a
 Muse Code `storage: "keychain"` login has no token in `auth.json`; the collector
 reads only the CLI's own Keychain item (`ai.meta.dev.credentials` / `meta`)
-through `security find-generic-password`, with a short deadline so a Keychain
-prompt cannot stall a refresh. A successful token is kept in the process until
-that file changes or the quota API rejects it; it is never written to plugin
-state.
+through `security find-generic-password`. Background processes never prompt:
+without a recorded approval marker the keychain branch is skipped outright, and
+the user approves once via `refresh --provider muse --keychain-approve`. A
+successful token is kept in the process until that file changes or the quota
+API rejects it; it is never written to plugin state.
 
 Authenticated quota requests use the relevant CLI/provider's usage contract.
 The plugin sends no model prompts and does not upload usage to another service.
