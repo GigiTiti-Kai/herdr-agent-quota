@@ -682,7 +682,60 @@ fn read_bounded_json(path: &Path) -> Option<Value> {
 
 fn read_credentials(path: &Path) -> std::result::Result<MuseCredentials, ProviderError> {
     let value = read_bounded_json(path).ok_or(ProviderError::MissingCredentials)?;
-    credentials_from_auth(&value)
+    match credentials_from_auth(&value) {
+        Ok(credentials) => Ok(credentials),
+        Err(error) => {
+            // `storage: "keychain"` logins keep the OAuth token out of the
+            // file entirely; the CLI reads it from macOS Keychain instead.
+            if auth_uses_keychain(&value) {
+                keychain_access_token()
+                    .map(|access_token| MuseCredentials { access_token })
+                    .ok_or(error)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Whether the auth file declares `providers.meta.storage: "keychain"`.
+fn auth_uses_keychain(value: &Value) -> bool {
+    value
+        .get("providers")
+        .and_then(|providers| providers.get("meta"))
+        .and_then(|meta| meta.get("storage"))
+        .and_then(Value::as_str)
+        == Some("keychain")
+}
+
+/// The OAuth token for a `storage: "keychain"` login, from the item the CLI
+/// itself writes (`ai.meta.dev.credentials`, account `meta`). `security(1)`
+/// is the documented interface — no keychain crate, and on platforms without
+/// it the command simply fails and the login reports as missing.
+fn keychain_access_token() -> Option<String> {
+    let executable = std::env::var_os("HERDR_AGENT_QUOTA_SECURITY_BIN")
+        .unwrap_or_else(|| "security".into());
+    let output = std::process::Command::new(executable)
+        .args([
+            "find-generic-password",
+            "-s",
+            "ai.meta.dev.credentials",
+            "-a",
+            "meta",
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
 }
 
 /// Only an OAuth account login has a subscription. An API-key login bills
@@ -937,6 +990,61 @@ mod tests {
         fs::write(&big, vec![b' '; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
         assert!(matches!(
             read_credentials(&big),
+            Err(ProviderError::MissingCredentials)
+        ));
+    }
+
+    #[test]
+    fn only_a_keychain_storage_declaration_reads_the_keychain() {
+        for (value, expected) in [
+            (json!({"providers": {"meta": {"storage": "keychain"}}}), true),
+            (json!({"providers": {"meta": {"storage": "file"}}}), false),
+            (json!({"providers": {"meta": {}}}), false),
+            (json!({"providers": {}}), false),
+        ] {
+            assert_eq!(auth_uses_keychain(&value), expected);
+        }
+    }
+
+    /// The whole keychain path, against a `security` stub that answers with a
+    /// token payload: a keychain-storage auth file with no inline token has to
+    /// resolve through the keychain, and a file-storage one must not.
+    #[test]
+    fn a_keychain_login_reads_its_token_from_the_keychain() {
+        let dir = tempdir().unwrap();
+        let stub = dir.path().join("security-stub");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s' '{\"access_token\":\" keychain-token \"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("HERDR_AGENT_QUOTA_SECURITY_BIN", &stub);
+
+        let keychain_auth = dir.path().join("auth.json");
+        fs::write(
+            &keychain_auth,
+            r#"{"providers":{"meta":{"mechanism":"oauth","storage":"keychain"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_credentials(&keychain_auth).unwrap().access_token,
+            "keychain-token"
+        );
+
+        let file_auth = dir.path().join("auth-file.json");
+        fs::write(
+            &file_auth,
+            r#"{"providers":{"meta":{"mechanism":"oauth","storage":"file"}}}"#,
+        )
+        .unwrap();
+        std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
+        assert!(matches!(
+            read_credentials(&file_auth),
             Err(ProviderError::MissingCredentials)
         ));
     }
