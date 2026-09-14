@@ -31,8 +31,9 @@ pub enum Command {
         /// Approve macOS Keychain access for Muse interactively (one-time).
         ///
         /// Without a recorded approval, background reads skip the keychain
-        /// silently instead of prompting. Run once in a terminal and approve
-        /// the macOS prompt; afterwards all refreshes work unattended.
+        /// silently instead of prompting. Run once in a terminal and click
+        /// Always Allow (not Allow) on the macOS prompt; afterwards all
+        /// refreshes work unattended.
         #[arg(long)]
         keychain_approve: bool,
     },
