@@ -149,15 +149,18 @@ environment, never anything else from it. A session Herdr does report always
 wins. No `/proc` (macOS) means no session, never a guessed one.
 
 The quota call (`muse-code/key`) also returns the account's API key and
-identity. Only `subs_usage` is read. A `storage: "keychain"` login keeps the
 OAuth token out of `auth.json`; the collector then reads that one item through
 `security find-generic-password` (service `ai.meta.dev.credentials`, account
-`meta`) with a short deadline. A successful token is kept in the watch process
-until the auth file's identity changes or `muse-code/key` returns 401/403; a
-failed lookup is not cached, so a prompt that timed out is retried on the next
-refresh. A missing `security`, a prompt that does not complete, or any other
-failure is missing credentials. Only `access_token` is taken from the payload;
-file-storage logins are unchanged. No stored account
+`meta`). Background processes never prompt: without a recorded approval marker
+the keychain branch is skipped outright, and the user approves once via
+`refresh --provider muse --keychain-approve` (click **Always Allow**, not
+Allow). The marker lives beside the Muse config dir so every process — herdr
+hook, daemon, or plain terminal — resolves the same path. A successful token
+is kept in the watch process until the auth file's identity changes or
+`muse-code/key` returns 401/403; a failed lookup is not cached and does not
+clear the marker, so a transient failure retries on the next refresh. Only
+`access_token` is taken from the payload; file-storage logins are unchanged.
+No stored account
 login (an API-key login) or an inactive subscription yields a snapshot without
 windows, but only while a Muse session is refreshed, so its local fields still
 publish. A rejected token or failed request stays an error, which keeps the

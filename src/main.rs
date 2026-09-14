@@ -9,7 +9,20 @@ fn main() -> Result<()> {
             provider,
             force,
             json,
-        } => herdr_agent_quota::refresh::run(&provider.providers(), force, json),
+            keychain_approve,
+        } => {
+            if keychain_approve {
+                let providers = provider.providers();
+                if !providers.contains(&herdr_agent_quota::model::Provider::Muse) {
+                    anyhow::bail!(
+                        "--keychain-approve only applies to muse; run `refresh --provider muse --keychain-approve`"
+                    );
+                }
+                herdr_agent_quota::providers::muse::set_keychain_approve_attempt();
+                return herdr_agent_quota::refresh::run(&providers, force, json);
+            }
+            herdr_agent_quota::refresh::run(&provider.providers(), force, json)
+        }
         Command::Watch {
             provider,
             interval_seconds,

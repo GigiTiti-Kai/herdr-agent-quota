@@ -125,7 +125,7 @@ turn failures into zero usage.
 | Claude/Agy quota is missing | Send a turn so the session's StatusLine produces an observation |
 | OMP quota is missing | Check `omp usage --json --redact --provider <id>` |
 | Devin quota is missing | Check the CLI login and `DEVIN_CREDENTIALS_FILE` if customized |
-| Muse quota is missing | Run `muse login` (API-key logins have no subscription quota); check `MUSE_AUTH_PATH` if customized |
+| Muse quota is missing | Run `muse login` (API-key logins have no subscription quota); check `MUSE_AUTH_PATH` if customized. On macOS, a `storage: "keychain"` login also needs a one-time Keychain approval: run `herdr-agent-quota refresh --provider muse --keychain-approve` and click **Always Allow** |
 | Rows are missing | Run the configure action below to repair managed configuration |
 | The `gauges` meter disappears on a narrow sidebar | Expected below ~24 columns; widen the sidebar and refresh |
 | `gauges` still uses the old width after a resize | Refresh with `prefix+shift+r`; there is no live resize publish path |
