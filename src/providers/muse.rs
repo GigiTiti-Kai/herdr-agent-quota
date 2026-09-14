@@ -5,7 +5,9 @@
 //! launcher uses). A `storage: "keychain"` login (typical macOS `muse login`)
 //! keeps the OAuth token out of that file; the collector then reads the CLI's
 //! own Keychain item through `security find-generic-password`, with a short
-//! deadline so a prompt cannot stall a refresh. The quota is the `subs_usage`
+//! deadline so a prompt cannot stall a refresh. A successful token is kept
+//! in-process so a watch pulse does not prompt Keychain for every Muse pane;
+//! a failed lookup is not remembered. The quota is the `subs_usage`
 //! block of the same `POST https://api.meta.ai/muse-code/key` call the CLI
 //! makes at startup and for its `/usage` panel. That call is idempotent for a
 //! signed-in account: it returns the key already stored for the login rather
@@ -45,8 +47,9 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const SUBSCRIPTION_URL: &str = "https://api.meta.ai/muse-code/key";
 /// The API version the Muse Code CLI sends with the same request.
@@ -103,7 +106,12 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
         // once before believing the login is gone.
         Err(ProviderError::MissingCredentials) => {
             invalidate_credentials();
-            resolve_subscription(read_credentials(&path), has_sessions, now, fetch_subscription)
+            resolve_subscription(
+                read_credentials(&path),
+                has_sessions,
+                now,
+                fetch_subscription,
+            )
         }
         result => result,
     }
@@ -707,9 +715,10 @@ fn read_bounded_json(path: &Path) -> Option<Value> {
 /// from this unsigned binary can trigger a macOS keychain ACL prompt. The
 /// watch daemon would otherwise prompt once per poll per pane — a storm the
 /// user cannot approve away. Caching keyed on the file's identity (path,
-/// mtime, length) bounds `security` to one call per daemon lifetime; a 401
-/// from the subscription API busts the cache once so a rotated token still
-/// self-heals (`fetch_for_sessions`).
+/// mtime, length) bounds `security` to one successful call per daemon
+/// lifetime; a 401 from the subscription API busts the cache once so a
+/// rotated token still self-heals (`fetch_for_sessions`). Failed lookups are
+/// not stored, so a Keychain prompt that timed out is retried next refresh.
 fn read_credentials(path: &Path) -> std::result::Result<MuseCredentials, ProviderError> {
     // The keychain helper binary is part of the lookup's identity: tests
     // stub it through the environment, and a cached result must not outlive
@@ -721,28 +730,26 @@ fn read_credentials(path: &Path) -> std::result::Result<MuseCredentials, Provide
             metadata
                 .modified()
                 .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
                 .ok()?
                 .as_secs(),
             metadata.len(),
             security_bin.clone(),
         ))
     });
-    let mut cache = CREDENTIAL_CACHE.lock();
+    let mut cache = CREDENTIAL_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Some((cached_key, credentials)) = cache.as_ref() {
         if Some(cached_key) == key.as_ref() {
-            return credentials
-                .clone()
-                .map_err(|_| ProviderError::MissingCredentials);
+            return Ok(credentials.clone());
         }
     }
+    // Hold the lock across the uncached lookup so two panes in one pass
+    // cannot each spawn `security` and each raise a Keychain prompt.
     let credentials = read_credentials_uncached(path);
-    if let Some(key) = key {
-        let storable = match &credentials {
-            Ok(credentials) => Ok(credentials.clone()),
-            Err(_) => Err(()),
-        };
-        *cache = Some((key, storable));
+    if let (Some(key), Ok(credentials)) = (key, &credentials) {
+        *cache = Some((key, credentials.clone()));
     }
     credentials
 }
@@ -750,21 +757,17 @@ fn read_credentials(path: &Path) -> std::result::Result<MuseCredentials, Provide
 /// Forget the cached credentials so the next read re-runs the keychain
 /// lookup. Called when the subscription API rejects the cached token.
 fn invalidate_credentials() {
-    *CREDENTIAL_CACHE.lock() = None;
+    *CREDENTIAL_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
-static CREDENTIAL_CACHE: std::sync::LazyLock<
-    parking_lot::Mutex<
-        Option<(
-            (std::path::PathBuf, u64, u64, Option<std::ffi::OsString>),
-            std::result::Result<MuseCredentials, ()>,
-        )>,
-    >,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+type CredentialCacheKey = (PathBuf, u64, u64, Option<std::ffi::OsString>);
 
-fn read_credentials_uncached(
-    path: &Path,
-) -> std::result::Result<MuseCredentials, ProviderError> {
+static CREDENTIAL_CACHE: LazyLock<Mutex<Option<(CredentialCacheKey, MuseCredentials)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn read_credentials_uncached(path: &Path) -> std::result::Result<MuseCredentials, ProviderError> {
     let value = read_bounded_json(path).ok_or(ProviderError::MissingCredentials)?;
     match credentials_from_auth(&value) {
         Ok(credentials) => Ok(credentials),
@@ -1150,6 +1153,7 @@ mod tests {
     /// The whole keychain path, against a `security` stub that answers with a
     /// token payload: a keychain-storage auth file with no inline token has to
     /// resolve through the keychain, and a file-storage one must not.
+    #[test]
     fn a_keychain_login_reads_its_token_from_the_keychain() {
         let _guard = security_env_guard();
         let dir = tempdir().unwrap();
@@ -1188,6 +1192,67 @@ mod tests {
             read_credentials(&file_auth),
             Err(ProviderError::MissingCredentials)
         ));
+    }
+
+    /// A failed `security` lookup must not stick: the first call is allowed to
+    /// miss (a Keychain prompt that timed out), the next refresh has to try
+    /// again, and only a successful token is reused without spawning.
+    #[test]
+    fn a_failed_keychain_lookup_is_retried_and_a_success_is_reused() {
+        let _guard = security_env_guard();
+        invalidate_credentials();
+        let dir = tempdir().unwrap();
+        let count = dir.path().join("calls");
+        let stub = dir.path().join("security-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 count_file='{count}'\n\
+                 n=0\n\
+                 [ -f \"$count_file\" ] && n=$(cat \"$count_file\")\n\
+                 n=$((n + 1))\n\
+                 printf '%s\\n' \"$n\" > \"$count_file\"\n\
+                 [ \"$n\" -eq 1 ] && exit 1\n\
+                 printf '%s' '{{\"access_token\":\"cached-token\"}}'\n",
+                count = count.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("HERDR_AGENT_QUOTA_SECURITY_BIN", &stub);
+
+        let auth = dir.path().join("auth.json");
+        fs::write(
+            &auth,
+            r#"{"providers":{"meta":{"mechanism":"oauth","storage":"keychain"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_credentials(&auth),
+            Err(ProviderError::MissingCredentials)
+        ));
+        assert_eq!(
+            read_credentials(&auth).unwrap().access_token,
+            "cached-token"
+        );
+        assert_eq!(
+            read_credentials(&auth).unwrap().access_token,
+            "cached-token"
+        );
+        assert_eq!(fs::read_to_string(&count).unwrap().trim(), "2");
+
+        invalidate_credentials();
+        assert_eq!(
+            read_credentials(&auth).unwrap().access_token,
+            "cached-token"
+        );
+        std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
+        assert_eq!(fs::read_to_string(&count).unwrap().trim(), "3");
     }
 
     #[test]
