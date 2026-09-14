@@ -51,12 +51,21 @@ pub struct ProviderUsage {
 pub fn fetch(paths: &OmpPaths, provider_id: &str, now_unix: u64) -> Result<ProviderUsage> {
     let executable = std::env::var_os("HERDR_AGENT_QUOTA_OMP_BIN").unwrap_or_else(|| "omp".into());
     let mut command = Command::new(executable);
+    if let Some(profile) = profile_name(&paths.agent_dir) {
+        // omp isolates profiles under ~/.omp/profiles/<name>/agent and selects
+        // them with a global flag, not PI_CONFIG_DIR. Without it `omp usage`
+        // answers from the default profile's credential store — which may not
+        // hold this pane's account at all.
+        command.args(["--profile", &profile]);
+    }
     command.args(["usage", "--json", "--provider", provider_id]);
-    if let Some(config_dir) = config_dir_override(&paths.agent_dir) {
-        // A plugin action runs in Herdr's environment, so the pane's own
-        // `PI_CONFIG_DIR` or `--profile` never reaches us. Point omp back at
-        // the directory the transcript came from.
-        command.env("PI_CONFIG_DIR", config_dir);
+    if profile_name(&paths.agent_dir).is_none() {
+        if let Some(config_dir) = config_dir_override(&paths.agent_dir) {
+            // A plugin action runs in Herdr's environment, so the pane's own
+            // `PI_CONFIG_DIR` or `--profile` never reaches us. Point omp back at
+            // the directory the transcript came from.
+            command.env("PI_CONFIG_DIR", config_dir);
+        }
     }
     let output = command
         .output()
@@ -91,6 +100,28 @@ fn config_dir_override(agent_dir: &Path) -> Option<OsString> {
         return None;
     }
     (relative != Path::new(".omp")).then(|| relative.as_os_str().to_os_string())
+}
+
+/// The omp profile name for an agent directory under `~/.omp/profiles/`.
+///
+/// omp's own profile layout is fixed — `~/.omp/profiles/<name>/agent` — so a
+/// session path inside it identifies the profile exactly. Any other shape
+/// (the default `~/.omp/agent`, an XDG relocation, a directory outside home)
+/// returns `None` and the caller falls back to `PI_CONFIG_DIR` or omp's
+/// default resolution.
+fn profile_name(agent_dir: &Path) -> Option<String> {
+    if agent_dir.file_name()? != "agent" {
+        return None;
+    }
+    let profile = agent_dir.parent()?;
+    if profile.parent()?.file_name()? != "profiles" {
+        return None;
+    }
+    if profile.parent()?.parent()?.file_name()? != ".omp" {
+        return None;
+    }
+    let name = profile.file_name()?.to_str()?;
+    (!name.is_empty() && !name.chars().any(char::is_control)).then(|| name.to_string())
 }
 
 /// Read one provider's accounts out of an `omp usage --json` payload.
@@ -600,12 +631,38 @@ mod tests {
             sessions: dir.path().join(".omp/agent/sessions"),
         };
         let usage = fetch(&paths, "anthropic", 0).expect("usage");
-        std::env::remove_var("HERDR_AGENT_QUOTA_OMP_BIN");
         assert_eq!(usage.accounts.len(), 1);
         assert_eq!(
             std::fs::read_to_string(&arguments).unwrap().trim(),
             "usage --json --provider anthropic"
         );
+
+        // A profile agent dir selects the profile with a flag, not an env var.
+        let profile_paths = OmpPaths {
+            agent_dir: dir.path().join(".omp/profiles/work/agent"),
+            sessions: dir.path().join(".omp/profiles/work/agent/sessions"),
+        };
+        fetch(&profile_paths, "anthropic", 0).expect("usage");
+        std::env::remove_var("HERDR_AGENT_QUOTA_OMP_BIN");
+        assert_eq!(
+            std::fs::read_to_string(&arguments).unwrap().trim(),
+            "--profile work usage --json --provider anthropic"
+        );
+    }
+
+    #[test]
+    fn only_omps_profile_layout_yields_a_profile_name() {
+        let home = directories::BaseDirs::new()
+            .expect("home")
+            .home_dir()
+            .to_path_buf();
+        assert_eq!(
+            profile_name(&home.join(".omp/profiles/team-a/agent")),
+            Some("team-a".to_string())
+        );
+        assert_eq!(profile_name(&home.join(".omp/agent")), None);
+        assert_eq!(profile_name(Path::new("/srv/omp/agent")), None);
+        assert_eq!(profile_name(Path::new("/tmp/profiles/work/agent")), None);
     }
 
     #[test]
