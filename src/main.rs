@@ -9,7 +9,13 @@ fn main() -> Result<()> {
             provider,
             force,
             json,
-        } => herdr_agent_quota::refresh::run(&provider.providers(), force, json),
+            keychain_approve,
+        } => {
+            if keychain_approve {
+                herdr_agent_quota::providers::muse::set_keychain_approve_attempt();
+            }
+            herdr_agent_quota::refresh::run(&provider.providers(), force, json)
+        }
         Command::Watch {
             provider,
             interval_seconds,
