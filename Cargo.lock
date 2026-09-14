@@ -390,6 +390,7 @@ dependencies = [
  "crossterm",
  "directories",
  "libc",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",

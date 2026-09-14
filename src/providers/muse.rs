@@ -90,12 +90,23 @@ impl std::fmt::Debug for MuseCredentials {
 /// enrich the named sessions from their local transcripts.
 pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
     let path = auth_path().context("resolve Muse Code auth path")?;
-    let mut snapshot = resolve_subscription(
+    let has_sessions = !session_ids.is_empty();
+    let now = CacheStore::now_unix();
+    let mut snapshot = match resolve_subscription(
         read_credentials(&path),
-        !session_ids.is_empty(),
-        CacheStore::now_unix(),
+        has_sessions,
+        now,
         fetch_subscription,
-    )
+    ) {
+        // A 401/403 maps to MissingCredentials — with a cached keychain token
+        // that can mean the token rotated under us. Drop the cache and retry
+        // once before believing the login is gone.
+        Err(ProviderError::MissingCredentials) => {
+            invalidate_credentials();
+            resolve_subscription(read_credentials(&path), has_sessions, now, fetch_subscription)
+        }
+        result => result,
+    }
     .map_err(anyhow::Error::from)?
     .with_model(configured_model());
     if let Ok(data_dir) = muse_data_dir() {
@@ -690,7 +701,70 @@ fn read_bounded_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
+/// Credentials for the current auth file, cached in-process.
+///
+/// The keychain fallback below shells out to `security(1)`, and every call
+/// from this unsigned binary can trigger a macOS keychain ACL prompt. The
+/// watch daemon would otherwise prompt once per poll per pane — a storm the
+/// user cannot approve away. Caching keyed on the file's identity (path,
+/// mtime, length) bounds `security` to one call per daemon lifetime; a 401
+/// from the subscription API busts the cache once so a rotated token still
+/// self-heals (`fetch_for_sessions`).
 fn read_credentials(path: &Path) -> std::result::Result<MuseCredentials, ProviderError> {
+    // The keychain helper binary is part of the lookup's identity: tests
+    // stub it through the environment, and a cached result must not outlive
+    // the stub it was read with.
+    let security_bin = std::env::var_os("HERDR_AGENT_QUOTA_SECURITY_BIN");
+    let key = fs::metadata(path).ok().and_then(|metadata| {
+        Some((
+            path.to_path_buf(),
+            metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs(),
+            metadata.len(),
+            security_bin.clone(),
+        ))
+    });
+    let mut cache = CREDENTIAL_CACHE.lock();
+    if let Some((cached_key, credentials)) = cache.as_ref() {
+        if Some(cached_key) == key.as_ref() {
+            return credentials
+                .clone()
+                .map_err(|_| ProviderError::MissingCredentials);
+        }
+    }
+    let credentials = read_credentials_uncached(path);
+    if let Some(key) = key {
+        let storable = match &credentials {
+            Ok(credentials) => Ok(credentials.clone()),
+            Err(_) => Err(()),
+        };
+        *cache = Some((key, storable));
+    }
+    credentials
+}
+
+/// Forget the cached credentials so the next read re-runs the keychain
+/// lookup. Called when the subscription API rejects the cached token.
+fn invalidate_credentials() {
+    *CREDENTIAL_CACHE.lock() = None;
+}
+
+static CREDENTIAL_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<
+        Option<(
+            (std::path::PathBuf, u64, u64, Option<std::ffi::OsString>),
+            std::result::Result<MuseCredentials, ()>,
+        )>,
+    >,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+fn read_credentials_uncached(
+    path: &Path,
+) -> std::result::Result<MuseCredentials, ProviderError> {
     let value = read_bounded_json(path).ok_or(ProviderError::MissingCredentials)?;
     match credentials_from_auth(&value) {
         Ok(credentials) => Ok(credentials),
@@ -938,6 +1012,14 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    /// Serializes tests that mutate `HERDR_AGENT_QUOTA_SECURITY_BIN` — the
+    /// variable is process-global, and parallel tests would otherwise run
+    /// their `security` calls against each other's stubs.
+    fn security_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     fn power_fixture() -> Value {
         serde_json::from_str(include_str!(
             "../../tests/fixtures/muse/subscription-power.json"
@@ -1068,8 +1150,8 @@ mod tests {
     /// The whole keychain path, against a `security` stub that answers with a
     /// token payload: a keychain-storage auth file with no inline token has to
     /// resolve through the keychain, and a file-storage one must not.
-    #[test]
     fn a_keychain_login_reads_its_token_from_the_keychain() {
+        let _guard = security_env_guard();
         let dir = tempdir().unwrap();
         let stub = dir.path().join("security-stub");
         fs::write(
@@ -1110,6 +1192,7 @@ mod tests {
 
     #[test]
     fn a_keychain_prompt_that_does_not_return_is_abandoned() {
+        let _guard = security_env_guard();
         let dir = tempdir().unwrap();
         let stub = dir.path().join("security-stub");
         fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
