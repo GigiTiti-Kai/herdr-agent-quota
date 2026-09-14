@@ -753,10 +753,14 @@ fn keychain_approval_mtime() -> Option<u64> {
 }
 
 /// Record a successful keychain read. The content is the approval time, for
-/// debugging only; existence of the file is the signal.
+/// debugging only; existence of the file is the signal. Written once: the
+/// marker's mtime is part of the credential cache key, so re-writing it on
+/// every success would invalidate the cache on every poll.
 fn record_keychain_approval() {
     if let Some(marker) = keychain_approval_marker() {
-        let _ = fs::write(marker, CacheStore::now_unix().to_string());
+        if !marker.exists() {
+            let _ = fs::write(marker, CacheStore::now_unix().to_string());
+        }
     }
 }
 
@@ -1288,6 +1292,12 @@ mod tests {
         assert_eq!(
             read_credentials(&keychain_auth).unwrap().access_token,
             "keychain-token"
+        );
+        // A success must not rewrite the marker: its mtime is cache-key
+        // material, and churning it would re-run `security` every poll.
+        assert_eq!(
+            fs::read_to_string(state.path().join(".muse-keychain-approved")).unwrap(),
+            "1"
         );
 
         let file_auth = dir.path().join("auth-file.json");
