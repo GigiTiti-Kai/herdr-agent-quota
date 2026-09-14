@@ -149,10 +149,16 @@ environment, never anything else from it. A session Herdr does report always
 wins. No `/proc` (macOS) means no session, never a guessed one.
 
 The quota call (`muse-code/key`) also returns the account's API key and
-identity. Only `subs_usage` is read. No stored account login (an API-key
-login) or an inactive subscription yields a snapshot without windows, but only
-while a Muse session is refreshed, so its local fields still publish. A
-rejected token or failed request stays an error, which keeps the cached quota. Session-local fields come from the
+identity. Only `subs_usage` is read. A `storage: "keychain"` login keeps the
+OAuth token out of `auth.json`; the collector then reads that one item through
+`security find-generic-password` (service `ai.meta.dev.credentials`, account
+`meta`) with a short deadline. A missing `security`, a prompt that does not
+complete, or any other failure is missing credentials. Only `access_token` is
+taken from the payload; file-storage logins are unchanged. No stored account
+login (an API-key login) or an inactive subscription yields a snapshot without
+windows, but only while a Muse session is refreshed, so its local fields still
+publish. A rejected token or failed request stays an error, which keeps the
+cached quota. Session-local fields come from the
 bounded tail of `session.jsonl`: the last `model_completed` usage against the
 `model-catalog` context limit, and the last prompt as topic: a main-surface
 chat `runtime.user_intent.accepted`, with `user_prompt_display` accepted too

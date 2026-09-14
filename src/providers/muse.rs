@@ -2,12 +2,16 @@
 //!
 //! Muse Code keeps its login in `~/.config/muse/auth.json` (or
 //! `$XDG_CONFIG_HOME/muse/auth.json`, or `$MUSE_AUTH_PATH`, the same order its
-//! launcher uses). The quota is the `subs_usage` block of the same
-//! `POST https://api.meta.ai/muse-code/key` call the CLI makes at startup and
-//! for its `/usage` panel. That call is idempotent for a signed-in account: it
-//! returns the key already stored in `auth.json` rather than rotating it, so
-//! polling it cannot sign the CLI out. This is the Grok/Devin pattern — local
-//! credential plus the official CLI contract — not a browser scrape.
+//! launcher uses). A `storage: "keychain"` login (typical macOS `muse login`)
+//! keeps the OAuth token out of that file; the collector then reads the CLI's
+//! own Keychain item through `security find-generic-password`, with a short
+//! deadline so a prompt cannot stall a refresh. The quota is the `subs_usage`
+//! block of the same `POST https://api.meta.ai/muse-code/key` call the CLI
+//! makes at startup and for its `/usage` panel. That call is idempotent for a
+//! signed-in account: it returns the key already stored for the login rather
+//! than rotating it, so polling it cannot sign the CLI out. This is the
+//! Grok/Devin pattern — local credential plus the official CLI contract — not
+//! a browser scrape.
 //!
 //! The response also carries the account's API key, name, and email. Only
 //! `subs_usage` is read; the rest is dropped with the response and never
@@ -40,7 +44,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const SUBSCRIPTION_URL: &str = "https://api.meta.ai/muse-code/key";
 /// The API version the Muse Code CLI sends with the same request.
@@ -48,6 +54,10 @@ const API_VERSION: &str = "1.0.0";
 /// `auth.json` and `settings.json` are a few kilobytes. Anything larger is
 /// not a file this collector understands.
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+/// Wall-clock budget for `security(1)`. A Keychain ACL prompt can block
+/// forever; the Muse HTTP call already gives up at five seconds connect, and
+/// a hung `security` would stall the watch pulse for every other provider.
+const KEYCHAIN_COMMAND_BUDGET: Duration = Duration::from_secs(5);
 const FIVE_HOUR_MINUTES: u64 = 5 * 60;
 /// The last model call and the last prompt sit at the end of a transcript
 /// that can grow to tens of megabytes, so only this much of it is read.
@@ -688,7 +698,7 @@ fn read_credentials(path: &Path) -> std::result::Result<MuseCredentials, Provide
             // `storage: "keychain"` logins keep the OAuth token out of the
             // file entirely; the CLI reads it from macOS Keychain instead.
             if auth_uses_keychain(&value) {
-                keychain_access_token()
+                read_keychain_access_token(KEYCHAIN_COMMAND_BUDGET)
                     .map(|access_token| MuseCredentials { access_token })
                     .ok_or(error)
             } else {
@@ -712,10 +722,11 @@ fn auth_uses_keychain(value: &Value) -> bool {
 /// itself writes (`ai.meta.dev.credentials`, account `meta`). `security(1)`
 /// is the documented interface — no keychain crate, and on platforms without
 /// it the command simply fails and the login reports as missing.
-fn keychain_access_token() -> Option<String> {
-    let executable = std::env::var_os("HERDR_AGENT_QUOTA_SECURITY_BIN")
-        .unwrap_or_else(|| "security".into());
-    let output = std::process::Command::new(executable)
+fn read_keychain_access_token(budget: Duration) -> Option<String> {
+    let executable =
+        std::env::var_os("HERDR_AGENT_QUOTA_SECURITY_BIN").unwrap_or_else(|| "security".into());
+    let mut command = Command::new(executable);
+    command
         .args([
             "find-generic-password",
             "-s",
@@ -724,18 +735,49 @@ fn keychain_access_token() -> Option<String> {
             "meta",
             "-w",
         ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let stdout = run_command_with_deadline(&mut command, budget)?;
+    if stdout.len() as u64 > MAX_CONFIG_BYTES {
         return None;
     }
-    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value: Value = serde_json::from_slice(&stdout).ok()?;
     value
         .get("access_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
+}
+
+/// Return stdout if `command` exits successfully within `budget`. A timeout
+/// kills the child so a Keychain ACL prompt cannot block the caller.
+fn run_command_with_deadline(command: &mut Command, budget: Duration) -> Option<Vec<u8>> {
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout
+            .take(MAX_CONFIG_BYTES.saturating_add(1))
+            .read_to_end(&mut buf);
+        buf
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < budget => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+    };
+    let stdout = reader.join().ok()?;
+    status.success().then_some(stdout)
 }
 
 /// Only an OAuth account login has a subscription. An API-key login bills
@@ -997,7 +1039,10 @@ mod tests {
     #[test]
     fn only_a_keychain_storage_declaration_reads_the_keychain() {
         for (value, expected) in [
-            (json!({"providers": {"meta": {"storage": "keychain"}}}), true),
+            (
+                json!({"providers": {"meta": {"storage": "keychain"}}}),
+                true,
+            ),
             (json!({"providers": {"meta": {"storage": "file"}}}), false),
             (json!({"providers": {"meta": {}}}), false),
             (json!({"providers": {}}), false),
@@ -1047,6 +1092,23 @@ mod tests {
             read_credentials(&file_auth),
             Err(ProviderError::MissingCredentials)
         ));
+    }
+
+    #[test]
+    fn a_keychain_prompt_that_does_not_return_is_abandoned() {
+        let dir = tempdir().unwrap();
+        let stub = dir.path().join("security-stub");
+        fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("HERDR_AGENT_QUOTA_SECURITY_BIN", &stub);
+        let started = Instant::now();
+        assert!(read_keychain_access_token(Duration::from_millis(200)).is_none());
+        std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

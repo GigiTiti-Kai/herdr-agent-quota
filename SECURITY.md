@@ -12,12 +12,16 @@ is seven days. Security fixes target the latest release.
 The plugin reads configured CLI credentials, local session metadata/transcripts,
 and Claude/Agy StatusLine input. Codex quota is obtained through its app-server;
 OMP quota through its usage CLI. OMP's credential database is never opened.
-Local SQLite reads are read-only and limited to session/model data.
+Local SQLite reads are read-only and limited to session/model data. On macOS, a
+Muse Code `storage: "keychain"` login has no token in `auth.json`; the collector
+reads only the CLI's own Keychain item (`ai.meta.dev.credentials` / `meta`)
+through `security find-generic-password`, with a short deadline so a Keychain
+prompt cannot stall a refresh.
 
 Authenticated quota requests use the relevant CLI/provider's usage contract.
 The plugin sends no model prompts and does not upload usage to another service.
-It does not read browser cookies or system keychains, or manage provider logins.
-Invoked CLIs remain responsible for their own credential lifecycle.
+It does not read browser cookies, other Keychain items, or manage provider
+logins. Invoked CLIs remain responsible for their own credential lifecycle.
 
 Plugin state can contain quota, account/session identifiers, model and cache
 statistics, session summaries, preferences, and watcher coordination files.
