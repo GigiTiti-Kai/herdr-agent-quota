@@ -765,20 +765,27 @@ fn keychain_approval_mtime() -> Option<u64> {
 /// Record a successful keychain read. The content is the approval time, for
 /// debugging only; existence of the file is the signal. Written once: the
 /// marker's mtime is part of the credential cache key, so re-writing it on
-/// every success would invalidate the cache on every poll.
-fn record_keychain_approval() {
-    if let Some(marker) = keychain_approval_marker() {
-        // `create_new` so two concurrent approvers cannot race a partial
-        // write; the content is idempotent either way.
-        if let Ok(mut file) = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-        {
-            use std::io::Write;
-            let _ = write!(file, "{}", CacheStore::now_unix());
-        }
+/// every success would invalidate the cache on every poll. Returns whether
+/// the marker exists afterward, so callers can gate their success message on
+/// the approval actually persisting.
+fn record_keychain_approval() -> bool {
+    let Some(marker) = keychain_approval_marker() else {
+        return false;
+    };
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
     }
+    // `create_new` so two concurrent approvers cannot race a partial
+    // write; the content is idempotent either way.
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        use std::io::Write;
+        let _ = write!(file, "{}", CacheStore::now_unix());
+    }
+    marker.exists()
 }
 
 /// Credentials for the current auth file, cached in-process.
@@ -880,8 +887,13 @@ fn approve_keychain_interactive() -> Option<MuseCredentials> {
     if started.elapsed() < KEYCHAIN_NO_PROMPT_THRESHOLD {
         // No prompt appeared: a persistent grant already covers this
         // lookup, so future background reads are safe to attempt.
-        record_keychain_approval();
-        eprintln!("muse: keychain approval recorded — future refreshes won't prompt.");
+        if record_keychain_approval() {
+            eprintln!("muse: keychain approval recorded — future refreshes won't prompt.");
+        } else {
+            eprintln!(
+                "muse: keychain read works, but the approval marker could not be written — future refreshes will prompt again."
+            );
+        }
         return Some(credentials);
     }
     // A prompt was handled; only a second instant read proves Always Allow
@@ -891,8 +903,13 @@ fn approve_keychain_interactive() -> Option<MuseCredentials> {
     if read_keychain_access_token(KEYCHAIN_COMMAND_BUDGET).is_some()
         && verified.elapsed() < KEYCHAIN_NO_PROMPT_THRESHOLD
     {
-        record_keychain_approval();
-        eprintln!("muse: Always Allow confirmed — future refreshes won't prompt.");
+        if record_keychain_approval() {
+            eprintln!("muse: Always Allow confirmed — future refreshes won't prompt.");
+        } else {
+            eprintln!(
+                "muse: Always Allow confirmed, but the approval marker could not be written — future refreshes will prompt again."
+            );
+        }
     } else {
         eprintln!(
             "muse: that approval didn't stick (one-time Allow?). Continuing with one-time access; re-run with --keychain-approve and click Always Allow to stop future prompts."
@@ -911,7 +928,15 @@ fn read_credentials_uncached(path: &Path) -> std::result::Result<MuseCredentials
             if auth_uses_keychain(&value) {
                 let force = KEYCHAIN_APPROVE_ATTEMPT.load(Ordering::Relaxed);
                 if force {
-                    return approve_keychain_interactive().ok_or(error);
+                    // A failed ceremony is Unavailable, not MissingCredentials:
+                    // the latter would either wipe the last-good snapshot
+                    // (has_sessions maps it to Ok empty) or re-run the whole
+                    // 300s ceremony via the MissingCredentials retry arm.
+                    return approve_keychain_interactive().ok_or_else(|| {
+                        ProviderError::Unavailable(
+                            "keychain approval denied or timed out".to_string(),
+                        )
+                    });
                 }
                 if keychain_approval_mtime().is_none() {
                     // No prompt from background processes, ever: without a
