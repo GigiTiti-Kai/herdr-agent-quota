@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-09-14
+
 ### Added
 
 - Muse Code (Meta Muse Spark) is a supported harness: `--agent muse`,
@@ -13,6 +15,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   color. Quota is the `subs_usage` block of the same `muse-code/key` call the
   CLI makes at startup and for `/usage`, authenticated with the account login
   in `~/.config/muse/auth.json` (or `$XDG_CONFIG_HOME` / `$MUSE_AUTH_PATH`).
+  A `storage: "keychain"` login (typical on macOS) keeps the token out of that
+  file; the collector reads the CLI's Keychain item through
+  `security find-generic-password`, with a deadline so a prompt cannot stall a
+  refresh, and keeps a successful token in-process for the daemon lifetime.
   The call returns the key the CLI already stored, so polling it does not
   sign Muse out. The session window is published as 5h and the weekly window
   as 7d; a different advertised session length keeps its own label. Only the
@@ -65,6 +71,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without being mistaken for that legacy list.
 - Gauges now keeps `no cached` as an amber token when it joins the cache row;
   live TTL continues to fold into the uncoloured cache token.
+- `omp usage` now passes `--profile` when the pane's agent directory is an omp
+  named profile (`~/.omp/profiles/<name>/agent`), so that pane is billed to
+  the profile's credential store rather than the default one. Non-profile
+  layouts still use `PI_CONFIG_DIR`.
 
 ## [1.5.4] - 2026-09-10
 
@@ -711,7 +721,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A popup dashboard pane, event-driven refresh, and a local snapshot cache that
   survives provider failures.
 
-[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.4...HEAD
+[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.5...HEAD
+[1.5.5]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.1...v1.5.2
