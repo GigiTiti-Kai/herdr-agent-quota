@@ -1229,7 +1229,7 @@ fn unknown_agent_working_event_does_not_refresh_any_collector() {
         state.path(),
         &herdr,
         &codex,
-        r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p8","agent":"cursor","status":"working"}}"#,
+        r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p8","agent":"amp","status":"working"}}"#,
     );
     assert!(
         output.status.success(),
@@ -1599,6 +1599,7 @@ struct AgentHomes {
     claude_settings: PathBuf,
     agy_settings: PathBuf,
     grok_home: PathBuf,
+    cursor_hooks: PathBuf,
 }
 
 impl AgentHomes {
@@ -1609,6 +1610,7 @@ impl AgentHomes {
             claude_settings: root.join("claude/settings.json"),
             agy_settings: root.join("agy/settings.json"),
             grok_home: root.join("grok-home"),
+            cursor_hooks: root.join("cursor/hooks.json"),
         }
     }
 
@@ -1630,6 +1632,7 @@ impl AgentHomes {
             .env("CLAUDE_SETTINGS_FILE", &self.claude_settings)
             .env("AGY_SETTINGS_FILE", &self.agy_settings)
             .env("GROK_HOME", &self.grok_home)
+            .env("CURSOR_HOOKS_FILE", &self.cursor_hooks)
             .env("HERDR_BIN_PATH", self.state.join("herdr-absent"))
             .output()
             .unwrap()
@@ -1673,6 +1676,10 @@ fn installing_one_agent_leaves_every_other_agent_untouched() {
         !homes.grok_home.exists(),
         "an unselected Grok home was created"
     );
+    assert!(
+        !homes.cursor_hooks.exists(),
+        "an unselected Cursor hooks file was created"
+    );
 }
 
 #[test]
@@ -1697,6 +1704,7 @@ fn installing_only_pi_adds_only_its_sidebar_style() {
     assert!(!homes.claude_settings.exists());
     assert!(!homes.agy_settings.exists());
     assert!(!homes.grok_home.exists());
+    assert!(!homes.cursor_hooks.exists());
 }
 
 #[test]
@@ -1728,6 +1736,10 @@ fn uninstalling_one_agent_keeps_the_rest_working() {
     assert!(
         homes.claude_settings.exists(),
         "removing Grok tore out the Claude statusLine"
+    );
+    assert!(
+        homes.cursor_hooks.exists(),
+        "removing Grok tore out the Cursor collector hooks"
     );
 }
 
@@ -1786,6 +1798,79 @@ fn an_installer_can_narrow_the_selection_through_the_environment() {
     assert!(sidebar.contains("grok ="), "{sidebar}");
     assert!(!sidebar.contains("claude ="), "{sidebar}");
     assert!(!homes.claude_settings.exists());
+    assert!(!homes.cursor_hooks.exists());
+}
+
+#[test]
+fn cursor_collector_hooks_preserve_herdr_session_start() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    fs::create_dir_all(homes.cursor_hooks.parent().unwrap()).unwrap();
+    fs::write(
+        &homes.cursor_hooks,
+        r#"{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "bash '/tmp/herdr-agent-state.sh' session" }]
+  }
+}"#,
+    )
+    .unwrap();
+    assert!(homes
+        .configure(&["--apply", "--agent", "cursor"])
+        .status
+        .success());
+    let hooks = fs::read_to_string(&homes.cursor_hooks).unwrap();
+    assert!(hooks.contains("herdr-agent-state.sh"));
+    assert!(hooks.contains("herdr-agent-quota-hooks.sh"));
+    assert!(hooks.contains("afterAgentResponse"));
+    assert!(hooks.contains("preCompact"));
+    let script = homes
+        .cursor_hooks
+        .parent()
+        .unwrap()
+        .join("herdr-agent-quota-hooks.sh");
+    let script_text = fs::read_to_string(&script).unwrap();
+    assert!(script_text.contains("cursor-hooks"));
+
+    assert!(homes
+        .configure(&["--uninstall", "--agent", "cursor"])
+        .status
+        .success());
+    let hooks = fs::read_to_string(&homes.cursor_hooks).unwrap();
+    assert!(hooks.contains("herdr-agent-state.sh"));
+    assert!(!hooks.contains("herdr-agent-quota-hooks.sh"));
+    assert!(!script.exists());
+}
+
+#[test]
+fn cursor_hooks_command_writes_a_session_mailbox() {
+    let state = tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("cursor-hooks")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"conversation_id":"50b33403-da5a-40f4-bb9e-5fc3566f91a4","model":"composer-2.5","input_tokens":20000,"cache_read_tokens":15000,"cache_write_tokens":0}"#,
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let mailbox = state
+        .path()
+        .join("cursor-hooks/50b33403-da5a-40f4-bb9e-5fc3566f91a4.json");
+    let observation: serde_json::Value =
+        serde_json::from_slice(&fs::read(mailbox).unwrap()).unwrap();
+    assert_eq!(observation["input_tokens"], 20000);
+    assert_eq!(observation["cache_read_tokens"], 15000);
 }
 
 fn stub_missing_omp_integration(state: &Path) {
@@ -2702,6 +2787,15 @@ fn a_manual_refresh_reads_no_pane_at_all() {
         .env("XDG_DATA_HOME", &xdg)
         .env_remove("GROK_AUTH_FILE")
         .env_remove("OPENCODE_API_KEY")
+        .env("MUSE_AUTH_PATH", state.path().join("absent-muse-auth.json"))
+        .env(
+            "CURSOR_AUTH_FILE",
+            state.path().join("absent-cursor-auth.json"),
+        )
+        .env(
+            "CURSOR_STATE_DB",
+            state.path().join("absent-cursor-state.vscdb"),
+        )
         .output()
         .unwrap();
     assert!(

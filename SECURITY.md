@@ -10,16 +10,20 @@ is seven days. Security fixes target the latest release.
 ## Data handling
 
 The plugin reads configured CLI credentials, local session metadata/transcripts,
-and Claude/Agy StatusLine input. Codex quota is obtained through its app-server;
+Claude/Agy StatusLine input, and Cursor CLI hook payloads (token counts and
+context-window fields only). Codex quota is obtained through its app-server;
 OMP quota through its usage CLI. OMP's credential database is never opened.
-Local SQLite reads are read-only and limited to session/model data. On macOS, a
-Muse Code `storage: "keychain"` login has no token in `auth.json`; the collector
-reads only the CLI's own Keychain item (`ai.meta.dev.credentials` / `meta`)
-through `security find-generic-password`. Background processes never prompt:
-without a recorded approval marker the keychain branch is skipped outright, and
-the user approves once via `refresh --provider muse --keychain-approve`. A
-successful token is kept in the process until that file changes or the quota
-API rejects it; it is never written to plugin state.
+Local SQLite reads are read-only and limited to session/model data, plus Cursor
+IDE's `state.vscdb` key `cursorAuth/accessToken` when the CLI auth file has no
+token. On macOS, a Muse Code `storage: "keychain"` login has no token in
+`auth.json`; the collector reads only the CLI's own Keychain item
+(`ai.meta.dev.credentials` / `meta`) through `security find-generic-password`.
+Background processes never prompt: without a recorded approval marker the
+keychain branch is skipped outright, and the user approves once via
+`refresh --provider muse --keychain-approve`. A successful token is kept in
+the process until that file changes or the quota API rejects it; it is never
+written to plugin state. Cursor credentials are never written, refreshed, or
+exchanged, and Cursor's Keychain is never opened.
 
 Authenticated quota requests use the relevant CLI/provider's usage contract.
 The plugin sends no model prompts and does not upload usage to another service.

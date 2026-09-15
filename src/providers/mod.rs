@@ -1,6 +1,7 @@
 pub mod agy;
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod devin;
 pub mod grok;
 pub mod muse;
@@ -38,6 +39,7 @@ mod tests {
             Provider::Grok,
             Provider::Devin,
             Provider::Muse,
+            Provider::Cursor,
             Provider::OpenCodeGo,
         ] {
             let mut cached = ProviderSnapshot::new(provider, vec![], 100);

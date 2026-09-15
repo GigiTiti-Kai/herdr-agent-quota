@@ -12,7 +12,7 @@ use crate::omp::OmpEvidence;
 use crate::opencode::OpenCodePaths;
 use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
 use crate::providers::statusline::enrich_cache_session;
-use crate::providers::{codex, devin, grok, muse, omp as omp_provider, opencode_go};
+use crate::providers::{codex, cursor, devin, grok, muse, omp as omp_provider, opencode_go};
 use crate::route;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -411,10 +411,13 @@ pub fn event() -> Result<()> {
 
     let status = find_status(event);
     // Pi's and omp's exact session files carry the routing evidence, and
-    // Muse's transcript records the prompt itself. Reading their panes would
-    // add a visible repaint without improving attribution or the topic.
-    let topic_pane =
-        (!matches!(harness, Harness::Pi | Harness::Omp | Harness::Muse)).then_some(pane_id);
+    // Muse/Cursor transcripts record the prompt itself. Reading their panes
+    // would add a visible repaint without improving attribution or the topic.
+    let topic_pane = (!matches!(
+        harness,
+        Harness::Pi | Harness::Omp | Harness::Muse | Harness::Cursor
+    ))
+    .then_some(pane_id);
     let result = handle_named_pane(&cache, pane, topic_pane);
     if status.is_some_and(is_working_status) {
         if let Err(error) = spawn_watch(true) {
@@ -516,11 +519,12 @@ fn publish_row(cache: &CacheStore) -> RowStyle {
     }
 }
 
-/// Muse's session summary is the last submitted prompt, the same evidence
-/// other harnesses read off the screen, so it is also that pane's topic.
+/// Muse/Cursor session summaries are the last submitted prompt, the same
+/// evidence other harnesses read off the screen, so they are also that pane's
+/// topic.
 fn apply_session_summary(pane: &mut AgentPane, summary: &str) {
     pane.session_summary = summary.to_string();
-    if pane.harness == Harness::Muse {
+    if matches!(pane.harness, Harness::Muse | Harness::Cursor) {
         pane.topic = summary.to_string();
     }
 }
@@ -871,6 +875,7 @@ fn refresh_provider(
         Provider::Grok => grok::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Devin => devin::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Muse => muse::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
+        Provider::Cursor => cursor::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Claude | Provider::Agy => load_statusline_snapshot(cache, provider),
         // OpenCode Go is fetched for a resolved pane, never through the
         // provider list; see `fetch_opencode_go`.
@@ -889,7 +894,11 @@ fn refresh_provider(
                 cache.save_preserving_context_for_session(snapshot, session_id.as_deref())?;
             } else if matches!(
                 provider,
-                Provider::Codex | Provider::Grok | Provider::Devin | Provider::Muse
+                Provider::Codex
+                    | Provider::Grok
+                    | Provider::Devin
+                    | Provider::Muse
+                    | Provider::Cursor
             ) {
                 let (_, mtime) = current_account_gate(provider);
                 cache.save_preserving_diagnostics_for_sessions(
@@ -1005,6 +1014,7 @@ fn current_account_gate(provider: Provider) -> (Option<String>, Option<u64>) {
         Provider::Codex => (codex::current_account_id(), codex::auth_mtime_unix()),
         Provider::Devin => (devin::current_account_id(), devin::auth_mtime_unix()),
         Provider::Muse => (muse::current_account_id(), muse::auth_mtime_unix()),
+        Provider::Cursor => (cursor::current_account_id(), cursor::auth_mtime_unix()),
         Provider::OpenCodeGo => (
             OpenCodePaths::from_env()
                 .and_then(|paths| crate::opencode::go_key(&paths))
@@ -1319,11 +1329,21 @@ fn tokens_for_loaded_snapshot(
     session_id: Option<&str>,
     row: RowStyle,
 ) -> Option<MetadataTokens> {
+    let mut overlaid = None;
+    let usable = match (provider, usable) {
+        (Provider::Cursor, Some(snapshot)) => {
+            let mut snapshot = snapshot.clone();
+            cursor::overlay_hook_context(&mut snapshot, session_id);
+            Some(&*overlaid.insert(snapshot))
+        }
+        (_, usable) => usable,
+    };
     match (usable, raw) {
         (Some(snapshot), _) => tokens_for_provider(Some(snapshot), now_unix, session_id, row),
-        (None, Some(_)) => Some(MetadataTokens::unavailable(
+        (None, Some(raw)) => Some(MetadataTokens::unavailable_for_windows(
             provider,
             "signed-in account changed",
+            &raw.windows,
         )),
         (None, None) => None,
     }
@@ -1348,12 +1368,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_muse_session_summary_replaces_the_topic() {
+    fn muse_and_cursor_session_summaries_replace_the_topic() {
         let mut muse = test_pane("w1:p1", Harness::Muse);
         muse.topic = "old prompt".to_string();
         apply_session_summary(&mut muse, "new prompt");
         assert_eq!(muse.topic, "new prompt");
         assert_eq!(muse.session_summary, "new prompt");
+
+        let mut cursor = test_pane("w1:p3", Harness::Cursor);
+        cursor.topic = "old prompt".to_string();
+        apply_session_summary(&mut cursor, "hi");
+        assert_eq!(cursor.topic, "hi");
 
         let mut codex = test_pane("w1:p2", Harness::Codex);
         codex.topic = "screen topic".to_string();
@@ -1391,6 +1416,7 @@ mod tests {
             Provider::Grok,
             Provider::Devin,
             Provider::Muse,
+            Provider::Cursor,
             Provider::OpenCodeGo,
         ] {
             cache
@@ -2172,12 +2198,42 @@ mod tests {
             values.quota_week_severity,
             Some(crate::model::Severity::Unknown)
         );
+        assert_eq!(values.quota_month, "");
         assert_eq!(
             values.quota_error.as_deref(),
             Some("signed-in account changed")
         );
         // A failure must not masquerade as a lapsed prompt cache.
         assert_eq!(values.quota_cache_state, "");
+    }
+
+    #[test]
+    fn a_monthly_snapshot_for_the_wrong_account_keeps_the_30d_slot() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Cursor,
+            vec![UsageWindow::new(WindowKind::Monthly, 7.0, None).unwrap()],
+            1,
+        )
+        .with_account_id(Some("old-account".to_string()));
+        let values = tokens_for_loaded_snapshot(
+            Provider::Cursor,
+            Some(&snapshot),
+            None,
+            1,
+            None,
+            RowStyle::default(),
+        )
+        .unwrap();
+        assert_eq!(values.quota_month, "30d N/A");
+        assert_eq!(
+            values.quota_month_severity,
+            Some(crate::model::Severity::Unknown)
+        );
+        assert_eq!(values.quota_week, "");
+        assert_eq!(
+            values.quota_error.as_deref(),
+            Some("signed-in account changed")
+        );
     }
 
     #[test]
@@ -2295,6 +2351,10 @@ mod tests {
         );
         assert_eq!(
             collector(r#"{"data":{"agent":"cursor","status":"working"}}"#),
+            Some(Provider::Cursor)
+        );
+        assert_eq!(
+            collector(r#"{"data":{"agent":"amp","status":"working"}}"#),
             None
         );
         assert_eq!(

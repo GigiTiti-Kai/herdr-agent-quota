@@ -3,7 +3,7 @@ name = "herdr-agent-quota"
 version = "1.5.5"
 edition = "2021"
 rust-version = "1.95"
-description = "Credential-scoped AI quota and context in Herdr for Claude, Codex, Grok, Agy, OpenCode, Pi, omp, Devin, and Muse"
+description = "Credential-scoped AI quota and context in Herdr for Claude, Codex, Grok, Agy, OpenCode, Pi, omp, Devin, Muse, and Cursor"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/levi-qiao/herdr-agent-quota"
@@ -33,7 +33,8 @@ toml_edit = "0.22"
 ureq = { version = "2.12", features = ["json"] }
 # Bundled SQLite so macOS/Linux CI does not need libsqlite3 or a sqlite3 binary.
 # Used for exact session-id lookups in OpenCode's local opencode.db, omp's
-# models.db, and Devin CLI's sessions.db.
+# models.db, Devin CLI's sessions.db, and Cursor IDE's state.vscdb
+# (`cursorAuth/accessToken` only).
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 # Only used to put the Codex app-server in its own process group.

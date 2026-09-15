@@ -14,7 +14,7 @@
 #   ./install.sh --low-quota-alert 10
 #
 # --agent installs only the agents you name (all, claude, codex, grok, agy,
-# opencode, pi, omp, devin, muse). Anything you leave out gets no sidebar row, no
+# opencode, pi, omp, devin, muse, cursor). Anything you leave out gets no sidebar row, no
 # statusLine entry and no hook file. The default is every supported agent.
 #
 # --sidebar-layout gauges (default) draws a meter beside each quota number.
@@ -28,7 +28,7 @@
 # how much has been consumed. The colour always follows what is left.
 #
 # --fields picks the quota fields the sidebar shows: all (default), none, or a
-# comma-separated list of provider, topic, model, cache, ttl, context, 5h, 7d.
+# comma-separated list of provider, topic, model, cache, ttl, context, 5h, 7d, 30d.
 # The error token is always shown.
 #
 # --brand-colors on (default) tints provider and model with each agent's hue;

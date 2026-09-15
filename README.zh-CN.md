@@ -69,11 +69,11 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Layout | `gauges`（默认）在每个额度数字旁加进度条；`packed` 合并相关字段；`stacked` 将字段分行显示 |
 | Row gap | Agent 之间保留零行或一行空白 |
 | Watch interval | 30 秒–1 小时，默认 60 秒 |
-| Fields | 提供方、主题、模型、缓存、TTL、上下文、短期／长期额度 |
+| Fields | 提供方、主题、模型、缓存、TTL、上下文、短期／长期／月度额度 |
 | Brand colors | 开启或关闭品牌色 |
 | Agent order | Herdr 默认排序，或剩余额度最少的优先 |
 | Low quota alert | 关闭，或设置 1%–100% 的提醒阈值 |
-| Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse |
+| Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor |
 
 方向键或空格修改，`a` 应用，`q` 关闭。脚本配置选项见 `./install.sh --help`。
 
@@ -85,6 +85,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Grok | CLI billing 接口；7d 或 30d | 当前 CLI 凭据 |
 | Devin | CLI usage 接口；1d 和 7d | 当前 CLI 凭据 |
 | Muse Code | CLI 订阅接口；5h 和 7d | 当前 CLI 账号登录；会话通过 Muse 的 session lock 识别（Linux） |
+| Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；cache 和 cx 来自 CLI hook |
 | Claude Code | StatusLine；5h 和 7d | 精确会话的观测 |
 | Agy / Antigravity | StatusLine；5h 和 7d | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
@@ -98,7 +99,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 所有受支持的工作中 agent 共用一个后台 watcher，请求间隔至少 60 秒，并在回合结束后
 完成收尾刷新。OMP 另有自身的五分钟 usage 缓存。共享已确认额度来源的闲置窗格会收到同一读数。
 
-原生 Codex、Grok、Devin、Muse collector 跟随插件的当前登录，不为每个窗格分别识别账号。
+原生 Codex、Grok、Devin、Muse、Cursor collector 跟随插件的当前登录，不为每个窗格分别识别账号。
 Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
 账号或模型额度池无法确认时不猜测数字。请求失败保留同一账号最后一次已确认的读数，
 不会把失败解释为零用量。
@@ -111,7 +112,9 @@ Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
 | Claude/Agy 缺少额度 | 发送一轮消息，让该会话的 StatusLine 产生观测 |
 | OMP 缺少额度 | 检查 `omp usage --json --redact --provider <id>` |
 | Devin 缺少额度 | 检查 CLI 登录；使用自定义路径时检查 `DEVIN_CREDENTIALS_FILE` |
-| Muse 缺少额度 | 运行 `muse login`（API key 登录没有订阅额度）；使用自定义路径时检查 `MUSE_AUTH_PATH` |
+| Muse 缺少额度 | 运行 `muse login`（API key 登录没有订阅额度）；使用自定义路径时检查 `MUSE_AUTH_PATH`。macOS 上 `storage: "keychain"` 登录还需一次性 Keychain 授权：运行 `herdr-agent-quota refresh --provider muse --keychain-approve`，并点击 **Always Allow** |
+| Cursor 缺少额度 | 运行 `cursor login`，或登录 Cursor 桌面端；使用自定义路径时检查 `CURSOR_AUTH_FILE` |
+| Cursor 缺少 cache/cx | 先重启该 Cursor pane 让它重新加载 `hooks.json`，再发一轮（headless `--print` 不会触发这些 hook） |
 | 缺少侧栏行 | 运行下面的 configure action 修复插件配置 |
 | 侧栏太窄，`gauges` 不显示进度条 | 约 24 列以下是预期行为；调宽后刷新即可 |
 | 调整宽度后 `gauges` 仍是旧长度 | 用 `prefix+shift+r` 刷新；没有随拖动实时发布的路径 |

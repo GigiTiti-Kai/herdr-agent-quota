@@ -719,7 +719,7 @@ mod tests {
                 "configure",
                 "--apply",
                 "--agent",
-                "claude,codex,grok,agy,opencode,omp,devin,muse",
+                "claude,codex,grok,agy,opencode,omp,devin,muse,cursor",
                 "--quota-percent",
                 "used",
                 "--sidebar-layout",
@@ -729,7 +729,7 @@ mod tests {
                 "--brand-colors",
                 "on",
                 "--fields",
-                "provider,model,cache,ttl,context,5h,7d",
+                "provider,model,cache,ttl,context,5h,7d,30d",
                 "--agent-order",
                 "default",
                 "--low-quota-alert",
@@ -772,12 +772,12 @@ mod tests {
     #[test]
     fn turning_the_newest_agent_off_is_an_exact_cli_list() {
         let mut draft = settings();
-        draft.cycle(Row::Agent(Harness::Muse), 1);
+        draft.cycle(Row::Agent(Harness::Cursor), 1);
         let arguments = draft.apply_arguments();
         let agent = arguments.iter().position(|flag| flag == "--agent").unwrap();
         assert_eq!(
             arguments[agent + 1],
-            "claude,codex,grok,agy,opencode,pi,omp,devin"
+            "claude,codex,grok,agy,opencode,pi,omp,devin,muse"
         );
     }
 

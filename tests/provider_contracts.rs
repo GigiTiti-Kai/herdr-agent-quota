@@ -1,6 +1,6 @@
 use herdr_agent_quota::model::{BillingTarget, ResetAt, WindowKind};
 use herdr_agent_quota::presentation::MetadataTokens;
-use herdr_agent_quota::providers::{agy, claude, codex, devin, grok, muse, omp};
+use herdr_agent_quota::providers::{agy, claude, codex, cursor, devin, grok, muse, omp};
 use serde_json::Value;
 
 fn fixture(value: &str) -> Value {
@@ -200,6 +200,29 @@ fn devin_fixture_flips_remaining_to_used_for_daily_and_weekly() {
     assert_eq!(
         weekly.resets_at.map(|reset| reset.unix_seconds()),
         Some(1_788_681_600)
+    );
+}
+
+/// Recorded from a live Cursor `GetCurrentPeriodUsage` call. The CLI usage
+/// panel uses `totalPercentUsed` for Included when present, and
+/// `apiPercentUsed` for the named-model bar. Cycle end is Unix milliseconds.
+#[test]
+fn cursor_fixture_maps_included_and_api_the_way_the_cli_panel_does() {
+    let value = fixture(include_str!("fixtures/cursor/current-period-usage.json"));
+    let snapshot = cursor::parse_current_period_usage(&value, 1).expect("snapshot");
+    assert_eq!(snapshot.windows.len(), 3);
+    let auto = snapshot.window(WindowKind::FiveHour).expect("Auto window");
+    assert_eq!(auto.used_percent, 10.5);
+    assert_eq!(auto.display_label(), "at");
+    let api = snapshot.window(WindowKind::Weekly).expect("API window");
+    assert_eq!(api.used_percent, 40.0);
+    assert_eq!(api.display_label(), "api");
+    let monthly = snapshot.window(WindowKind::Monthly).expect("30d window");
+    assert!((monthly.used_percent - 7.165656565656565).abs() < 1e-9);
+    assert_eq!(monthly.display_label(), "30d");
+    assert_eq!(
+        monthly.resets_at.map(|reset| reset.unix_seconds()),
+        Some(1_790_950_387)
     );
 }
 
