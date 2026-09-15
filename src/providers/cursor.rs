@@ -343,16 +343,17 @@ fn state_db_path() -> Result<PathBuf> {
 }
 
 fn cursor_config_dir() -> Result<PathBuf> {
-    if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(xdg).join("cursor"));
-    }
-    let home = non_empty_env("HOME").context("HOME is not set")?;
     #[cfg(target_os = "macos")]
     {
+        let home = non_empty_env("HOME").context("HOME is not set")?;
         Ok(PathBuf::from(home).join(".cursor"))
     }
     #[cfg(not(target_os = "macos"))]
     {
+        if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {
+            return Ok(PathBuf::from(xdg).join("cursor"));
+        }
+        let home = non_empty_env("HOME").context("HOME is not set")?;
         Ok(PathBuf::from(home).join(".config/cursor"))
     }
 }
@@ -1090,6 +1091,36 @@ mod tests {
         std::env::remove_var("CURSOR_AUTH_FILE");
         std::env::remove_var("CURSOR_STATE_DB");
         assert!(matches!(error, ProviderError::MissingCredentials));
+    }
+
+    #[test]
+    fn xdg_config_home_is_not_the_macos_auth_dir() {
+        let _guard = env_guard();
+        let dir = tempdir().unwrap();
+        let xdg = dir.path().join("xdg");
+        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_auth = std::env::var_os("CURSOR_AUTH_FILE");
+        std::env::remove_var("CURSOR_AUTH_FILE");
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let path = auth_path().unwrap();
+        match previous_auth {
+            Some(value) => std::env::set_var("CURSOR_AUTH_FILE", value),
+            None => std::env::remove_var("CURSOR_AUTH_FILE"),
+        }
+        match previous_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_ne!(path, xdg.join("cursor/auth.json"));
+            assert!(
+                path.ends_with(".cursor/auth.json"),
+                "macOS auth path {path:?}"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(path, xdg.join("cursor/auth.json"));
     }
 
     #[test]

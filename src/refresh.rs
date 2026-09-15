@@ -1340,9 +1340,10 @@ fn tokens_for_loaded_snapshot(
     };
     match (usable, raw) {
         (Some(snapshot), _) => tokens_for_provider(Some(snapshot), now_unix, session_id, row),
-        (None, Some(_)) => Some(MetadataTokens::unavailable(
+        (None, Some(raw)) => Some(MetadataTokens::unavailable_for_windows(
             provider,
             "signed-in account changed",
+            &raw.windows,
         )),
         (None, None) => None,
     }
@@ -2197,12 +2198,42 @@ mod tests {
             values.quota_week_severity,
             Some(crate::model::Severity::Unknown)
         );
+        assert_eq!(values.quota_month, "");
         assert_eq!(
             values.quota_error.as_deref(),
             Some("signed-in account changed")
         );
         // A failure must not masquerade as a lapsed prompt cache.
         assert_eq!(values.quota_cache_state, "");
+    }
+
+    #[test]
+    fn a_monthly_snapshot_for_the_wrong_account_keeps_the_30d_slot() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Cursor,
+            vec![UsageWindow::new(WindowKind::Monthly, 7.0, None).unwrap()],
+            1,
+        )
+        .with_account_id(Some("old-account".to_string()));
+        let values = tokens_for_loaded_snapshot(
+            Provider::Cursor,
+            Some(&snapshot),
+            None,
+            1,
+            None,
+            RowStyle::default(),
+        )
+        .unwrap();
+        assert_eq!(values.quota_month, "30d N/A");
+        assert_eq!(
+            values.quota_month_severity,
+            Some(crate::model::Severity::Unknown)
+        );
+        assert_eq!(values.quota_week, "");
+        assert_eq!(
+            values.quota_error.as_deref(),
+            Some("signed-in account changed")
+        );
     }
 
     #[test]

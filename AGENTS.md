@@ -129,9 +129,9 @@ than a wrong number.
 - OMP stores all accounts in one sanitized provider report so a second pin
   does not lose its quota during debounce. Select by pin; keep a failed
   account's old reading only while the report still identifies that account.
-- Cursor stamps `sha256("cursor\0" || access token)`. Used percent is
-  `includedSpend / limit` of the included monthly pool, never the blended
-  `totalPercentUsed` when those fields exist. The IDE `state.vscdb` mtime is
+- Cursor stamps `sha256("cursor\0" || access token)`. Included is
+  `planUsage.totalPercentUsed` when present — the CLI usage panel's Included
+  row — and only then `includedSpend / limit`. The IDE `state.vscdb` mtime is
   not a credential gate.
 
 ## Devin's per-session model is local SQLite, not the quota API
