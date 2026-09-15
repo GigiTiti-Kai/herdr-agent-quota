@@ -1,5 +1,6 @@
 pub mod agy;
 pub mod claude;
+pub mod cursor;
 pub mod grok;
 pub mod herdr;
 mod integration;
@@ -58,6 +59,9 @@ pub fn run(
         }
         if agents.contains(&Harness::Claude) {
             claude::uninstall()?;
+        }
+        if agents.contains(&Harness::Cursor) {
+            cursor::uninstall()?;
         }
         // The rows on disk were written from these settings, so uninstall
         // needs them to recognise its own work and restore the backup.
@@ -147,6 +151,9 @@ pub fn run(
         if agents.contains(&Harness::Grok) {
             grok::apply()?;
         }
+        if agents.contains(&Harness::Cursor) {
+            cursor::apply()?;
+        }
         integration::report_missing(agents);
     } else {
         let cache = CacheStore::from_env().ok();
@@ -169,6 +176,9 @@ pub fn run(
         }
         if agents.contains(&Harness::Grok) {
             grok::check()?;
+        }
+        if agents.contains(&Harness::Cursor) {
+            cursor::check()?;
         }
         integration::report_missing(agents);
     }

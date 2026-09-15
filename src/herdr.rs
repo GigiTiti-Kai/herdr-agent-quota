@@ -14,7 +14,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 25] = [
+const METADATA_TOKEN_NAMES: [&str; 29] = [
     "quota_provider",
     "quota_model",
     "quota_provider_model",
@@ -37,6 +37,10 @@ const METADATA_TOKEN_NAMES: [&str; 25] = [
     "quota_week_inline_warning",
     "quota_week_inline_danger",
     "quota_week_inline_unknown",
+    "quota_month_normal",
+    "quota_month_warning",
+    "quota_month_danger",
+    "quota_month_unknown",
     "quota_topic",
     "quota_error",
     HEADROOM_TOKEN,
@@ -55,7 +59,7 @@ pub(crate) const HEADROOM_TOKEN: &str = "quota_headroom";
 /// The subset of [`METADATA_TOKEN_NAMES`] whose value comes from the cached
 /// quota windows and nothing else. [`quota_rows_have_drifted`] compares these,
 /// so a name added here must be one a snapshot alone can render.
-const QUOTA_WINDOW_TOKEN_NAMES: [&str; 13] = [
+const QUOTA_WINDOW_TOKEN_NAMES: [&str; 17] = [
     "quota_5h_normal",
     "quota_5h_warning",
     "quota_5h_danger",
@@ -68,6 +72,10 @@ const QUOTA_WINDOW_TOKEN_NAMES: [&str; 13] = [
     "quota_week_inline_warning",
     "quota_week_inline_danger",
     "quota_week_inline_unknown",
+    "quota_month_normal",
+    "quota_month_warning",
+    "quota_month_danger",
+    "quota_month_unknown",
     HEADROOM_TOKEN,
 ];
 /// Names a pane may still carry from an older build of this plugin. They are
@@ -670,6 +678,12 @@ fn desired_tokens(
         &values.quota_week,
         values.quota_week_severity,
     );
+    insert_severity_token(
+        &mut tokens,
+        "quota_month",
+        &values.quota_month,
+        values.quota_month_severity,
+    );
     insert_optional_token(&mut tokens, "quota_topic", topic);
     if let Some(error) = &values.quota_error {
         tokens.insert("quota_error".to_string(), error.clone());
@@ -1216,8 +1230,11 @@ mod tests {
                 desired.len(),
                 desired.keys().collect::<Vec<_>>()
             );
-            // A monthly window must not have leaked in through a weekly token.
+            // A monthly window has its own token; it must not ride a weekly one.
             for (name, value) in &desired {
+                if name.starts_with("quota_month") {
+                    continue;
+                }
                 assert!(
                     !value.contains("30d"),
                     "{provider:?} put a monthly value in {name}"

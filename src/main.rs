@@ -64,5 +64,6 @@ fn main() -> Result<()> {
         ),
         Command::ClaudeStatusline => herdr_agent_quota::configure::claude::run_statusline_hook(),
         Command::AgyStatusline => herdr_agent_quota::configure::agy::run_statusline_hook(),
+        Command::CursorHooks => herdr_agent_quota::configure::cursor::run_hook(),
     }
 }

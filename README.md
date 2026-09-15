@@ -77,11 +77,11 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Layout | `gauges` (default) adds a meter beside each quota number; `packed` groups related fields; `stacked` gives each field a row |
 | Row gap | Zero or one blank line between agents |
 | Watch interval | 30 seconds–1 hour; default 60 seconds |
-| Fields | Provider, topic, model, cache, TTL, context, short/long quota |
+| Fields | Provider, topic, model, cache, TTL, context, short/long/monthly quota |
 | Brand colors | On or off |
 | Agent order | Herdr default or lowest remaining quota first |
 | Low quota alert | Off or a threshold from 1% to 100% |
-| Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse |
+| Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor |
 
 Use arrows or Space to edit, `a` to apply, and `q` to close.
 Installer options are also available through `./install.sh --help`.
@@ -94,6 +94,7 @@ Installer options are also available through `./install.sh --help`.
 | Grok | CLI billing endpoint; 7d or 30d | Current CLI credentials |
 | Devin | CLI usage endpoint; 1d and 7d | Current CLI credentials |
 | Muse Code | CLI subscription endpoint; 5h and 7d | Current CLI account login; session via Muse's session lock (Linux) |
+| Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the desktop `state.vscdb` access token; model and topic from local session files; cache and context from CLI hooks |
 | Claude Code | StatusLine; 5h and 7d | Exact session observation |
 | Agy / Antigravity | StatusLine; 5h and 7d | Exact session and identifiable model pool |
 | OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
@@ -110,7 +111,7 @@ are debounced for 60 seconds, including a final refresh after a turn settles.
 OMP additionally retains its own five-minute usage cache. Idle panes sharing a
 verified quota source receive the same reading.
 
-Native Codex, Grok, Devin, and Muse collectors follow the plugin's current login,
+Native Codex, Grok, Devin, Muse, and Cursor collectors follow the plugin's current login,
 not separate accounts for each pane. Claude/Agy do not report a reliable serving
 account ID, so their observations are not shared across sessions. Unknown
 identity or model-pool attribution does not produce a guessed quota. Failed
@@ -126,6 +127,8 @@ turn failures into zero usage.
 | OMP quota is missing | Check `omp usage --json --redact --provider <id>` |
 | Devin quota is missing | Check the CLI login and `DEVIN_CREDENTIALS_FILE` if customized |
 | Muse quota is missing | Run `muse login` (API-key logins have no subscription quota); check `MUSE_AUTH_PATH` if customized. On macOS, a `storage: "keychain"` login also needs a one-time Keychain approval: run `herdr-agent-quota refresh --provider muse --keychain-approve` and click **Always Allow** |
+| Cursor quota is missing | Run `cursor login`, or sign in to the Cursor desktop app; check `CURSOR_AUTH_FILE` if customized |
+| Cursor cache/context is missing | Restart that Cursor pane so it reloads `hooks.json`, then send a turn (headless `--print` does not fire those hooks) |
 | Rows are missing | Run the configure action below to repair managed configuration |
 | The `gauges` meter disappears on a narrow sidebar | Expected below ~24 columns; widen the sidebar and refresh |
 | `gauges` still uses the old width after a resize | Refresh with `prefix+shift+r`; there is no live resize publish path |

@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Cursor Agent CLI is a supported harness: `--agent cursor`, `--provider cursor`,
+  its own settings row, and a sidebar row with a Cursor brand color. Quota is
+  the included monthly pool from the same
+  `aiserver.v1.DashboardService/GetCurrentPeriodUsage` call the CLI makes,
+  authenticated with `accessToken` in `~/.cursor/auth.json` (macOS) or
+  `$XDG_CONFIG_HOME/cursor/auth.json` (Linux), or `$CURSOR_AUTH_FILE`. When
+  that file is missing or has no token, the collector reads only
+  `cursorAuth/accessToken` from the desktop app's `state.vscdb`, opened
+  read-only. The IDE database's mtime is never a credential gate. Included
+  follows the CLI usage panel: `totalPercentUsed` when present, otherwise
+  `includedSpend / limit`. Auto, API, and Included map onto at / api / 30d.
+  A 30d sidebar field was added so a monthly window is not hidden behind 7d.
+  Model comes from
+  `cli-config.json` (`selectedModel` mapped through `model.displayName`); a
+  session's `lastUsedModel` overrides it. The sidebar title uses Grok's hue.
+  The last
+  `<user_query>` in the session jsonl is the topic, so Cursor panes are never
+  read. Cache and context come from the interactive CLI's
+  `afterAgentResponse` / `stop` / `preCompact` hooks (token counts and, when
+  present, `context_usage_percent` / `context_window_size`). Composer 2.x
+  uses its documented 200k window when the hook omits the size. Cycle end is
+  Unix milliseconds. Snapshots are stamped with
+  `sha256("cursor\0" || token)`. The collector never writes or refreshes
+  Cursor credentials, never opens Keychain, and never calls a bare `agent`
+  binary.
+
 ## [1.5.5] - 2026-09-14
 
 ### Added

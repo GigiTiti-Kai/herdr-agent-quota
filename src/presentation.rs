@@ -1,7 +1,7 @@
 use crate::cli::{FieldSet, PercentStyle, SidebarLayout};
 use crate::model::{
-    format_percent, live_windows, long_window, printed_percent, window_in, Provider,
-    ProviderSnapshot, ResetAt, Severity, UsageWindow, WindowKind,
+    format_percent, live_windows, printed_percent, window_in, Provider, ProviderSnapshot, ResetAt,
+    Severity, UsageWindow, WindowKind,
 };
 
 /// Three-character label, three spaces, `100%`, and a six-character ETA.
@@ -139,6 +139,8 @@ pub struct MetadataTokens {
     pub quota_5h_severity: Option<Severity>,
     pub quota_week: String,
     pub quota_week_severity: Option<Severity>,
+    pub quota_month: String,
+    pub quota_month_severity: Option<Severity>,
     pub quota_context: String,
     /// Read from context *left*, on the same bands as the window severities,
     /// whichever side of the ledger the row prints. Only `gauges` renders it.
@@ -243,7 +245,8 @@ impl MetadataTokens {
         } else {
             None
         };
-        let long = long_window(windows);
+        let weekly = window_in(windows, WindowKind::Weekly);
+        let monthly = window_in(windows, WindowKind::Monthly);
         let quota_5h = if omp_windows {
             short_window
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
@@ -264,10 +267,14 @@ impl MetadataTokens {
                         .flatten()
                 }),
             quota_5h,
-            quota_week: long
+            quota_week: weekly
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
-            quota_week_severity: long.map(|window| Severity::for_window(window, now_unix)),
+            quota_week_severity: weekly.map(|window| Severity::for_window(window, now_unix)),
+            quota_month: monthly
+                .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
+                .unwrap_or_default(),
+            quota_month_severity: monthly.map(|window| Severity::for_window(window, now_unix)),
             quota_context: sidebar_context(context, style, shape),
             quota_context_severity: context.map(|context| context_severity(context, style)),
             quota_cache: sidebar_cache(context),
@@ -293,6 +300,8 @@ impl MetadataTokens {
             quota_5h_severity: missing_five_hour_label(provider).map(|_| Severity::Unknown),
             quota_week: "7d N/A".to_string(),
             quota_week_severity: Some(Severity::Unknown),
+            quota_month: String::new(),
+            quota_month_severity: None,
             quota_context: String::new(),
             quota_context_severity: None,
             quota_cache: String::new(),
@@ -304,21 +313,23 @@ impl MetadataTokens {
     }
 }
 
-/// The least remaining quota across the two windows the sidebar shows.
+/// The least remaining quota across the windows the sidebar shows.
 ///
-/// Deliberately the same pair as the rendered tokens — the 5h window and
-/// whichever long window `long_window` picks — so a sort or an alert can
-/// always be explained by a number the user can see. A monthly window that
-/// the sidebar has no token for never drives either one.
+/// Deliberately the same set as the rendered tokens — 5h, 7d, and 30d — so a
+/// sort or an alert can always be explained by a number the user can see.
 ///
 /// Rounded down, so a window one point above a threshold is never rounded
 /// onto the wrong side of it.
 fn headroom(windows: &[UsageWindow]) -> Option<u8> {
-    window_in(windows, WindowKind::FiveHour)
-        .into_iter()
-        .chain(long_window(windows))
-        .map(|window| window.remaining_percent.clamp(0.0, 100.0).floor() as u8)
-        .min()
+    [
+        window_in(windows, WindowKind::FiveHour),
+        window_in(windows, WindowKind::Weekly),
+        window_in(windows, WindowKind::Monthly),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|window| window.remaining_percent.clamp(0.0, 100.0).floor() as u8)
+    .min()
 }
 
 fn provider_model_label(provider: &str, model: &str) -> String {
@@ -398,7 +409,8 @@ fn missing_five_hour_label(provider: Provider) -> Option<&'static str> {
         | Provider::OpenCodeGo
         | Provider::Omp
         | Provider::Devin
-        | Provider::Muse => None,
+        | Provider::Muse
+        | Provider::Cursor => None,
     }
 }
 
@@ -657,8 +669,7 @@ fn format_ttl(seconds: u64) -> String {
 mod tests {
 
     /// The sort key and the alert both read this, and both have to be
-    /// explainable by a token the user can see, so a monthly window the
-    /// sidebar has no room for must not decide either.
+    /// explainable by a token the user can see.
     #[test]
     fn headroom_is_the_tightest_window_the_sidebar_actually_shows() {
         let snapshot = ProviderSnapshot::new(
@@ -670,9 +681,9 @@ mod tests {
             ],
             0,
         );
-        // 5h has 60 left, 7d has 25, 30d has 2 and is not shown.
+        // 5h has 60 left, 7d has 25, 30d has 2.
         let tokens = MetadataTokens::from_snapshot(&snapshot, 0);
-        assert_eq!(tokens.quota_headroom, Some(25));
+        assert_eq!(tokens.quota_headroom, Some(2));
     }
 
     #[test]
@@ -702,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn a_monthly_window_reaches_the_dashboard_but_never_the_sidebar() {
+    fn a_monthly_window_has_its_own_sidebar_token() {
         let snapshot = ProviderSnapshot::new(
             Provider::OpenCodeGo,
             vec![
@@ -716,10 +727,10 @@ mod tests {
         assert!(dashboard.contains("30d"), "{dashboard}");
 
         let sidebar = MetadataTokens::from_snapshot(&snapshot, 0);
-        assert!(!sidebar.quota_week.contains("30d"), "{sidebar:?}");
-        // No monthly token exists, so the value must not ride in on another.
         assert!(sidebar.quota_5h.contains("5h"));
         assert!(sidebar.quota_week.contains("7d"));
+        assert!(sidebar.quota_month.contains("30d"), "{sidebar:?}");
+        assert!(!sidebar.quota_week.contains("30d"), "{sidebar:?}");
     }
     use super::*;
     use crate::model::{ProviderSnapshot, UsageWindow};
@@ -739,8 +750,9 @@ mod tests {
             0,
         );
         let values = MetadataTokens::from_snapshot(&snapshot, 0);
-        assert_eq!(values.quota_week, "30d 70% 17d8h");
-        assert_eq!(values.quota_week_severity, Some(Severity::Normal));
+        assert_eq!(values.quota_month, "30d 70% 17d8h");
+        assert_eq!(values.quota_month_severity, Some(Severity::Normal));
+        assert_eq!(values.quota_week, "");
         assert_eq!(values.quota_5h, "");
     }
 
@@ -759,6 +771,7 @@ mod tests {
         let values = MetadataTokens::from_snapshot(&snapshot, 0);
         assert_eq!(values.quota_week, "7d 80% 2d3h");
         assert!(!values.quota_week.contains("30d"));
+        assert!(values.quota_month.contains("30d"));
     }
 
     #[test]
@@ -2015,7 +2028,7 @@ mod tests {
             gauges(26),
         );
         assert_eq!(
-            gauged.quota_week,
+            gauged.quota_month,
             "30d \u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  83% 4d22h"
         );
 
@@ -2026,7 +2039,7 @@ mod tests {
             PercentStyle::Remaining,
             SidebarLayout::Packed.into(),
         );
-        assert_eq!(packed.quota_week, "30d 83% 4d22h");
+        assert_eq!(packed.quota_month, "30d 83% 4d22h");
     }
 
     /// `30d 100% 29d23h` is one column past an 18-wide content area. The
@@ -2045,8 +2058,8 @@ mod tests {
             PercentStyle::Used,
             gauges(18),
         );
-        assert_eq!(values.quota_week, "30d 100% 29d");
-        assert!(values.quota_week.chars().count() <= gauges(18).content_width);
+        assert_eq!(values.quota_month, "30d 100% 29d");
+        assert!(values.quota_month.chars().count() <= gauges(18).content_width);
     }
 
     /// A provider-supplied label is never rewritten, so one too long for the
@@ -2068,6 +2081,6 @@ mod tests {
             PercentStyle::Remaining,
             gauges(26),
         );
-        assert_eq!(values.quota_week, "Monthly 83% 4d22h");
+        assert_eq!(values.quota_month, "Monthly 83% 4d22h");
     }
 }

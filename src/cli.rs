@@ -85,7 +85,7 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["check", "apply"])]
         uninstall: bool,
         /// Agents to configure: all, claude, codex, grok, agy, opencode, pi,
-        /// omp, devin, muse. Repeat or comma-separate to pick several. Defaults to
+        /// omp, devin, muse, cursor. Repeat or comma-separate to pick several. Defaults to
         /// every supported agent (or $HERDR_AGENT_QUOTA_AGENTS when set), so
         /// `--uninstall` alone still removes everything this plugin installed.
         #[arg(long, value_delimiter = ',')]
@@ -137,6 +137,9 @@ pub enum Command {
     ClaudeStatusline,
     /// Agy statusLine hook. Antigravity invokes this; not for manual use.
     AgyStatusline,
+    /// Cursor CLI afterAgentResponse/stop/preCompact hook. Cursor invokes this;
+    /// not for manual use.
+    CursorHooks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -148,6 +151,7 @@ pub enum ProviderSelection {
     Agy,
     Devin,
     Muse,
+    Cursor,
 }
 
 impl ProviderSelection {
@@ -160,6 +164,7 @@ impl ProviderSelection {
             Self::Agy => vec![Provider::Agy],
             Self::Devin => vec![Provider::Devin],
             Self::Muse => vec![Provider::Muse],
+            Self::Cursor => vec![Provider::Cursor],
         }
     }
 }
@@ -180,6 +185,7 @@ pub enum AgentSelection {
     Omp,
     Devin,
     Muse,
+    Cursor,
 }
 
 /// How quota tokens are arranged in Herdr's agent sidebar.
@@ -217,10 +223,11 @@ pub enum SidebarField {
     Context,
     FiveHour,
     Week,
+    Month,
 }
 
 impl SidebarField {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Provider,
         Self::Topic,
         Self::Model,
@@ -229,6 +236,7 @@ impl SidebarField {
         Self::Context,
         Self::FiveHour,
         Self::Week,
+        Self::Month,
     ];
 
     pub fn name(self) -> &'static str {
@@ -241,6 +249,7 @@ impl SidebarField {
             Self::Context => "context",
             Self::FiveHour => "5h",
             Self::Week => "7d",
+            Self::Month => "30d",
         }
     }
 
@@ -252,11 +261,12 @@ impl SidebarField {
             .or(match name.as_str() {
                 "week" => Some(Self::Week),
                 "5h_limit" | "five_hour" => Some(Self::FiveHour),
+                "month" | "monthly" => Some(Self::Month),
                 _ => None,
             })
     }
 
-    fn bit(self) -> u8 {
+    fn bit(self) -> u16 {
         1 << Self::ALL
             .iter()
             .position(|field| *field == self)
@@ -266,7 +276,7 @@ impl SidebarField {
 
 /// Which quota fields the sidebar shows. Every field is on by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldSet(u8);
+pub struct FieldSet(u16);
 
 impl FieldSet {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_FIELDS";
@@ -278,6 +288,9 @@ impl FieldSet {
     /// stored for "everything on", which `parse` has to go on reading as
     /// `all()`. The marker keeps the two apart without a version stamp.
     const NO_PROVIDER: &'static str = "no-provider";
+    /// Marker for "everything except 30d". That selection is otherwise the
+    /// list a pre-`30d` build stored for "everything on".
+    const NO_MONTH: &'static str = "no-30d";
 
     pub fn all() -> Self {
         Self(
@@ -290,8 +303,25 @@ impl FieldSet {
     /// The field list a build without a provider field wrote for "everything
     /// on". Those builds drew the provider name regardless of the list, so the
     /// list only ever named the other seven fields.
-    fn pre_provider_full() -> Self {
-        Self::all().toggled(SidebarField::Provider)
+    fn legacy_pre_provider_full() -> Self {
+        Self(
+            [
+                SidebarField::Topic,
+                SidebarField::Model,
+                SidebarField::Cache,
+                SidebarField::Ttl,
+                SidebarField::Context,
+                SidebarField::FiveHour,
+                SidebarField::Week,
+            ]
+            .into_iter()
+            .fold(0, |bits, field| bits | field.bit()),
+        )
+    }
+
+    /// The field list a build without a 30d field wrote for "everything on".
+    fn legacy_full() -> Self {
+        Self(Self::legacy_pre_provider_full().0 | SidebarField::Provider.bit())
     }
 
     pub fn contains(self, field: SidebarField) -> bool {
@@ -322,10 +352,30 @@ impl FieldSet {
             .map(SidebarField::name)
             .collect::<Vec<_>>()
             .join(",");
-        if self == Self::pre_provider_full() {
-            return format!("{},{}", Self::NO_PROVIDER, names);
+        let mut markers = Vec::new();
+        if !self.contains(SidebarField::Provider)
+            && (self == Self::all().toggled(SidebarField::Provider)
+                || self
+                    == Self::all()
+                        .toggled(SidebarField::Provider)
+                        .toggled(SidebarField::Month))
+        {
+            markers.push(Self::NO_PROVIDER);
         }
-        names
+        if !self.contains(SidebarField::Month)
+            && (self == Self::all().toggled(SidebarField::Month)
+                || self
+                    == Self::all()
+                        .toggled(SidebarField::Provider)
+                        .toggled(SidebarField::Month))
+        {
+            markers.push(Self::NO_MONTH);
+        }
+        if markers.is_empty() {
+            names
+        } else {
+            format!("{},{names}", markers.join(","))
+        }
     }
 
     /// `None` when nothing in the list is a field name, so an unparsable
@@ -345,11 +395,16 @@ impl FieldSet {
         if raw.eq_ignore_ascii_case("none") {
             return Some(Self(0));
         }
-        let mut bits = 0;
+        let mut bits = 0u16;
         let mut provider_named = false;
+        let mut month_excluded = false;
         for token in raw.split(',').map(str::trim) {
             if token.eq_ignore_ascii_case(Self::NO_PROVIDER) {
                 provider_named = true;
+                continue;
+            }
+            if token.eq_ignore_ascii_case(Self::NO_MONTH) {
+                month_excluded = true;
                 continue;
             }
             let Some(field) = SidebarField::parse(token) else {
@@ -359,7 +414,10 @@ impl FieldSet {
             bits |= field.bit();
         }
         let fields = Self(bits);
-        if !provider_named && fields == Self::pre_provider_full() {
+        if !provider_named && fields == Self::legacy_pre_provider_full() {
+            return Some(Self::all());
+        }
+        if !month_excluded && fields == Self::legacy_full() {
             return Some(Self::all());
         }
         (bits != 0).then_some(fields)
@@ -736,7 +794,7 @@ impl AgentSelection {
     /// New agents are appended, never inserted, so a saved complete list from
     /// an earlier build is a proper prefix of this array and can still mean
     /// "everything on" after a provider is added.
-    pub const SUPPORTED: [Harness; 9] = [
+    pub const SUPPORTED: [Harness; 10] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Grok,
@@ -746,6 +804,7 @@ impl AgentSelection {
         Harness::Omp,
         Harness::Devin,
         Harness::Muse,
+        Harness::Cursor,
     ];
 
     /// Length of the first complete list the settings pane persisted.
@@ -771,6 +830,7 @@ impl AgentSelection {
             Self::Omp => Some(Harness::Omp),
             Self::Devin => Some(Harness::Devin),
             Self::Muse => Some(Harness::Muse),
+            Self::Cursor => Some(Harness::Cursor),
         }
     }
 
@@ -785,6 +845,7 @@ impl AgentSelection {
             Harness::Omp => "omp",
             Harness::Devin => "devin",
             Harness::Muse => "muse",
+            Harness::Cursor => "cursor",
         }
     }
 
@@ -860,6 +921,7 @@ impl AgentSelection {
             "omp" => Some(Self::Omp),
             "devin" => Some(Self::Devin),
             "muse" => Some(Self::Muse),
+            "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -1086,9 +1148,19 @@ mod tests {
             let selected = AgentSelection::from_args_or_env(&[]);
             assert_eq!(
                 selected,
-                AgentSelection::SUPPORTED[..AgentSelection::SUPPORTED.len() - 1].to_vec()
+                vec![
+                    Harness::Claude,
+                    Harness::Codex,
+                    Harness::Grok,
+                    Harness::Agy,
+                    Harness::OpenCode,
+                    Harness::Pi,
+                    Harness::Omp,
+                    Harness::Devin,
+                ]
             );
             assert!(!selected.contains(&Harness::Muse));
+            assert!(!selected.contains(&Harness::Cursor));
 
             crate::prefs::write(crate::prefs::AGENTS, "only,grok").unwrap();
             assert_eq!(AgentSelection::from_args_or_env(&[]), vec![Harness::Grok]);
@@ -1113,7 +1185,16 @@ mod tests {
             AgentSelection::as_cli_list(&[Harness::Grok, Harness::Claude]),
             "grok,claude"
         );
-        let pre_muse = &AgentSelection::SUPPORTED[..AgentSelection::SUPPORTED.len() - 1];
+        let pre_muse = &[
+            Harness::Claude,
+            Harness::Codex,
+            Harness::Grok,
+            Harness::Agy,
+            Harness::OpenCode,
+            Harness::Pi,
+            Harness::Omp,
+            Harness::Devin,
+        ];
         assert_eq!(
             AgentSelection::as_stored_list(pre_muse),
             "only,claude,codex,grok,agy,opencode,pi,omp,devin"
@@ -1121,6 +1202,15 @@ mod tests {
         assert_eq!(
             AgentSelection::as_cli_list(pre_muse),
             "claude,codex,grok,agy,opencode,pi,omp,devin"
+        );
+        let pre_cursor = &AgentSelection::SUPPORTED[..AgentSelection::SUPPORTED.len() - 1];
+        assert_eq!(
+            AgentSelection::as_stored_list(pre_cursor),
+            "only,claude,codex,grok,agy,opencode,pi,omp,devin,muse"
+        );
+        assert_eq!(
+            AgentSelection::as_cli_list(pre_cursor),
+            "claude,codex,grok,agy,opencode,pi,omp,devin,muse"
         );
     }
 
@@ -1251,5 +1341,19 @@ mod tests {
         assert!(!five_hour.contains(SidebarField::Provider));
         assert_eq!(FieldSet::parse(&five_hour.as_list()), Some(five_hour));
         assert!(FieldSet::parse("none").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_pre_month_full_list_still_selects_every_field() {
+        assert_eq!(
+            FieldSet::parse("provider,topic,model,cache,ttl,context,5h,7d"),
+            Some(FieldSet::all())
+        );
+        let without_month = FieldSet::all().toggled(SidebarField::Month);
+        assert_eq!(
+            FieldSet::parse(&without_month.as_list()),
+            Some(without_month)
+        );
+        assert!(without_month.as_list().starts_with("no-30d,"));
     }
 }

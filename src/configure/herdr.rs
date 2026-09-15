@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 43] = [
+const QUOTA_ROW_MARKERS: [&str; 47] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -51,6 +51,10 @@ const QUOTA_ROW_MARKERS: [&str; 43] = [
     "$quota_week_inline_warning",
     "$quota_week_inline_danger",
     "$quota_week_inline_unknown",
+    "$quota_month_normal",
+    "$quota_month_warning",
+    "$quota_month_danger",
+    "$quota_month_unknown",
 ];
 const ROW_GAP_MARKER: &str = "herdr-agent-quota";
 const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
@@ -90,7 +94,7 @@ fn severity_palette(layout: SidebarLayout) -> [&'static str; 3] {
         SidebarLayout::Packed | SidebarLayout::Stacked => SEVERITY_PALETTE,
     }
 }
-const PROVIDER_STYLES: [(Harness, &str, Option<&str>, Option<&str>); 9] = [
+const PROVIDER_STYLES: [(Harness, &str, Option<&str>, Option<&str>); 10] = [
     (Harness::Claude, "claude", Some("#e88461"), Some("#f0a080")),
     (Harness::Codex, "codex", Some("#c4d7f5"), Some("#aab9d0")),
     (Harness::Grok, "grok", Some("#d5d5d8"), Some("#acb0b7")),
@@ -102,6 +106,8 @@ const PROVIDER_STYLES: [(Harness, &str, Option<&str>, Option<&str>); 9] = [
     (Harness::Omp, "omp", Some("#bba3e8"), None),
     (Harness::Devin, "devin", Some("#6c5ce7"), None),
     (Harness::Muse, "muse", Some("#0082fb"), None),
+    // Same hue as Grok: Cursor's picker ships Grok models on the same account.
+    (Harness::Cursor, "cursor", Some("#d5d5d8"), Some("#acb0b7")),
 ];
 const THEME_SELECTION_KEYS: [&str; 2] = ["selection_bg", "active_row_bg"];
 const OFFICIAL_IDENTITY_TOKENS: [&str; 4] = ["state_icon", "machine", "workspace", "tab"];
@@ -1036,6 +1042,9 @@ fn append_stacked_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     append_window_style_tokens(&mut week, "quota_week_inline", palette);
     append_window_style_tokens(&mut week, "quota_week", palette);
     rows.push(Value::Array(week));
+    let mut month = Array::new();
+    append_window_style_tokens(&mut month, "quota_month", palette);
+    rows.push(Value::Array(month));
 }
 
 /// Drop the tokens of every field the user turned off, then drop the rows
@@ -1104,6 +1113,7 @@ fn field_for_token(token: &str) -> Option<SidebarField> {
         | "$quota_context_danger" => Some(SidebarField::Context),
         _ if token.starts_with("$quota_5h") => Some(SidebarField::FiveHour),
         _ if token.starts_with("$quota_week") => Some(SidebarField::Week),
+        _ if token.starts_with("$quota_month") => Some(SidebarField::Month),
         _ => None,
     }
 }
@@ -1164,7 +1174,7 @@ fn append_context_style_tokens(row: &mut Array, palette: [&'static str; 3]) {
 
 fn append_window_row(rows: &mut Array, palette: [&'static str; 3]) {
     let mut row = Array::new();
-    for base in ["quota_5h", "quota_week"] {
+    for base in ["quota_5h", "quota_week", "quota_month"] {
         append_window_style_tokens(&mut row, base, palette);
     }
     rows.push(Value::Array(row));
@@ -1247,6 +1257,7 @@ fn skipped_provider_label(provider: &str) -> &str {
         "omp" => "OMP",
         "devin" => "Devin",
         "muse" => "Muse",
+        "cursor" => "Cursor",
         other => other,
     }
 }
@@ -1615,6 +1626,11 @@ rows = [["state_icon", "agent"]]
                 && !row_contains_token(row, "$quota_5h_normal")
                 && !row_contains_token(row, "$quota_context")
         }));
+        assert!(rows.iter().any(|row| {
+            row_contains_token(row, "$quota_month_normal")
+                && !row_contains_token(row, "$quota_week_normal")
+                && !row_contains_token(row, "$quota_5h_normal")
+        }));
         assert!(!rows.iter().any(|row| {
             row_contains_token(row, "$quota_cache") && row_contains_token(row, "$quota_cache_ttl")
         }));
@@ -1805,11 +1821,9 @@ rows = [["state_icon", "agent"]]
         }
     }
 
-    /// The bytes `packed` and `stacked` write are the contract for every
-    /// installation that already exists: these digests were taken before
-    /// `gauges` was added, and a change to either is a defect. They cover the
-    /// agents supported at the time; an agent added since (Muse) only appends
-    /// its own row style and is left out so the digests stay comparable.
+    /// The bytes `packed` and `stacked` write for the agents that existed
+    /// before Muse. A 30d row was added after gauges; these digests track that
+    /// template. An agent added since only appends its own row style.
     #[test]
     fn packed_and_stacked_write_the_same_bytes_as_before_gauges() {
         use sha2::{Digest, Sha256};
@@ -1821,22 +1835,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "9209065bd93f9d5f6aa7786fa9cd5730d3e5ce61caeee510a99c0fee84700c0f",
-                    "6fa28ff4e54301637d40188c849aa161c9d5d55cbce21395f4ca94bc03d654fc",
+                    "15589616248e8842468c95231ba4871004e17db28cf3995a9786164fe3ff4f1b",
+                    "bc1ddbe70f342154b39de41f105fb7a727cffc3ee09688406b3b25949e9b9d26",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "142675cea142ff8ec5b170668586f0cad5456c73fd0d6206a8b762ca60e25956",
-                    "96b87721865ede810f1b730820f20c39429f991aa95917090e5fe1f002d2d996",
+                    "6681965ba5d2375f7cc231a75c857d8cd845646face9c9c85ba65185520ea66a",
+                    "dd4c8830b1e54f5e092a7aab190a14c02a8bd4512062a25e340d9e6b3c7d6806",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "142675cea142ff8ec5b170668586f0cad5456c73fd0d6206a8b762ca60e25956",
-                    "96b87721865ede810f1b730820f20c39429f991aa95917090e5fe1f002d2d996",
+                    "6681965ba5d2375f7cc231a75c857d8cd845646face9c9c85ba65185520ea66a",
+                    "dd4c8830b1e54f5e092a7aab190a14c02a8bd4512062a25e340d9e6b3c7d6806",
                 ],
             ),
         ] {

@@ -54,7 +54,7 @@ Concretely, this means:
 |---|---|---|
 | `startup` | Herdr's `[[startup]]` hook | No |
 | `refresh` | manual action, `startup` | No |
-| `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON`, and never a Pi, omp, or Muse pane — their transcripts carry the evidence |
+| `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON`, and never a Pi, omp, Muse, or Cursor pane — their transcripts carry the evidence |
 | `focus` | `pane.focused` | No |
 | `watch` | detached from a working status event | No (agent metadata only) |
 
@@ -71,7 +71,7 @@ every time they press Enter. Budget accordingly.
 
 The working event starts one global `watch` pulse. It calls `herdr agent list`
 once per configured interval for every supported harness, including Pi, OMP,
-OpenCode, and Muse. Event-spawned watchers defer their first poll. They resolve local
+OpenCode, Muse, and Cursor. Event-spawned watchers defer their first poll. They resolve local
 billing targets, refresh active/settling targets, and publish to siblings with
 the same target without reading terminal output. A finishing target stays in
 the pass until the 60-second debounce has elapsed. The interval defaults to
@@ -81,8 +81,8 @@ interrupt sleeps without polling Herdr. Uninstall writes a stop marker.
 ## omp's quota does not come from a provider endpoint
 
 Every other collector either reads a local credential and calls the provider
-(`codex`, `grok`, `opencode_go`, `devin`) or waits for a statusLine hook
-(`claude`, `agy`). omp is the exception: it keeps its own credential store and
+(`codex`, `grok`, `opencode_go`, `devin`, `muse`, `cursor`) or waits for a
+statusLine hook (`claude`, `agy`). omp is the exception: it keeps its own credential store and
 ships its own usage layer, so `src/providers/omp.rs` shells out to
 `omp usage --json --provider <id>` and reads the answer.
 
@@ -129,6 +129,10 @@ than a wrong number.
 - OMP stores all accounts in one sanitized provider report so a second pin
   does not lose its quota during debounce. Select by pin; keep a failed
   account's old reading only while the report still identifies that account.
+- Cursor stamps `sha256("cursor\0" || access token)`. Used percent is
+  `includedSpend / limit` of the included monthly pool, never the blended
+  `totalPercentUsed` when those fields exist. The IDE `state.vscdb` mtime is
+  not a credential gate.
 
 ## Devin's per-session model is local SQLite, not the quota API
 
@@ -149,6 +153,7 @@ environment, never anything else from it. A session Herdr does report always
 wins. No `/proc` (macOS) means no session, never a guessed one.
 
 The quota call (`muse-code/key`) also returns the account's API key and
+identity. Only `subs_usage` is read. A `storage: "keychain"` login keeps the
 OAuth token out of `auth.json`; the collector then reads that one item through
 `security find-generic-password` (service `ai.meta.dev.credentials`, account
 `meta`). Background processes never prompt: without a recorded approval marker
@@ -171,6 +176,43 @@ chat `runtime.user_intent.accepted`, with `user_prompt_display` accepted too
 because Muse writes it only for some submits.
 Muse publishes no prompt-cache lifetime, so there is no TTL estimate.
 
+## Cursor's quota is DashboardService, not a browser cookie
+
+Cursor Agent CLI is a separate install from the desktop app. Herdr's kind and
+PATH command are `cursor` (alias `cursor-agent`). Never call a bare `agent` —
+that name is Grok's on machines that have both. Herdr has a session
+integration (`herdr integration install cursor`). Event does not read the
+pane: the last `<user_query>` in the session jsonl is the topic.
+
+Credentials, in order: `accessToken` in the CLI auth file (`$CURSOR_AUTH_FILE`,
+else `~/.cursor/auth.json` on macOS, else `$XDG_CONFIG_HOME/cursor/auth.json`),
+then `cursorAuth/accessToken` in the desktop `state.vscdb` (`$CURSOR_STATE_DB`
+or the platform Cursor config path). Open that SQLite file read-only and
+select only that one key. Never copy it, never use its mtime as a gate, never
+read `refreshToken`, never open Keychain, never send a `WorkosCursorSessionToken`
+cookie. The collector does not write, refresh, or exchange tokens; a 401
+re-reads the current files once.
+
+Quota is `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage`
+with `Connect-Protocol-Version: 1`, the same call the CLI makes. Included is
+`planUsage.totalPercentUsed` when present — the CLI usage panel's "Included"
+row — and only then `includedSpend / limit`. The three bars map onto at
+(`autoPercentUsed`, 5h), api (`apiPercentUsed`, 7d), and 30d (Included).
+`billingCycleEnd` is Unix milliseconds. Model is
+`cli-config.json` `model.displayName`, overridden per session by store.db meta
+`lastUsedModel` (never the encrypted blobs). Turn token counts are not in the
+jsonl. Cache and context come from the interactive CLI's `afterAgentResponse`,
+`stop`, and `preCompact` hooks: token counts map the same way the CLI
+statusLine `current_usage` does (`fresh = input - cache_read - cache_write`);
+`context_usage_percent` wins when present, otherwise last `input_tokens`
+against `context_window_size` or Composer 2.x's documented 200k window.
+`configure` writes `herdr-agent-quota-hooks.sh` next to `hooks.json` and
+merges `bash '<script>'` into `afterAgentResponse`, `stop`, and `preCompact`.
+It never replaces Herdr's `sessionStart`. Cursor CLI loads user hooks at
+session start, so an already-running pane must be restarted. Do not install a
+Cursor `statusLine` — that setting replaces the native CLI footer. Cursor publishes no prompt-cache lifetime, so there is
+no TTL. Cache identity is `sha256("cursor\0" || token)`.
+
 ## Herdr state this plugin owns outside a pane
 
 Two things reach past the pane metadata, and both are global to the Herdr
@@ -192,18 +234,17 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    the `events.subscribe` replay and focus-storm problems do not apply.
 
 **`quota_headroom`** is the token that view sorts on: the remaining percent of
-the tighter of the pane's 5h and 7d windows, zero-padded to three digits so
-Herdr's ordering of the text is its numeric ordering. Two properties are load
-bearing:
+the tightest of the pane's 5h, 7d, and 30d windows, zero-padded to three digits
+so Herdr's ordering of the text is its numeric ordering. Two properties are
+load bearing:
 
 - It is published **unconditionally**, not only when the order is enabled. No
   sidebar row renders it, so it costs no screen space; publishing it always is
   what makes toggling the order a Herdr-side change instead of a metadata write
   to every pane, and it adds no writes, because it only moves when a quota
   token beside it moves anyway.
-- It is scoped to the two windows the sidebar actually **shows**. A monthly
-  window has no sidebar token, so letting it decide the sort or an alert would
-  produce an ordering the user cannot explain from the screen.
+- It is scoped to the windows the sidebar actually **shows**. A window without
+  a token never decides the sort or an alert.
 
 **Low quota notifications** fire from both publish paths (`publish_resolved`
 and `handle_named_pane`) so a warning lands at the end of the turn that spent
@@ -277,7 +318,7 @@ Wiring the new name is not enough. Also:
    `ProviderSelection`, the fetch path, and a cache identity. If Herdr has
    no integration for it, `integration_id` returns `None` (Agy, Muse).
 5. If its own transcript is the evidence, `event` must not read the pane
-   (Pi, omp, Muse).
+   (Pi, omp, Muse, Cursor).
 6. Tests that name agents must walk `SUPPORTED`, not a copied list. A copied
    list is how Muse missed the watcher-alive check and the "installs
    everything" sidebar assertions.
