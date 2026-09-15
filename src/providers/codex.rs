@@ -23,7 +23,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const FIVE_HOUR_WINDOW_MINUTES: u64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 const ROLLOUT_TAIL_BYTES: u64 = 256 * 1024;
-const ROLLOUT_HEAD_BYTES: u64 = 256 * 1024;
+/// How far back from EOF to look for the latest `turn_context` when the tail
+/// has none. Codex writes that event at turn start, then tool calls and
+/// `token_count` lines; a long turn can push the model several megabytes
+/// behind EOF. The previous 256 KB *head* fallback returned the session-start
+/// model instead. Chunked reverse reads stay within this budget so a 40 MB
+/// rollout is not scanned on every watch pulse. Observed live threads put the
+/// latest model 1–4 MB from EOF.
+const ROLLOUT_MODEL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+/// Extra bytes kept from the newer chunk so a `turn_context` line that
+/// straddles a 256 KB boundary is complete in the older window. Live
+/// `turn_context` records are about 2 KB.
+const ROLLOUT_LINE_OVERLAP_BYTES: u64 = 8 * 1024;
 const CODEX_CONTEXT_BASELINE_TOKENS: u64 = 12_000;
 /// Prompt cache lifetime assumed for a Codex request.
 ///
@@ -399,17 +410,67 @@ fn read_rollout_observation(path: &Path, session_id: &str) -> Option<RolloutObse
     };
     let mut observation = parse_rollout_observation(&text, session_id)?;
     if observation.model.is_none() {
-        observation.model = read_rollout_head_model(path);
+        // The tail is live token_count / tool output. The latest model sits
+        // further back, at the start of this turn. Never fall back to the
+        // file head: that is the first turn's model, not the current one.
+        observation.model = read_latest_rollout_model(path);
     }
     Some(observation)
 }
 
-fn read_rollout_head_model(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(ROLLOUT_HEAD_BYTES).read_to_end(&mut bytes).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    parse_rollout_model(&text)
+/// Walk the rollout newest-first in tail-sized chunks until a `turn_context`
+/// model is found, stopping at [`ROLLOUT_MODEL_SCAN_BYTES`]. Adjacent chunks
+/// overlap so a `turn_context` that straddles a boundary is still parsed.
+fn read_latest_rollout_model(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    if length == 0 {
+        return None;
+    }
+    let floor = length.saturating_sub(ROLLOUT_MODEL_SCAN_BYTES);
+    let mut cursor = length;
+    while cursor > floor {
+        let start = cursor.saturating_sub(ROLLOUT_TAIL_BYTES).max(floor);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(cursor.saturating_sub(start))
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut slice = text.as_ref();
+        if start > 0 {
+            slice = match slice.split_once('\n') {
+                Some((_, rest)) => rest,
+                None => {
+                    let Some(next) = next_reverse_cursor(start, cursor, floor) else {
+                        break;
+                    };
+                    cursor = next;
+                    continue;
+                }
+            };
+        }
+        if cursor < length && !slice.is_empty() && !slice.ends_with('\n') {
+            slice = slice.rsplit_once('\n').map(|(rest, _)| rest).unwrap_or("");
+        }
+        if let Some(model) = parse_rollout_model(slice) {
+            return Some(model);
+        }
+        let Some(next) = next_reverse_cursor(start, cursor, floor) else {
+            break;
+        };
+        cursor = next;
+    }
+    None
+}
+
+fn next_reverse_cursor(start: u64, cursor: u64, floor: u64) -> Option<u64> {
+    if start <= floor {
+        return None;
+    }
+    let next = start.saturating_add(ROLLOUT_LINE_OVERLAP_BYTES);
+    (next < cursor).then_some(next)
 }
 
 fn parse_rollout_observation(text: &str, session_id: &str) -> Option<RolloutObservation> {
@@ -1041,5 +1102,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(account_id_from_auth(&path).as_deref(), Some("acc-2"));
+    }
+
+    fn token_count_pad_line() -> String {
+        serde_json::to_string(&json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "total_tokens": 50_000,
+                        "cached_input_tokens": 800,
+                        "cache_write_input_tokens": 100
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 1_000,
+                        "cached_input_tokens": 800,
+                        "cache_write_input_tokens": 100
+                    },
+                    "model_context_window": 100_000
+                }
+            }
+        }))
+        .unwrap()
+            + "\n"
+    }
+
+    fn pad_jsonl(body: &mut String, min_len: usize, pad_line: &str) {
+        while body.len() < min_len {
+            body.push_str(pad_line);
+        }
+    }
+
+    fn write_padded_rollout(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    /// A long Codex turn writes `turn_context` at the start, then enough
+    /// `token_count` lines to push that model out of the 256 KB tail. The
+    /// session-start model is still in the first 256 KB. Publishing the head
+    /// fallback is the stale-sidebar bug: context/cache keep moving, model does
+    /// not.
+    #[test]
+    fn latest_turn_context_beyond_the_tail_wins_over_the_session_start_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let pad = token_count_pad_line();
+        let mut body = String::new();
+        body.push_str("{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\"}}\n");
+        pad_jsonl(&mut body, ROLLOUT_TAIL_BYTES as usize + pad.len(), &pad);
+        body.push_str("{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\"}}\n");
+        let tail_floor = body.len() + ROLLOUT_TAIL_BYTES as usize + pad.len();
+        pad_jsonl(&mut body, tail_floor, &pad);
+        write_padded_rollout(
+            &directory
+                .path()
+                .join("sessions/2026/09/15/rollout-session-1.jsonl"),
+            &body,
+        );
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        assert_eq!(
+            snapshot.session_models.get("session-1").map(String::as_str),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(snapshot.model.as_deref(), Some("gpt-5.6-sol"));
+        assert!(snapshot.session_contexts.contains_key("session-1"));
+    }
+
+    #[test]
+    fn session_start_model_is_kept_when_it_is_still_the_latest_turn_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let pad = token_count_pad_line();
+        let mut body = String::new();
+        body.push_str("{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\"}}\n");
+        pad_jsonl(&mut body, ROLLOUT_TAIL_BYTES as usize + pad.len(), &pad);
+        write_padded_rollout(
+            &directory
+                .path()
+                .join("sessions/2026/09/15/rollout-session-1.jsonl"),
+            &body,
+        );
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        assert_eq!(
+            snapshot.session_models.get("session-1").map(String::as_str),
+            Some("gpt-6-astra")
+        );
     }
 }
