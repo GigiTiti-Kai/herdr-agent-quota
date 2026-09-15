@@ -36,6 +36,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Codex sidebar model no longer sticks on the session-start `turn_context`.
+  A long turn writes `turn_context` once at the beginning, then enough
+  `token_count` / tool output that the 256 KB tail has no model line. The
+  previous head fallback then published the first turn's model (`Codex/gpt-6-astra`
+  while the TUI footer already showed `gpt-5.6-sol`). The collector now
+  scans backwards from EOF for the latest `turn_context`, capped so a 40 MB
+  rollout is not read on every watch pulse.
 - `rustls` 0.23.43 → 0.23.45 (`RUSTSEC-2026-0285`). It is a `ureq` TLS
   dependency; the collector sends bearer tokens to provider endpoints, so a
   known-vulnerable handshake stack fails `cargo audit --deny warnings`.
