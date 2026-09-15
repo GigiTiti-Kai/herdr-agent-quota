@@ -34,6 +34,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Cursor credentials, never opens Keychain, and never calls a bare `agent`
   binary.
 
+### Fixed
+
+- `rustls` 0.23.43 → 0.23.45 (`RUSTSEC-2026-0285`). It is a `ureq` TLS
+  dependency; the collector sends bearer tokens to provider endpoints, so a
+  known-vulnerable handshake stack fails `cargo audit --deny warnings`.
+
 ## [1.5.5] - 2026-09-14
 
 ### Added
