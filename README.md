@@ -96,6 +96,10 @@ Installer options are also available through `./install.sh --help`.
 | Muse Code | CLI subscription endpoint; 5h and 7d | Current CLI account login; session via Muse's session lock (Linux) |
 | Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the desktop `state.vscdb` access token; model and topic from local session files; cache and context from CLI hooks |
 | Claude Code | StatusLine; 5h and 7d | Exact session observation |
+| Agy / Antigravity | StatusLine; 5h and 7d | Exact session and identifiable model pool |
+| OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
+| Pi | Canonical Codex quota | Only when the recorded account matches |
+| OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
 
 The Claude Code status line keeps the user's own statusLine output and appends
 a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
@@ -103,12 +107,7 @@ minus the share of the window's clock already run, in points. `↓` means slow
 down, `↑` means there is headroom, `=` is within five points. The window with
 the least remaining quota is paced and named; if that window cannot be paced,
 nothing is appended rather than pacing the looser one: no reset time, expired,
-or in the first 5% of the window.
-| Agy / Antigravity | StatusLine; 5h and 7d | Exact session and identifiable model pool |
-| OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
-| Pi | Canonical Codex quota | Only when the recorded account matches |
-| OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
-
+reset further away than the window is long, or in the first 5% of the window.
 
 Quota windows retain their provider's meaning. Model, context, and cache data
 come from the identified session when available. `ttl≈` marks an estimated
