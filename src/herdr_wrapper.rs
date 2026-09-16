@@ -31,7 +31,9 @@ pub fn list_agent_state() -> Result<AgentState> {
 }
 
 pub fn list_agent_panes() -> Result<Vec<AgentPane>> {
-    Ok(list_agent_state()?.panes)
+    let mut panes = crate::herdr_base::list_agent_panes()?;
+    bind_agy_quota_sessions(&mut panes);
+    Ok(panes)
 }
 
 pub fn find_agent_pane(pane_id: &str) -> Result<Option<AgentPane>> {
