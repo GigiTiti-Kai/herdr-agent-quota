@@ -98,7 +98,8 @@ pub fn locate_integration_marker(integration: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let candidates = [
         home.join(".config/herdr/integrations").join(integration),
-        home.join(".local/share/herdr/integrations").join(integration),
+        home.join(".local/share/herdr/integrations")
+            .join(integration),
     ];
     candidates.into_iter().find(|path| path.exists())
 }
