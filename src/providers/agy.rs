@@ -267,6 +267,30 @@ mod tests {
     }
 
     #[test]
+    fn zero_cache_counters_are_not_a_zero_percent_hit() {
+        let value = json!({
+            "context_window": {
+                "used_percentage": 3.4,
+                "current_usage": {
+                    "input_tokens": 25943,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            },
+            "quota": {"gemini-weekly": {"remaining_fraction": 0.8}}
+        });
+        let snapshot = parse_statusline(&value, 1).unwrap();
+        assert_eq!(
+            snapshot
+                .context
+                .as_ref()
+                .map(|context| context.used_percent),
+            Some(3.4)
+        );
+        assert!(snapshot.context.as_ref().unwrap().cache.is_none());
+    }
+
+    #[test]
     fn parses_the_human_readable_active_model_name() {
         let value = json!({
             "model": {"id": "gemini-3.5-flash", "display_name": "Gemini Flash"},

@@ -73,6 +73,11 @@ fn parse_cache_usage(value: Option<&Value>) -> Option<CacheUsage> {
         "cache_creation_input_tokens",
         "cacheCreationInputTokens",
     );
+    // Agy always emits the cache keys, usually as zeros. That is "no cache
+    // traffic", not a 0.0% hit rate.
+    if read == 0 && creation == 0 {
+        return None;
+    }
     CacheUsage::from_token_counts(fresh, read, creation)
 }
 

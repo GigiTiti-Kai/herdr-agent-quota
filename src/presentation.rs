@@ -1432,6 +1432,11 @@ mod tests {
             "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
             "Gemini 3.8 Flash (High)".to_string(),
         );
+        snapshot.context = Some(crate::model::ContextUsage::new(3.427886962890625).unwrap());
+        snapshot.session_contexts.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            crate::model::ContextUsage::new(3.427886962890625).unwrap(),
+        );
 
         let values = MetadataTokens::from_snapshot_for_pane(
             &snapshot,
@@ -1443,7 +1448,8 @@ mod tests {
         assert_eq!(values.quota_5h, "5h 99% 4h07m");
         assert_eq!(values.quota_week, "7d 98% 6d0h");
         assert_eq!(values.quota_provider_model, "Agy/Gemini 3.8 Flash (High)");
-        assert_eq!(values.quota_context, "");
+        assert_eq!(values.quota_context, "context 3%");
+        assert_eq!(values.quota_cache, "");
     }
 
     #[test]

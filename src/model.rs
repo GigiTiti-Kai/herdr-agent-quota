@@ -693,7 +693,10 @@ impl ProviderSnapshot {
     /// Return context/cache diagnostics for a pane's session. A known session
     /// never falls back to provider-level data, because an older snapshot may
     /// belong to another pane. The global value is used only when the caller
-    /// has no session id at all.
+    /// has no session id at all. Agy also falls back when Herdr's
+    /// antigravity-cli session id is a subagent conversation that is not in
+    /// `session_contexts` — the same unmatched-id case as
+    /// [`Self::model_for_session`].
     pub fn context_for_session(&self, session_id: Option<&str>) -> Option<&ContextUsage> {
         let Some(session_id) = session_id else {
             return self.context.as_ref();
@@ -701,7 +704,10 @@ impl ProviderSnapshot {
         if let Some(context) = self.session_contexts.get(session_id) {
             return Some(context);
         }
-        None
+        match self.provider {
+            Provider::Agy => self.context.as_ref(),
+            _ => None,
+        }
     }
 
     /// Return the quota windows for a pane's session.
@@ -1007,7 +1013,14 @@ impl Severity {
 }
 
 pub fn format_percent(value: f64) -> String {
-    format!("{value:.0}")
+    let rounded = format!("{value:.0}");
+    // `{:.0}` rounds 99.5–99.9 to 100. Agy gemini-5h at remaining_fraction
+    // 0.9986 then paints a full bar while headroom (floored) is already 99.
+    if value < 100.0 && rounded == "100" {
+        "99".to_string()
+    } else {
+        rounded
+    }
 }
 
 /// The whole number the sidebar prints, for callers that must agree with it —
@@ -1041,6 +1054,18 @@ mod tests {
         let value = window(WindowKind::Weekly, 42.5);
         assert_eq!(value.remaining_percent, 57.5);
         assert_eq!(format_percent(value.remaining_percent), "58");
+        assert_eq!(
+            format_percent(window(WindowKind::FiveHour, 0.14411).remaining_percent),
+            "99"
+        );
+    }
+
+    #[test]
+    fn format_percent_does_not_round_a_partial_pool_up_to_full() {
+        assert_eq!(format_percent(99.85589), "99");
+        assert_eq!(format_percent(99.5), "99");
+        assert_eq!(format_percent(100.0), "100");
+        assert_eq!(format_percent(0.0), "0");
     }
 
     #[test]
@@ -1623,6 +1648,11 @@ mod tests {
             "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
             "Gemini 3.8 Flash (High)".to_string(),
         );
+        snapshot.context = Some(ContextUsage::new(3.427886962890625).unwrap());
+        snapshot.session_contexts.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            ContextUsage::new(3.427886962890625).unwrap(),
+        );
 
         let herdr_id = "6a4d6f77-88be-4704-adcc-a51401ad7c03";
         assert_eq!(
@@ -1637,7 +1667,12 @@ mod tests {
             snapshot.model_for_session(Some(herdr_id)),
             Some("Gemini 3.8 Flash (High)")
         );
-        assert!(snapshot.context_for_session(Some(herdr_id)).is_none());
+        assert_eq!(
+            snapshot
+                .context_for_session(Some(herdr_id))
+                .map(|context| context.used_percent),
+            Some(3.427886962890625)
+        );
     }
 
     #[test]

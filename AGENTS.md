@@ -128,10 +128,10 @@ than a wrong number.
   not a conversation. Herdr's `antigravity-cli` session id can be a
   subagent conversation that does not match statusLine `conversation_id`,
   so Agy windows are published from the snapshot's top-level pools. Model
-  falls back to the latest observed name when that id is unknown; context
-  stays blank rather than borrowing another conversation's tokens. Agy
-  must identify the active pool or receive only one possible pool. Do not
-  combine Gemini and third-party quotas for an unknown model.
+  and context fall back to the latest statusLine observation when that id
+  is unknown; cache stays blank unless the payload actually moved cache
+  tokens. Agy must identify the active pool or receive only one possible
+  pool. Do not combine Gemini and third-party quotas for an unknown model.
 - OMP stores all accounts in one sanitized provider report so a second pin
   does not lose its quota during debounce. Select by pin; keep a failed
   account's old reading only while the report still identifies that account.
