@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The Claude Code status line ends with a spending pace for the binding
+  quota window, `⏱ 5h ↓12%`: quota consumed versus how much of the window's
+  clock has run, in points. `↓` means slow down, `↑` means there is headroom,
+  `=` is within five points. It paces against the live window with the least
+  remaining quota and names it (`5h`/`7d`); when that window cannot be paced
+  nothing is shown rather than pacing the looser one: no reset time, expired,
+  or in the first 5% of the window.
 - Cursor Agent CLI is a supported harness: `--agent cursor`, `--provider cursor`,
   its own settings row, and a sidebar row with a Cursor brand color. Quota is
   the included monthly pool from the same

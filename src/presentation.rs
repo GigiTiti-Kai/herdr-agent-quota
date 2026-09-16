@@ -716,6 +716,52 @@ fn format_ttl(seconds: u64) -> String {
     format_duration(seconds)
 }
 
+/// Spending pace for the Claude Code status line: quota consumed versus how
+/// much of the window's clock has run, in percentage points.
+///
+/// Paces against the binding window — the 5h/7d window with the least
+/// remaining quota, the same rule as [`headroom`], because whichever limit
+/// runs out first is the one the pace has to respect — and names it
+/// (`5h`/`7d`) so a weekly pace is never mistaken for a five-hour one. The
+/// binding window is chosen *before* asking whether it can be paced: if it
+/// cannot, nothing is rendered rather than pacing the looser window, which
+/// would put a confident arrow on the wrong budget. `↓` means slow down
+/// (consumption is ahead of the clock), `↑` means there is headroom, `=` is
+/// within five points either way, decided on the unrounded difference with an
+/// inclusive boundary. Nothing is rendered without a reset time, after the
+/// window expires, when its reset lies further away than the window is long,
+/// or in the first 5% of it — the ratio is noise right after a reset, and a
+/// confident wrong arrow is worse than none.
+pub fn pace_segment(windows: &[UsageWindow], now_unix: u64) -> Option<String> {
+    const TOLERANCE_POINTS: f64 = 5.0;
+    const MIN_ELAPSED_FRACTION: f64 = 0.05;
+    let window = windows
+        .iter()
+        .filter(|window| matches!(window.kind, WindowKind::FiveHour | WindowKind::Weekly))
+        // `min_by` keeps the first of equals, and 5h is parsed first.
+        .min_by(|a, b| a.remaining_percent.total_cmp(&b.remaining_percent))?;
+    let remaining = window
+        .resets_at?
+        .unix_seconds()
+        .checked_sub(now_unix)
+        .filter(|remaining| *remaining > 0)?;
+    let duration = window.kind.duration_seconds();
+    let elapsed_seconds = duration.checked_sub(remaining)?;
+    if (elapsed_seconds as f64) < MIN_ELAPSED_FRACTION * duration as f64 {
+        return None;
+    }
+    let elapsed = elapsed_seconds as f64 * 100.0 / duration as f64;
+    let delta = window.used_percent - elapsed;
+    let pace = if delta.abs() <= TOLERANCE_POINTS {
+        "=".to_string()
+    } else if delta > 0.0 {
+        format!("↓{}%", delta.round())
+    } else {
+        format!("↑{}%", (-delta).round())
+    };
+    Some(format!("⏱ {} {pace}", window.kind.label()))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2250,5 +2296,121 @@ mod tests {
             gauges(26),
         );
         assert_eq!(values.quota_month, "Monthly 83% 4d22h");
+    }
+
+    // --- Claude status line spending pace ---------------------------------
+
+    const HOUR: u64 = 3_600;
+    const DAY: u64 = 24 * HOUR;
+
+    /// 58% spent with 40% of the 5h window gone: 18 points ahead of the
+    /// clock, so slow down.
+    #[test]
+    fn pace_ahead_of_the_clock_says_slow_down() {
+        let windows = vec![window(WindowKind::FiveHour, 58.0, 3 * HOUR)];
+        assert_eq!(pace_segment(&windows, 0).as_deref(), Some("⏱ 5h ↓18%"));
+    }
+
+    /// 10% spent with 80% of the window gone: 70 points of headroom.
+    #[test]
+    fn pace_behind_the_clock_says_speed_up() {
+        let windows = vec![window(WindowKind::FiveHour, 10.0, HOUR)];
+        assert_eq!(pace_segment(&windows, 0).as_deref(), Some("⏱ 5h ↑70%"));
+    }
+
+    /// Within five points of the clock is on pace; no arrow, no number.
+    #[test]
+    fn pace_within_tolerance_is_on_pace() {
+        let windows = vec![window(WindowKind::FiveHour, 42.0, 3 * HOUR)];
+        assert_eq!(pace_segment(&windows, 0).as_deref(), Some("⏱ 5h ="));
+        let windows = vec![window(WindowKind::FiveHour, 36.0, 3 * HOUR)];
+        assert_eq!(pace_segment(&windows, 0).as_deref(), Some("⏱ 5h ="));
+    }
+
+    #[test]
+    fn pace_needs_a_reset_time() {
+        let windows = vec![UsageWindow::new(WindowKind::FiveHour, 58.0, None).unwrap()];
+        assert_eq!(pace_segment(&windows, 0), None);
+        assert_eq!(pace_segment(&[], 0), None);
+    }
+
+    /// Right after a reset the elapsed fraction is noise; say nothing until
+    /// 5% of the window (15 minutes of a 5h one) has passed.
+    #[test]
+    fn pace_is_silent_just_after_a_reset() {
+        let windows = vec![window(WindowKind::FiveHour, 3.0, 5 * HOUR - 2 * 60)];
+        assert_eq!(pace_segment(&windows, 0), None);
+        let windows = vec![window(WindowKind::FiveHour, 3.0, 5 * HOUR - 16 * 60)];
+        assert_eq!(pace_segment(&windows, 0).as_deref(), Some("⏱ 5h ="));
+    }
+
+    /// An expired window or a reset further away than the window is long
+    /// (clock skew, provider quirk) is not a pace either.
+    #[test]
+    fn pace_is_silent_for_expired_or_implausible_windows() {
+        let expired = vec![window(WindowKind::FiveHour, 58.0, 100)];
+        assert_eq!(pace_segment(&expired, 200), None);
+        let too_far = vec![window(WindowKind::FiveHour, 58.0, 6 * HOUR)];
+        assert_eq!(pace_segment(&too_far, 0), None);
+    }
+
+    /// Both windows present: pace against the one with the least remaining
+    /// quota, the same rule the sidebar's headroom uses, and say which.
+    #[test]
+    fn pace_follows_the_tightest_window() {
+        let five_hour_binds = vec![
+            window(WindowKind::FiveHour, 58.0, 3 * HOUR),
+            window(WindowKind::Weekly, 27.0, 2 * DAY),
+        ];
+        assert_eq!(
+            pace_segment(&five_hour_binds, 0).as_deref(),
+            Some("⏱ 5h ↓18%")
+        );
+        // 90% of the week spent with 5 of 7 days gone (71% elapsed).
+        let weekly_binds = vec![
+            window(WindowKind::FiveHour, 20.0, 3 * HOUR),
+            window(WindowKind::Weekly, 90.0, 2 * DAY),
+        ];
+        assert_eq!(pace_segment(&weekly_binds, 0).as_deref(), Some("⏱ 7d ↓19%"));
+    }
+
+    /// The binding window is chosen before asking whether it can be paced.
+    /// When it cannot, nothing is shown: pacing the looser window instead
+    /// would put a confident arrow on the wrong budget.
+    #[test]
+    fn a_degraded_binding_window_silences_the_pace_instead_of_falling_back() {
+        // Weekly is tighter (40 left vs 42) and just reset.
+        let tighter_just_reset = vec![
+            window(WindowKind::FiveHour, 58.0, 3 * HOUR),
+            window(WindowKind::Weekly, 60.0, 7 * DAY - HOUR),
+        ];
+        assert_eq!(pace_segment(&tighter_just_reset, 0), None);
+        // 5h is tighter and has no reset time.
+        let tighter_no_reset = vec![
+            UsageWindow::new(WindowKind::FiveHour, 70.0, None).unwrap(),
+            window(WindowKind::Weekly, 27.0, 2 * DAY),
+        ];
+        assert_eq!(pace_segment(&tighter_no_reset, 0), None);
+        // 5h is tighter and expired.
+        let tighter_expired = vec![
+            window(WindowKind::FiveHour, 70.0, 100),
+            window(WindowKind::Weekly, 27.0, 200 + 2 * DAY),
+        ];
+        assert_eq!(pace_segment(&tighter_expired, 200), None);
+    }
+
+    /// The band is decided on the unrounded difference and is inclusive:
+    /// 4.4, 4.6 and 5.0 points are on pace, 5.4 is not.
+    #[test]
+    fn pace_band_boundary_is_inclusive_and_unrounded() {
+        // 3h left of 5h: 40.0% elapsed exactly.
+        let at = |used: f64| pace_segment(&[window(WindowKind::FiveHour, used, 3 * HOUR)], 0);
+        assert_eq!(at(44.4).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(44.6).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(45.0).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(45.4).as_deref(), Some("⏱ 5h ↓5%"));
+        assert_eq!(at(35.6).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(35.0).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(34.6).as_deref(), Some("⏱ 5h ↑5%"));
     }
 }
