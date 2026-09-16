@@ -604,9 +604,13 @@ pub struct ProviderSnapshot {
     #[serde(default)]
     pub session_contexts: BTreeMap<String, ContextUsage>,
     /// StatusLine quota observations keyed by the exact provider session ID.
-    /// Direct API collectors leave this map empty. Current Claude/Agy
-    /// snapshots set `session_quota_only` and never share these observations
-    /// across sessions, because StatusLine does not prove account identity.
+    /// Direct API collectors leave this map empty. Current Claude snapshots
+    /// set `session_quota_only` and never share these observations across
+    /// sessions, because StatusLine does not prove account identity. Agy
+    /// quota is the Google account's gemini/3p pools, so
+    /// [`Self::windows_for_session`] reads the top-level windows even when
+    /// Herdr's antigravity-cli session id does not match statusLine
+    /// `conversation_id`.
     #[serde(default)]
     pub session_windows: BTreeMap<String, Vec<UsageWindow>>,
     /// Legacy Claude profile digests retained for cache format compatibility.
@@ -661,12 +665,14 @@ impl ProviderSnapshot {
 
     /// Return the model for a pane's session.
     ///
-    /// A known Claude/Agy/Codex/Grok session never borrows the provider-level
+    /// A known Claude/Codex/Grok session never borrows the provider-level
     /// value, because that may belong to another pane. Devin populates
     /// `session_models` from `sessions.db`, so a pane whose session id is found
     /// in the DB gets its per-session active model. A pane without a
     /// `session_models` entry — a brand-new session, or one whose id is not in
     /// the DB — falls back to `snapshot.model`, the `config.json` default.
+    /// Agy does the same fallback: Herdr's antigravity-cli session id can be a
+    /// subagent conversation that is not the statusLine `conversation_id`.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
         let Some(session_id) = session_id else {
             return self.model.as_deref();
@@ -677,7 +683,9 @@ impl ProviderSnapshot {
         match self.provider {
             // A Muse session with no completed model call yet runs the
             // `settings.json` default, like a fresh Devin session.
-            Provider::Devin | Provider::Muse | Provider::Cursor => self.model.as_deref(),
+            Provider::Devin | Provider::Muse | Provider::Cursor | Provider::Agy => {
+                self.model.as_deref()
+            }
             _ => None,
         }
     }
@@ -700,18 +708,24 @@ impl ProviderSnapshot {
     ///
     /// Context and model are session-local, so a known session never falls
     /// back to the provider-level value. Quota is account-level: Grok, Codex,
-    /// and Devin share one login's windows across every pane, and the keyed
-    /// maps stay empty for them.
+    /// Devin, and Agy share one login's windows across every pane. Agy still
+    /// keys model/context by statusLine `conversation_id`, but the gemini/3p
+    /// pools are the Google account's, and Herdr's antigravity-cli session id
+    /// can be a subagent conversation that does not match that id.
     ///
     /// Lookup order:
-    /// 1. No session id → top-level `windows`.
-    /// 2. Session has a Claude profile scope with canonical windows → those.
-    /// 3. Session has legacy `session_windows` → those (Agy, old cache).
-    /// 4. Every keyed map is empty → top-level `windows` (Grok/Codex/Devin
+    /// 1. Agy → top-level `windows` (account pools, not conversation quota).
+    /// 2. No session id → top-level `windows`.
+    /// 3. Session has a Claude profile scope with canonical windows → those.
+    /// 4. Session has legacy `session_windows` → those.
+    /// 5. Every keyed map is empty → top-level `windows` (Grok/Codex/Devin
     ///    and a StatusLine cache written before session maps existed).
-    /// 5. Keyed maps exist but this session is unknown → empty. A missing
+    /// 6. Keyed maps exist but this session is unknown → empty. A missing
     ///    session must not borrow another account's numbers.
     pub fn windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
+        if self.provider == Provider::Agy {
+            return &self.windows;
+        }
         if self.session_quota_only {
             return session_id
                 .and_then(|id| self.session_windows.get(id))
@@ -795,8 +809,8 @@ impl ProviderSnapshot {
 
     /// True when the windows this pane would render have already reset.
     ///
-    /// Codex/Grok/Devin share account-level windows, so every pane of that
-    /// login agrees. Claude/Agy key windows by session, so one idle chat
+    /// Codex/Grok/Devin/Agy share account-level windows, so every pane of
+    /// that login agrees. Claude keys windows by session, so one idle chat
     /// expiring must not pull its siblings into a watch pass.
     pub fn displayed_quota_has_expired(&self, session_id: Option<&str>, now_unix: u64) -> bool {
         quota_windows_expired(self.windows_for_session(session_id), now_unix)
@@ -1586,6 +1600,44 @@ mod tests {
                 .used_percent,
             90.0
         );
+    }
+
+    #[test]
+    fn agy_quota_is_the_account_pool_when_herdr_reports_a_subagent_session() {
+        // Live failure: statusLine keys the observation by conversation_id
+        // `ed02b39b-…` while Herdr's antigravity-cli hook reports the spawned
+        // DeepCoderWorkerL0 conversation `6a4d6f77-…`. Session-local lookup
+        // then published `5h N/A` even though gemini-5h was 99% remaining.
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 0.14411, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Gemini 3.8 Flash (High)".to_string()));
+        snapshot.session_windows.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            snapshot.windows.clone(),
+        );
+        snapshot.session_models.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            "Gemini 3.8 Flash (High)".to_string(),
+        );
+
+        let herdr_id = "6a4d6f77-88be-4704-adcc-a51401ad7c03";
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some(herdr_id))
+                .first()
+                .unwrap()
+                .used_percent,
+            0.14411
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some(herdr_id)),
+            Some("Gemini 3.8 Flash (High)")
+        );
+        assert!(snapshot.context_for_session(Some(herdr_id)).is_none());
     }
 
     #[test]

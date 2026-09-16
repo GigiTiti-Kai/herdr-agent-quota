@@ -281,8 +281,11 @@ fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, sessio
     }
 }
 
-/// Grok stores sessions at `sessions/<encoded-cwd>/<session-id>/`. Context and
-/// cache live in `signals.json` when present; newer sessions may only have
+/// Grok stores sessions at `sessions/<encoded-cwd>/<session-id>/`. Context
+/// window usage lives in `signals.json`. Cache totals live in `usage.json`
+/// (`session.cachedReadTokens`); a long in-progress turn no longer writes
+/// `turn_completed` usage into the `updates.jsonl` tail — that tail is tool
+/// calls — so the jsonl scan is only a fallback. Newer sessions may only have
 /// `summary.json` (`current_model_id`) until the first usage signal is written.
 fn collect_recent_session_dirs(directory: &Path) -> Vec<(u64, PathBuf)> {
     let Ok(cwd_entries) = fs::read_dir(directory) else {
@@ -469,9 +472,12 @@ struct LocalSessionObservation {
 
 fn observe_session_dir(session_dir: &Path, session_id: &str) -> Option<LocalSessionObservation> {
     let updates = read_jsonl_tail(&session_dir.join("updates.jsonl"));
+    let usage = read_json(&session_dir.join("usage.json")).ok();
     let mut observation = read_json(&session_dir.join("signals.json"))
         .ok()
-        .and_then(|signals| parse_local_session(&signals, updates.as_deref(), session_id));
+        .and_then(|signals| {
+            parse_local_session(&signals, updates.as_deref(), usage.as_ref(), session_id)
+        });
     if observation
         .as_ref()
         .is_none_or(|observation| observation.model.is_none())
@@ -508,6 +514,7 @@ fn parse_summary_model(summary: &Value) -> Option<String> {
 fn parse_local_session(
     signals: &Value,
     updates: Option<&str>,
+    usage: Option<&Value>,
     session_id: &str,
 ) -> Option<LocalSessionObservation> {
     let model = signals
@@ -540,12 +547,26 @@ fn parse_local_session(
                 .and_then(Value::as_f64)?;
             (capacity > 0.0).then_some(used / capacity * 100.0)
         });
-    let cache =
-        parse_update_cache(updates, session_id).or_else(|| parse_signal_cache(signals, session_id));
+    let cache = parse_usage_file_cache(usage, session_id)
+        .or_else(|| parse_update_cache(updates, session_id))
+        .or_else(|| parse_signal_cache(signals, session_id));
     let context = used
         .and_then(|used| ContextUsage::new(used.clamp(0.0, 100.0)).ok())
         .map(|context| context.with_cache(cache));
     (model.is_some() || context.is_some()).then_some(LocalSessionObservation { model, context })
+}
+
+/// Session-level cache totals from `usage.json`. Grok writes this file during
+/// a turn; `updates.jsonl` only gets a `usage` object when the turn completes.
+fn parse_usage_file_cache(usage: Option<&Value>, session_id: &str) -> Option<CacheUsage> {
+    let session = usage?
+        .get("session")
+        .and_then(Value::as_object)
+        .or_else(|| usage.and_then(Value::as_object))?;
+    let input = token_count(session, "inputTokens", "input_tokens");
+    let read = token_count(session, "cachedReadTokens", "cached_read_tokens");
+    let creation = token_count(session, "cacheCreationTokens", "cache_creation_tokens");
+    cache_usage(input, read, creation, session_id)
 }
 
 fn parse_signal_cache(signals: &Value, session_id: &str) -> Option<CacheUsage> {
@@ -802,7 +823,7 @@ mod tests {
         });
         let updates = r#"{"method":"_x.ai/session/update","params":{"update":{"usage":{"inputTokens":1000,"cachedReadTokens":800,"cacheCreationTokens":100}}}}
 "#;
-        let observation = parse_local_session(&signals, Some(updates), "session-1").unwrap();
+        let observation = parse_local_session(&signals, Some(updates), None, "session-1").unwrap();
         assert_eq!(observation.model.as_deref(), Some("grok-4.6"));
         assert_eq!(observation.context.as_ref().unwrap().used_percent, 16.0);
         let cache = observation.context.unwrap().cache.unwrap();
@@ -810,6 +831,63 @@ mod tests {
         assert_eq!(cache.read_tokens, 800);
         assert_eq!(cache.creation_tokens, 100);
         assert_eq!(cache.session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn usage_json_supplies_cache_when_the_updates_tail_has_no_turn_usage() {
+        // Live Grok 4.6 sessions write cache totals to usage.json during a
+        // turn. updates.jsonl only gets params.update.usage on turn_completed,
+        // and a long working turn's 128 KB tail is tool_call payloads.
+        let signals = json!({
+            "contextWindowUsage": 35,
+            "primaryModelId": "grok-4.6"
+        });
+        let usage = json!({
+            "sessionId": "session-1",
+            "session": {
+                "inputTokens": 5_162_248,
+                "cachedReadTokens": 4_985_984,
+                "cacheCreationTokens": 0
+            }
+        });
+        let noisy_tail = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","rawInput":{"command":"echo cachedReadTokens"}}}}
+"#;
+        let observation =
+            parse_local_session(&signals, Some(noisy_tail), Some(&usage), "session-1").unwrap();
+        assert_eq!(observation.context.as_ref().unwrap().used_percent, 35.0);
+        let cache = observation.context.unwrap().cache.unwrap();
+        assert_eq!(cache.read_tokens, 4_985_984);
+        assert_eq!(cache.fresh_input_tokens, 5_162_248 - 4_985_984);
+        assert!((cache.hit_percent - 96.585).abs() < 0.01);
+    }
+
+    #[test]
+    fn session_dir_reads_usage_json_instead_of_a_tool_call_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions/cwd/session-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("signals.json"),
+            r#"{"contextWindowUsage":35,"primaryModelId":"grok-4.6"}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("usage.json"),
+            r#"{"session":{"inputTokens":1000,"cachedReadTokens":800,"cacheCreationTokens":0}}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("updates.jsonl"),
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","content":[{"type":"text","text":"cachedReadTokens 4985984"}]}}}"#,
+        )
+        .unwrap();
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        let context = snapshot.context_for_session(Some("session-1")).unwrap();
+        assert_eq!(context.used_percent, 35.0);
+        let cache = context.cache.as_ref().unwrap();
+        assert_eq!(cache.read_tokens, 800);
+        assert_eq!(cache.fresh_input_tokens, 200);
     }
 
     #[test]

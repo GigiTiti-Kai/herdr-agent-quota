@@ -112,6 +112,9 @@ pub fn parse_statusline(
     }
     Ok(
         ProviderSnapshot::new(Provider::Agy, windows, fetched_at_unix)
+            // Keeps the StatusLine snapshot usable without an independent
+            // credential file. Quota display is still account-level: see
+            // `ProviderSnapshot::windows_for_session`.
             .session_local()
             .with_model(model)
             .with_context(

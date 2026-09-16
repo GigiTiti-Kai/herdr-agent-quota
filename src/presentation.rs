@@ -1413,6 +1413,40 @@ mod tests {
     }
 
     #[test]
+    fn agy_sidebar_keeps_account_quota_when_herdr_session_is_a_subagent() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![
+                window(WindowKind::FiveHour, 1.0, 14_820),
+                window(WindowKind::Weekly, 2.0, 518_400),
+            ],
+            0,
+        )
+        .session_local()
+        .with_model(Some("Gemini 3.8 Flash (High)".to_string()));
+        snapshot.session_windows.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            snapshot.windows.clone(),
+        );
+        snapshot.session_models.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            "Gemini 3.8 Flash (High)".to_string(),
+        );
+
+        let values = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            Some("6a4d6f77-88be-4704-adcc-a51401ad7c03"),
+            PercentStyle::default(),
+            SidebarShape::default(),
+        );
+        assert_eq!(values.quota_5h, "5h 99% 4h07m");
+        assert_eq!(values.quota_week, "7d 98% 6d0h");
+        assert_eq!(values.quota_provider_model, "Agy/Gemini 3.8 Flash (High)");
+        assert_eq!(values.quota_context, "");
+    }
+
+    #[test]
     fn claude_panes_on_the_same_profile_share_the_newest_quota() {
         let mut snapshot = ProviderSnapshot::new(
             Provider::Claude,

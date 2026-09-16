@@ -16,9 +16,11 @@ use std::process::Command;
 
 /// Herdr's integration id for a harness, when it has one.
 ///
-/// Agy reports through its statusLine instead, so it has no integration. Herdr
-/// ships no Muse integration, and Muse quota is account-level, so a Muse pane
-/// needs no session id to be attributed.
+/// Agy quota comes from the statusLine hook, not Herdr's session id. Herdr
+/// ships `antigravity-cli` for resume, but that id can be a subagent
+/// conversation and is not what statusLine keys quota by, so this plugin
+/// does not wait on it. Muse quota is account-level, so a Muse pane needs
+/// no session id to be attributed.
 fn integration_id(harness: Harness) -> Option<&'static str> {
     match harness {
         Harness::Claude => Some("claude"),

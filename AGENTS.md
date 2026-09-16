@@ -121,10 +121,16 @@ than a wrong number.
   attempted identity; a different login can refresh immediately.
 - Codex rollouts provide diagnostics only. Fresh API windows replace old
   windows, including ones an older plugin borrowed from a rollout.
-- Claude/Agy StatusLine has no reliable serving-account ID. New observations
+- Claude StatusLine has no reliable serving-account ID. New observations
   carry `session_quota_only`; they never share windows by profile directory.
   Rebuild old mailboxes from their raw payload, not merged profile windows.
-- Agy must identify the active pool or receive only one possible pool. Do not
+- Agy StatusLine quota is the Google account's `gemini-*` / `3p-*` pools,
+  not a conversation. Herdr's `antigravity-cli` session id can be a
+  subagent conversation that does not match statusLine `conversation_id`,
+  so Agy windows are published from the snapshot's top-level pools. Model
+  falls back to the latest observed name when that id is unknown; context
+  stays blank rather than borrowing another conversation's tokens. Agy
+  must identify the active pool or receive only one possible pool. Do not
   combine Gemini and third-party quotas for an unknown model.
 - OMP stores all accounts in one sanitized provider report so a second pin
   does not lose its quota during debounce. Select by pin; keep a failed

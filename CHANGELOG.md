@@ -36,6 +36,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Agy sidebar quota no longer stays on `5h N/A` when Herdr's
+  `antigravity-cli` session id is a subagent conversation. StatusLine
+  keys the observation by the parent `conversation_id`; the gemini/3p
+  pools belong to the Google account, so the pane now publishes those
+  top-level windows instead of treating the mismatched id as "no quota".
+  Model falls back to the latest observed name; context stays blank.
+- Grok cache no longer vanishes mid-turn. The CLI now writes session
+  totals to `usage.json` while the turn is still running;
+  `updates.jsonl` only gets a `usage` object on `turn_completed`, and a
+  long working turn's 128 KB tail is tool-call payloads, so the jsonl
+  scan saw nothing. Context still comes from `signals.json`.
 - Codex sidebar model no longer sticks on the session-start `turn_context`.
   A long turn writes `turn_context` once at the beginning, then enough
   `token_count` / tool output that the 256 KB tail has no model line. The
