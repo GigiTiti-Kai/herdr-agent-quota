@@ -604,13 +604,11 @@ pub struct ProviderSnapshot {
     #[serde(default)]
     pub session_contexts: BTreeMap<String, ContextUsage>,
     /// StatusLine quota observations keyed by the exact provider session ID.
-    /// Direct API collectors leave this map empty. Current Claude snapshots
-    /// set `session_quota_only` and never share these observations across
-    /// sessions, because StatusLine does not prove account identity. Agy
-    /// quota is the Google account's gemini/3p pools, so
-    /// [`Self::windows_for_session`] reads the top-level windows even when
-    /// Herdr's antigravity-cli session id does not match statusLine
-    /// `conversation_id`.
+    /// Direct API collectors leave this map empty. Claude and Agy snapshots
+    /// keep these windows conversation-local: Agy's gemini/3p allowance is an
+    /// account pool, but which pool applies is selected by that conversation's
+    /// active model. An unmatched Agy Herdr id may use a stored conversation
+    /// only when exactly one conversation is observable.
     #[serde(default)]
     pub session_windows: BTreeMap<String, Vec<UsageWindow>>,
     /// Legacy Claude profile digests retained for cache format compatibility.
@@ -663,6 +661,50 @@ impl ProviderSnapshot {
         self
     }
 
+    /// The only provider session represented by the session-local maps.
+    ///
+    /// Antigravity's PreInvocation hook may report a spawned subagent
+    /// conversation while statusLine continues to describe the parent TUI
+    /// conversation. Bridging that mismatch is safe only when all retained Agy
+    /// diagnostics point at one conversation. Two distinct ids are ambiguous
+    /// and deliberately return `None` rather than borrowing the latest pane.
+    fn only_observed_session(&self) -> Option<&str> {
+        let mut only = None;
+        for id in self
+            .session_windows
+            .keys()
+            .chain(self.session_models.keys())
+            .chain(self.session_contexts.keys())
+        {
+            let id = id.as_str();
+            match only {
+                None => only = Some(id),
+                Some(current) if current == id => {}
+                Some(_) => return None,
+            }
+        }
+        only
+    }
+
+    /// Resolve the session key used by per-session diagnostics.
+    ///
+    /// Non-Agy providers keep their exact existing lookup. Agy first honors an
+    /// exact statusLine conversation id. If Herdr supplied a different
+    /// subagent id, it may bridge to the sole observed conversation; once two
+    /// conversations are present, the mismatch fails closed.
+    fn session_for_lookup<'a>(&'a self, session_id: &'a str) -> Option<&'a str> {
+        if self.provider != Provider::Agy {
+            return Some(session_id);
+        }
+        if self.session_windows.contains_key(session_id)
+            || self.session_models.contains_key(session_id)
+            || self.session_contexts.contains_key(session_id)
+        {
+            return Some(session_id);
+        }
+        self.only_observed_session()
+    }
+
     /// Return the model for a pane's session.
     ///
     /// A known Claude/Codex/Grok session never borrows the provider-level
@@ -671,18 +713,21 @@ impl ProviderSnapshot {
     /// in the DB gets its per-session active model. A pane without a
     /// `session_models` entry — a brand-new session, or one whose id is not in
     /// the DB — falls back to `snapshot.model`, the `config.json` default.
-    /// Agy does the same fallback: Herdr's antigravity-cli session id can be a
-    /// subagent conversation that is not the statusLine `conversation_id`.
+    /// Agy may use the latest model only when its mismatched Herdr id can be
+    /// attributed to one unambiguous statusLine conversation.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
         let Some(session_id) = session_id else {
             return self.model.as_deref();
         };
+        let session_id = self.session_for_lookup(session_id)?;
         if let Some(model) = self.session_models.get(session_id) {
             return Some(model);
         }
         match self.provider {
             // A Muse session with no completed model call yet runs the
-            // `settings.json` default, like a fresh Devin session.
+            // `settings.json` default, like a fresh Devin session. Agy reaches
+            // this branch only after `session_for_lookup` proved the fallback
+            // unambiguous.
             Provider::Devin | Provider::Muse | Provider::Cursor | Provider::Agy => {
                 self.model.as_deref()
             }
@@ -693,14 +738,13 @@ impl ProviderSnapshot {
     /// Return context/cache diagnostics for a pane's session. A known session
     /// never falls back to provider-level data, because an older snapshot may
     /// belong to another pane. The global value is used only when the caller
-    /// has no session id at all. Agy also falls back when Herdr's
-    /// antigravity-cli session id is a subagent conversation that is not in
-    /// `session_contexts` — the same unmatched-id case as
-    /// [`Self::model_for_session`].
+    /// has no session id at all. Agy can bridge a Herdr subagent id only when
+    /// exactly one statusLine conversation is observable.
     pub fn context_for_session(&self, session_id: Option<&str>) -> Option<&ContextUsage> {
         let Some(session_id) = session_id else {
             return self.context.as_ref();
         };
+        let session_id = self.session_for_lookup(session_id)?;
         if let Some(context) = self.session_contexts.get(session_id) {
             return Some(context);
         }
@@ -712,29 +756,31 @@ impl ProviderSnapshot {
 
     /// Return the quota windows for a pane's session.
     ///
-    /// Context and model are session-local, so a known session never falls
-    /// back to the provider-level value. Quota is account-level: Grok, Codex,
-    /// Devin, and Agy share one login's windows across every pane. Agy still
-    /// keys model/context by statusLine `conversation_id`, but the gemini/3p
-    /// pools are the Google account's, and Herdr's antigravity-cli session id
-    /// can be a subagent conversation that does not match that id.
+    /// Context and model are session-local. Grok, Codex, and Devin have
+    /// provider-level quota windows. Claude and Agy statusLine windows stay
+    /// keyed by conversation: Agy's quota belongs to the account, but the
+    /// active conversation's model selects the gemini or 3p pool.
     ///
     /// Lookup order:
-    /// 1. Agy → top-level `windows` (account pools, not conversation quota).
-    /// 2. No session id → top-level `windows`.
-    /// 3. Session has a Claude profile scope with canonical windows → those.
+    /// 1. Agy with no Herdr session id → latest top-level statusLine windows.
+    /// 2. Session-local snapshot → exact session windows; Agy may bridge an
+    ///    unmatched subagent id only when exactly one conversation is stored.
+    /// 3. Session has a legacy Claude profile scope → canonical scope windows.
     /// 4. Session has legacy `session_windows` → those.
-    /// 5. Every keyed map is empty → top-level `windows` (Grok/Codex/Devin
-    ///    and a StatusLine cache written before session maps existed).
-    /// 6. Keyed maps exist but this session is unknown → empty. A missing
-    ///    session must not borrow another account's numbers.
+    /// 5. Every keyed map is empty → top-level windows (Grok/Codex/Devin and a
+    ///    StatusLine cache written before session maps existed).
+    /// 6. Keyed maps exist but this session is unknown → empty.
     pub fn windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
-        if self.provider == Provider::Agy {
+        if self.provider == Provider::Agy && session_id.is_none() {
             return &self.windows;
         }
         if self.session_quota_only {
-            return session_id
-                .and_then(|id| self.session_windows.get(id))
+            let Some(session_id) = session_id.and_then(|id| self.session_for_lookup(id)) else {
+                return &[];
+            };
+            return self
+                .session_windows
+                .get(session_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
         }
@@ -815,9 +861,9 @@ impl ProviderSnapshot {
 
     /// True when the windows this pane would render have already reset.
     ///
-    /// Codex/Grok/Devin/Agy share account-level windows, so every pane of
-    /// that login agrees. Claude keys windows by session, so one idle chat
-    /// expiring must not pull its siblings into a watch pass.
+    /// Codex/Grok/Devin share provider-level windows. Claude keys windows by
+    /// session. Agy uses an exact or unambiguous statusLine conversation, so an
+    /// unrelated Agy pane cannot make this pane inherit a different pool.
     pub fn displayed_quota_has_expired(&self, session_id: Option<&str>, now_unix: u64) -> bool {
         quota_windows_expired(self.windows_for_session(session_id), now_unix)
     }
@@ -1628,11 +1674,10 @@ mod tests {
     }
 
     #[test]
-    fn agy_quota_is_the_account_pool_when_herdr_reports_a_subagent_session() {
-        // Live failure: statusLine keys the observation by conversation_id
-        // `ed02b39b-…` while Herdr's antigravity-cli hook reports the spawned
-        // DeepCoderWorkerL0 conversation `6a4d6f77-…`. Session-local lookup
-        // then published `5h N/A` even though gemini-5h was 99% remaining.
+    fn agy_subagent_id_uses_the_only_observed_statusline_conversation() {
+        // Live failure: statusLine keys the parent conversation while Herdr's
+        // PreInvocation hook can report a spawned DeepCoderWorkerL0 id. With
+        // one observed Agy conversation the attribution is unambiguous.
         let mut snapshot = ProviderSnapshot::new(
             Provider::Agy,
             vec![quota_window(WindowKind::FiveHour, 0.14411, 10_000)],
@@ -1673,6 +1718,67 @@ mod tests {
                 .map(|context| context.used_percent),
             Some(3.427886962890625)
         );
+    }
+
+    #[test]
+    fn agy_unknown_subagent_does_not_borrow_when_two_conversations_exist() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Claude Sonnet".to_string()))
+        .with_context(Some(ContextUsage::new(70.0).unwrap()));
+        snapshot.session_windows.insert(
+            "parent-gemini".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+        snapshot.session_windows.insert(
+            "parent-claude".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+        );
+        snapshot
+            .session_models
+            .insert("parent-gemini".to_string(), "Gemini Flash".to_string());
+        snapshot
+            .session_models
+            .insert("parent-claude".to_string(), "Claude Sonnet".to_string());
+        snapshot.session_contexts.insert(
+            "parent-gemini".to_string(),
+            ContextUsage::new(20.0).unwrap(),
+        );
+        snapshot.session_contexts.insert(
+            "parent-claude".to_string(),
+            ContextUsage::new(70.0).unwrap(),
+        );
+
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some("parent-gemini"))
+                .first()
+                .unwrap()
+                .used_percent,
+            10.0
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some("parent-gemini")),
+            Some("Gemini Flash")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("parent-gemini"))
+                .map(|context| context.used_percent),
+            Some(20.0)
+        );
+
+        assert!(snapshot
+            .windows_for_session(Some("unknown-subagent"))
+            .is_empty());
+        assert_eq!(snapshot.model_for_session(Some("unknown-subagent")), None);
+        assert!(snapshot
+            .context_for_session(Some("unknown-subagent"))
+            .is_none());
     }
 
     #[test]
