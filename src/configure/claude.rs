@@ -1,6 +1,7 @@
 use super::statusline::{settings_path, Adapter};
 use crate::cache::{CacheStore, DEFAULT_WATCH_INTERVAL_SECONDS};
 use crate::model::Provider;
+use crate::presentation::pace_segment;
 use crate::providers::claude::parse_statusline;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -70,8 +71,11 @@ pub fn uninstall_at(settings: &Path, state: &Path) -> Result<()> {
 pub fn run_statusline_hook() -> Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
+    let mut pace = None;
     if let Ok(value) = serde_json::from_slice::<Value>(&input) {
-        if let Ok(snapshot) = parse_statusline(&value, CacheStore::now_unix()) {
+        let now_unix = CacheStore::now_unix();
+        if let Ok(snapshot) = parse_statusline(&value, now_unix) {
+            pace = pace_segment(&snapshot.windows, now_unix);
             if let Ok(cache) = CacheStore::from_env() {
                 let _ = cache.save_statusline_observation(Provider::Claude, snapshot, &value);
             }
@@ -79,15 +83,59 @@ pub fn run_statusline_hook() -> Result<()> {
     }
     let cache = CacheStore::from_env()?;
     let Some(output) = CONFIG.run_previous(cache.root(), &input)? else {
+        if let Some(pace) = pace {
+            println!("{pace}");
+        }
         return Ok(());
     };
     if output.timed_out {
         return Ok(());
     }
-    std::io::stdout().write_all(&output.stdout)?;
+    let stdout = if output.exit_code == Some(0) {
+        append_pace(output.stdout, pace.as_deref())
+    } else {
+        output.stdout
+    };
+    std::io::stdout().write_all(&stdout)?;
     std::io::stdout().flush()?;
     if output.exit_code != Some(0) {
         std::process::exit(output.exit_code.unwrap_or(1));
     }
     Ok(())
+}
+
+/// Add the pace to the end of the wrapped command's last line so the status
+/// line keeps whatever layout the user's own script produced.
+fn append_pace(mut stdout: Vec<u8>, pace: Option<&str>) -> Vec<u8> {
+    let Some(pace) = pace else {
+        return stdout;
+    };
+    let newline = stdout.ends_with(b"\n");
+    while stdout.last() == Some(&b'\n') {
+        stdout.pop();
+    }
+    if !stdout.is_empty() {
+        stdout.push(b' ');
+    }
+    stdout.extend_from_slice(pace.as_bytes());
+    if newline {
+        stdout.push(b'\n');
+    }
+    stdout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pace_joins_the_last_status_line_and_keeps_the_trailing_newline() {
+        assert_eq!(
+            append_pace(b"a\nb\n".to_vec(), Some("⏱ 5h =")),
+            "a\nb ⏱ 5h =\n".as_bytes()
+        );
+        assert_eq!(append_pace(b"a".to_vec(), Some("x")), b"a x");
+        assert_eq!(append_pace(b"".to_vec(), Some("x")), b"x");
+        assert_eq!(append_pace(b"a\n".to_vec(), None), b"a\n");
+    }
 }

@@ -87,10 +87,16 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Muse Code | CLI 订阅接口；5h 和 7d | 当前 CLI 账号登录；会话通过 Muse 的 session lock 识别（Linux） |
 | Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；cache 和 cx 来自 CLI hook |
 | Claude Code | StatusLine；5h 和 7d | 精确会话的观测 |
+
+Claude Code 状态栏保留用户自己的 statusLine 输出，并在末尾追加当前生效额度窗口的
+消耗节奏，例如 `⏱ 5h ↓12%`：已用额度减去窗口已过去的时间比例，单位为百分点。
+`↓` 表示应放慢，`↑` 表示还有余量，`=` 表示相差五个点以内。以剩余额度最少的窗口为
+准并标明窗口（`5h`/`7d`）。没有重置时间、窗口已过期或窗口刚开始的前 5% 不显示。
 | Agy / Antigravity | StatusLine；5h 和 7d | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
 | Pi | 规范 Codex collector 的额度 | 仅在记录的账号一致时复用 |
 | OMP | `omp usage --json --provider <id>` | usage 账号与会话 credential pin 一致 |
+
 
 额度窗口保留上游定义。模型、上下文和缓存数据优先来自已识别的会话。
 `ttl≈` 表示估算的提示词缓存寿命，不保证实际过期时间。
