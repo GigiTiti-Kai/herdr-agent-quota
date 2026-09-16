@@ -101,8 +101,9 @@ The Claude Code status line keeps the user's own statusLine output and appends
 a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
 minus the share of the window's clock already run, in points. `↓` means slow
 down, `↑` means there is headroom, `=` is within five points. The window with
-the least remaining quota is paced and named. Nothing is appended without a
-reset time, after the window expires, or in the first 5% of a window.
+the least remaining quota is paced and named; if that window cannot be paced,
+nothing is appended rather than pacing the looser one: no reset time, expired,
+or in the first 5% of the window.
 | Agy / Antigravity | StatusLine; 5h and 7d | Exact session and identifiable model pool |
 | OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
 | Pi | Canonical Codex quota | Only when the recorded account matches |

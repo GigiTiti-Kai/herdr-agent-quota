@@ -91,7 +91,8 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 Claude Code 状态栏保留用户自己的 statusLine 输出，并在末尾追加当前生效额度窗口的
 消耗节奏，例如 `⏱ 5h ↓12%`：已用额度减去窗口已过去的时间比例，单位为百分点。
 `↓` 表示应放慢，`↑` 表示还有余量，`=` 表示相差五个点以内。以剩余额度最少的窗口为
-准并标明窗口（`5h`/`7d`）。没有重置时间、窗口已过期或窗口刚开始的前 5% 不显示。
+准并标明窗口（`5h`/`7d`）；该窗口无法计算节奏时不显示，也不改用较宽松的窗口：
+没有重置时间、窗口已过期或窗口刚开始的前 5%。
 | Agy / Antigravity | StatusLine；5h 和 7d | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
 | Pi | 规范 Codex collector 的额度 | 仅在记录的账号一致时复用 |

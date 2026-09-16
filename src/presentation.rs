@@ -719,43 +719,45 @@ fn format_ttl(seconds: u64) -> String {
 /// Spending pace for the Claude Code status line: quota consumed versus how
 /// much of the window's clock has run, in percentage points.
 ///
-/// Paces against the live window with the least remaining quota — the same
-/// rule as [`headroom`], because whichever limit runs out first is the one
-/// the pace has to respect — and names it (`5h`/`7d`) so a weekly pace is
-/// never mistaken for a five-hour one. `↓` means slow down (consumption is
-/// ahead of the clock), `↑` means there is headroom, `=` is within five
-/// points either way. Renders nothing when there is no window, no reset time,
-/// the window has expired, its reset lies further away than the window is
-/// long, or less than 5% of it has elapsed — the ratio is noise right after a
-/// reset, and a confident wrong arrow is worse than none.
+/// Paces against the binding window — the 5h/7d window with the least
+/// remaining quota, the same rule as [`headroom`], because whichever limit
+/// runs out first is the one the pace has to respect — and names it
+/// (`5h`/`7d`) so a weekly pace is never mistaken for a five-hour one. The
+/// binding window is chosen *before* asking whether it can be paced: if it
+/// cannot, nothing is rendered rather than pacing the looser window, which
+/// would put a confident arrow on the wrong budget. `↓` means slow down
+/// (consumption is ahead of the clock), `↑` means there is headroom, `=` is
+/// within five points either way, decided on the unrounded difference with an
+/// inclusive boundary. Nothing is rendered without a reset time, after the
+/// window expires, when its reset lies further away than the window is long,
+/// or in the first 5% of it — the ratio is noise right after a reset, and a
+/// confident wrong arrow is worse than none.
 pub fn pace_segment(windows: &[UsageWindow], now_unix: u64) -> Option<String> {
     const TOLERANCE_POINTS: f64 = 5.0;
     const MIN_ELAPSED_FRACTION: f64 = 0.05;
-    let elapsed_percent = |window: &UsageWindow| -> Option<f64> {
-        if !matches!(window.kind, WindowKind::FiveHour | WindowKind::Weekly) {
-            return None;
-        }
-        let remaining = window
-            .resets_at?
-            .unix_seconds()
-            .checked_sub(now_unix)
-            .filter(|remaining| *remaining > 0)?;
-        let duration = window.kind.duration_seconds();
-        let elapsed = duration.checked_sub(remaining)? as f64 / duration as f64;
-        (elapsed >= MIN_ELAPSED_FRACTION).then_some(elapsed * 100.0)
-    };
-    let (window, elapsed) = windows
+    let window = windows
         .iter()
-        .filter_map(|window| elapsed_percent(window).map(|elapsed| (window, elapsed)))
+        .filter(|window| matches!(window.kind, WindowKind::FiveHour | WindowKind::Weekly))
         // `min_by` keeps the first of equals, and 5h is parsed first.
-        .min_by(|a, b| a.0.remaining_percent.total_cmp(&b.0.remaining_percent))?;
-    let delta = (window.used_percent - elapsed).round();
-    let pace = if delta.abs() < TOLERANCE_POINTS {
+        .min_by(|a, b| a.remaining_percent.total_cmp(&b.remaining_percent))?;
+    let remaining = window
+        .resets_at?
+        .unix_seconds()
+        .checked_sub(now_unix)
+        .filter(|remaining| *remaining > 0)?;
+    let duration = window.kind.duration_seconds();
+    let elapsed_seconds = duration.checked_sub(remaining)?;
+    if (elapsed_seconds as f64) < MIN_ELAPSED_FRACTION * duration as f64 {
+        return None;
+    }
+    let elapsed = elapsed_seconds as f64 * 100.0 / duration as f64;
+    let delta = window.used_percent - elapsed;
+    let pace = if delta.abs() <= TOLERANCE_POINTS {
         "=".to_string()
     } else if delta > 0.0 {
-        format!("↓{delta}%")
+        format!("↓{}%", delta.round())
     } else {
-        format!("↑{}%", -delta)
+        format!("↑{}%", (-delta).round())
     };
     Some(format!("⏱ {} {pace}", window.kind.label()))
 }
@@ -2370,14 +2372,45 @@ mod tests {
             window(WindowKind::Weekly, 90.0, 2 * DAY),
         ];
         assert_eq!(pace_segment(&weekly_binds, 0).as_deref(), Some("⏱ 7d ↓19%"));
-        // A weekly window that just reset falls back to the 5h one.
-        let weekly_just_reset = vec![
+    }
+
+    /// The binding window is chosen before asking whether it can be paced.
+    /// When it cannot, nothing is shown: pacing the looser window instead
+    /// would put a confident arrow on the wrong budget.
+    #[test]
+    fn a_degraded_binding_window_silences_the_pace_instead_of_falling_back() {
+        // Weekly is tighter (40 left vs 42) and just reset.
+        let tighter_just_reset = vec![
             window(WindowKind::FiveHour, 58.0, 3 * HOUR),
             window(WindowKind::Weekly, 60.0, 7 * DAY - HOUR),
         ];
-        assert_eq!(
-            pace_segment(&weekly_just_reset, 0).as_deref(),
-            Some("⏱ 5h ↓18%")
-        );
+        assert_eq!(pace_segment(&tighter_just_reset, 0), None);
+        // 5h is tighter and has no reset time.
+        let tighter_no_reset = vec![
+            UsageWindow::new(WindowKind::FiveHour, 70.0, None).unwrap(),
+            window(WindowKind::Weekly, 27.0, 2 * DAY),
+        ];
+        assert_eq!(pace_segment(&tighter_no_reset, 0), None);
+        // 5h is tighter and expired.
+        let tighter_expired = vec![
+            window(WindowKind::FiveHour, 70.0, 100),
+            window(WindowKind::Weekly, 27.0, 200 + 2 * DAY),
+        ];
+        assert_eq!(pace_segment(&tighter_expired, 200), None);
+    }
+
+    /// The band is decided on the unrounded difference and is inclusive:
+    /// 4.4, 4.6 and 5.0 points are on pace, 5.4 is not.
+    #[test]
+    fn pace_band_boundary_is_inclusive_and_unrounded() {
+        // 3h left of 5h: 40.0% elapsed exactly.
+        let at = |used: f64| pace_segment(&[window(WindowKind::FiveHour, used, 3 * HOUR)], 0);
+        assert_eq!(at(44.4).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(44.6).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(45.0).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(45.4).as_deref(), Some("⏱ 5h ↓5%"));
+        assert_eq!(at(35.6).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(35.0).as_deref(), Some("⏱ 5h ="));
+        assert_eq!(at(34.6).as_deref(), Some("⏱ 5h ↑5%"));
     }
 }
