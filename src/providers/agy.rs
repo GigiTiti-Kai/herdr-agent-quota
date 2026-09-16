@@ -110,21 +110,35 @@ pub fn parse_statusline(
             "quota has no supported windows".to_string(),
         ));
     }
+
+    let mut context = parse_context(
+        value
+            .get("context_window")
+            .or_else(|| value.get("contextWindow")),
+    )
+    .unwrap_or(None);
+    // Antigravity currently emits cache counter keys even when the active
+    // model has no cache traffic. Keep this provider quirk local to Agy: the
+    // shared statusLine parser must still represent a real zero-percent hit
+    // for providers where zero read/create counters are meaningful.
+    let idle_cache_counters = context
+        .as_ref()
+        .and_then(|context| context.cache.as_ref())
+        .is_some_and(|cache| cache.read_tokens == 0 && cache.creation_tokens == 0);
+    if idle_cache_counters {
+        if let Some(context) = context.as_mut() {
+            context.cache = None;
+        }
+    }
+
     Ok(
         ProviderSnapshot::new(Provider::Agy, windows, fetched_at_unix)
-            // Keeps the StatusLine snapshot usable without an independent
-            // credential file. Quota display is still account-level: see
-            // `ProviderSnapshot::windows_for_session`.
+            // StatusLine evidence remains conversation-local in the cache.
+            // `ProviderSnapshot` only bridges a mismatched Herdr subagent id
+            // when exactly one Agy conversation is observable.
             .session_local()
             .with_model(model)
-            .with_context(
-                parse_context(
-                    value
-                        .get("context_window")
-                        .or_else(|| value.get("contextWindow")),
-                )
-                .unwrap_or(None),
-            ),
+            .with_context(context),
     )
 }
 
