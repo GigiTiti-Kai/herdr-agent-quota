@@ -1413,6 +1413,95 @@ mod tests {
     }
 
     #[test]
+    fn agy_sidebar_keeps_account_quota_when_herdr_session_is_a_subagent() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![
+                window(WindowKind::FiveHour, 1.0, 14_820),
+                window(WindowKind::Weekly, 2.0, 518_400),
+            ],
+            0,
+        )
+        .session_local()
+        .with_model(Some("Gemini 3.8 Flash (High)".to_string()));
+        snapshot.session_windows.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            snapshot.windows.clone(),
+        );
+        snapshot.session_models.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            "Gemini 3.8 Flash (High)".to_string(),
+        );
+        snapshot.context = Some(crate::model::ContextUsage::new(3.427886962890625).unwrap());
+        snapshot.session_contexts.insert(
+            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
+            crate::model::ContextUsage::new(3.427886962890625).unwrap(),
+        );
+
+        let values = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            Some("6a4d6f77-88be-4704-adcc-a51401ad7c03"),
+            PercentStyle::default(),
+            SidebarShape::default(),
+        );
+        assert_eq!(values.quota_5h, "5h 99% 4h07m");
+        assert_eq!(values.quota_week, "7d 98% 6d0h");
+        assert_eq!(values.quota_provider_model, "Agy/Gemini 3.8 Flash (High)");
+        assert_eq!(values.quota_context, "context 3%");
+        assert_eq!(values.quota_cache, "");
+    }
+
+    #[test]
+    fn agy_sidebar_does_not_show_another_panes_model_or_context() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![window(WindowKind::FiveHour, 80.0, 14_820)],
+            0,
+        )
+        .session_local()
+        .with_model(Some("Claude Sonnet".to_string()));
+        snapshot.session_windows.insert(
+            "w1:p1".to_string(),
+            vec![window(WindowKind::FiveHour, 10.0, 14_820)],
+        );
+        snapshot.session_windows.insert(
+            "w1:p2".to_string(),
+            vec![window(WindowKind::FiveHour, 80.0, 14_820)],
+        );
+        snapshot
+            .session_models
+            .insert("w1:p2".to_string(), "Claude Sonnet".to_string());
+        snapshot.context = Some(crate::model::ContextUsage::new(70.0).unwrap());
+        snapshot.session_contexts.insert(
+            "w1:p2".to_string(),
+            crate::model::ContextUsage::new(70.0).unwrap(),
+        );
+
+        let pane_a = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            Some("w1:p1"),
+            PercentStyle::default(),
+            SidebarShape::default(),
+        );
+        assert_eq!(pane_a.quota_5h, "5h 90% 4h07m");
+        assert_eq!(pane_a.quota_provider_model, "Agy");
+        assert_eq!(pane_a.quota_context, "");
+        assert_eq!(pane_a.quota_cache, "");
+
+        let pane_b = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            Some("w1:p2"),
+            PercentStyle::default(),
+            SidebarShape::default(),
+        );
+        assert_eq!(pane_b.quota_provider_model, "Agy/Claude Sonnet");
+        assert_eq!(pane_b.quota_context, "context 70%");
+    }
+
+    #[test]
     fn claude_panes_on_the_same_profile_share_the_newest_quota() {
         let mut snapshot = ProviderSnapshot::new(
             Provider::Claude,

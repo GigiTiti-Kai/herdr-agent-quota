@@ -253,6 +253,24 @@ mod tests {
     }
 
     #[test]
+    fn zero_cache_reads_remain_a_real_zero_percent_hit() {
+        let value = json!({
+            "used_percentage": 3.4,
+            "current_usage": {
+                "input_tokens": 25943,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        });
+        let context = parse_context(Some(&value)).unwrap().unwrap();
+        let cache = context.cache.unwrap();
+        assert_eq!(cache.fresh_input_tokens, 25943);
+        assert_eq!(cache.read_tokens, 0);
+        assert_eq!(cache.creation_tokens, 0);
+        assert_eq!(cache.hit_percent, 0.0);
+    }
+
+    #[test]
     fn accumulates_session_cache_counters_once_per_transcript_offset() {
         let transcript = tempfile::NamedTempFile::new().unwrap();
         let first = br#"{"type":"assistant","timestamp":"2026-08-22T10:00:00Z","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":800,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_1h_input_tokens":100}}}}
