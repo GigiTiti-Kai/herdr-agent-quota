@@ -124,14 +124,16 @@ than a wrong number.
 - Claude StatusLine has no reliable serving-account ID. New observations
   carry `session_quota_only`; they never share windows by profile directory.
   Rebuild old mailboxes from their raw payload, not merged profile windows.
-- Agy StatusLine quota is the Google account's `gemini-*` / `3p-*` pools,
-  not a conversation. Herdr's `antigravity-cli` session id can be a
-  subagent conversation that does not match statusLine `conversation_id`,
-  so Agy windows are published from the snapshot's top-level pools. Model
-  and context fall back to the latest statusLine observation when that id
-  is unknown; cache stays blank unless the payload actually moved cache
-  tokens. Agy must identify the active pool or receive only one possible
-  pool. Do not combine Gemini and third-party quotas for an unknown model.
+- Agy's `gemini-*` / `3p-*` allowances are account pools, but the active
+  conversation's model decides which pool applies. Keep windows, model, and
+  context keyed by statusLine `conversation_id`. Herdr's `antigravity-cli`
+  PreInvocation id can be a spawned subagent conversation; if it does not
+  match statusLine, bridge it only when exactly one Agy conversation is
+  retained. With two possible conversations, publish no session-local value
+  rather than borrow the latest pane. Agy must identify the active pool or
+  receive only one possible pool; never combine Gemini and third-party quota.
+  Antigravity's always-present zero cache counters are suppressed in the Agy
+  parser only, so shared statusLine parsing can still represent a real 0% hit.
 - OMP stores all accounts in one sanitized provider report so a second pin
   does not lose its quota during debounce. Select by pin; keep a failed
   account's old reading only while the report still identifies that account.
