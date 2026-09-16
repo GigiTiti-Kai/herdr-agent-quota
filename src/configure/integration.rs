@@ -1,181 +1,141 @@
-//! Herdr agent integration setup and diagnostics.
-//!
-//! Quota attribution starts from the session id Herdr reports for a pane, and
-//! Herdr only learns that id once its integration for that agent is installed.
-//! Without it a pane is detected but carries no session, so this plugin can
-//! never attribute it and silently shows nothing. That is the least obvious
-//! way for a fresh install to look broken, so `configure` says so out loud.
-//!
-//! omp is installed automatically when the user enables omp in this plugin;
-//! otherwise the pane can be detected but has no session path, which makes
-//! every omp feature look broken. Existing integrations are left untouched.
-
+use crate::cli::AgentSelection;
 use crate::model::Harness;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Herdr's integration id for a harness, when it has one.
 ///
 /// Agy quota comes from the statusLine hook, not Herdr's session id. Herdr
-/// ships `antigravity-cli` for resume, but that id can be a subagent
-/// conversation and is not what statusLine keys quota by, so this plugin
-/// does not wait on it. Muse quota is account-level, so a Muse pane needs
-/// no session id to be attributed.
+/// ships `antigravity-cli` for resume, but its PreInvocation id can be a
+/// spawned subagent conversation while statusLine describes the parent. The
+/// quota plugin therefore keeps statusLine evidence keyed by its own
+/// conversation id and only bridges an id mismatch when that attribution is
+/// unambiguous. Muse quota is account-level, so a Muse pane needs no session
+/// id to be attributed.
 fn integration_id(harness: Harness) -> Option<&'static str> {
     match harness {
         Harness::Claude => Some("claude"),
         Harness::Codex => Some("codex"),
         Harness::Grok => Some("grok"),
+        Harness::Agy | Harness::Muse => None,
         Harness::OpenCode => Some("opencode"),
         Harness::Pi => Some("pi"),
         Harness::Omp => Some("omp"),
         Harness::Devin => Some("devin"),
         Harness::Cursor => Some("cursor"),
-        Harness::Agy | Harness::Muse => None,
     }
 }
 
-pub fn report_missing(agents: &[Harness]) {
-    let Some(status) = read_status() else {
-        return;
-    };
-    for harness in agents {
-        let Some(id) = integration_id(*harness) else {
-            continue;
-        };
-        if !is_missing(&status, id) {
+pub fn ensure_integrations(agents: &AgentSelection, missing_omp_is_error: bool) -> Result<()> {
+    for harness in AgentSelection::SUPPORTED {
+        if !agents.includes(harness) {
             continue;
         }
-        println!(
-            "Herdr's {id} integration is not installed, so Herdr reports no session id for {id} panes and their quota cannot be attributed. Install it with `herdr integration install {id}`, then restart that agent pane."
-        );
+        let Some(integration) = integration_id(harness) else {
+            continue;
+        };
+        match Command::new("herdr")
+            .args(["integration", "install", integration])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(_) if harness == Harness::Omp && !missing_omp_is_error => {
+                eprintln!("warning: omp integration was not installed; continuing");
+            }
+            Ok(_) if harness == Harness::Omp => bail!(
+                "failed to install Herdr's omp integration. Install/repair omp, then rerun configure"
+            ),
+            Ok(_) => bail!("failed to install Herdr's {integration} integration"),
+            Err(error) if harness == Harness::Omp && !missing_omp_is_error => {
+                eprintln!("warning: could not run herdr integration install omp: {error}");
+            }
+            Err(error) if harness == Harness::Omp => {
+                return Err(error).context(
+                    "run herdr integration install omp. Install/repair omp, then rerun configure",
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("run herdr integration install {integration}")
+                });
+            }
+        }
     }
-}
-
-/// Install the omp integration when omp is selected and Herdr explicitly says
-/// it is absent. A missing `herdr` binary or an unrecognized status format is
-/// not guessed at; the existing advisory remains the fallback.
-///
-/// `full_selection` is the every-agent default a Herdr plugin action always
-/// runs with. There, a machine without omp skips the omp collector and keeps
-/// configuring the others; only an explicit omp selection fails.
-pub fn ensure_omp(agents: &[Harness], full_selection: bool) -> Result<()> {
-    let Some(status) = read_status() else {
-        return Ok(());
-    };
-    if !needs_omp_install(agents, &status) {
-        return Ok(());
-    }
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-    let output = Command::new(executable)
-        .args(["integration", "install", "omp"])
-        .output()?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return omp_install_failed(full_selection, detail.trim());
-    }
-    println!("Installed Herdr's omp integration. Restart already-running omp panes once.");
     Ok(())
 }
 
-fn omp_install_failed(full_selection: bool, detail: &str) -> Result<()> {
-    if full_selection {
-        println!(
-            "Skipped omp: {detail}. Once omp is installed, select it in the settings pane or run configure with --agent omp."
-        );
-        return Ok(());
-    }
-    bail!("install Herdr omp integration: {detail}");
-}
-
-fn needs_omp_install(agents: &[Harness], status: &str) -> bool {
-    agents.contains(&Harness::Omp) && is_missing(status, "omp")
-}
-
-fn read_status() -> Option<String> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-    let output = Command::new(executable)
-        .args(["integration", "status"])
+pub fn integration_state() -> Result<BTreeMap<String, bool>> {
+    let output = Command::new("herdr")
+        .args(["integration", "status", "--json"])
         .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        .context("run herdr integration status --json")?;
+    if !output.status.success() {
+        bail!("herdr integration status --json failed");
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse integration status JSON")?;
+    let mut state = BTreeMap::new();
+    let Some(integrations) = value.get("integrations").and_then(|value| value.as_array()) else {
+        return Ok(state);
+    };
+    for integration in integrations {
+        let Some(id) = integration.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let installed = integration
+            .get("installed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        state.insert(id.to_string(), installed);
+    }
+    Ok(state)
 }
 
-/// Herdr prints one `<id>: <state> (<path>)` line per integration. Only an
-/// explicit "not installed" is actionable; an unknown id or a reworded state
-/// stays quiet rather than nagging about something that may be fine.
-fn is_missing(status: &str, id: &str) -> bool {
-    status.lines().any(|line| {
-        line.trim()
-            .strip_prefix(id)
-            .and_then(|rest| rest.strip_prefix(':'))
-            .is_some_and(|state| state.trim_start().starts_with("not installed"))
-    })
+pub fn locate_integration_marker(integration: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let candidates = [
+        home.join(".config/herdr/integrations").join(integration),
+        home.join(".local/share/herdr/integrations").join(integration),
+    ];
+    candidates.into_iter().find(|path| path.exists())
+}
+
+pub fn remove_integration_marker(integration: &str) -> Result<()> {
+    let Some(path) = locate_integration_marker(integration) else {
+        return Ok(());
+    };
+    if path.is_dir() {
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("remove integration marker {}", path.display()))?;
+    } else {
+        fs::remove_file(&path)
+            .with_context(|| format!("remove integration marker {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub fn path_exists(path: impl AsRef<Path>) -> bool {
+    path.as_ref().exists()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const STATUS: &str = "\
-claude: current (v7) (/home/u/.claude/hooks/herdr-agent-state.sh)
-codex: current (v7) (/home/u/.codex/herdr-agent-state.sh)
-opencode: not installed (/home/u/.config/opencode/plugins/herdr-agent-state.js)
-omp: not installed (/home/u/.omp/agent/extensions/herdr-agent-state.ts)
-grok: outdated (v0) (/home/u/.grok/hooks/herdr-agent-state.sh)
-";
-
     #[test]
-    fn only_an_explicit_not_installed_line_is_reported() {
-        assert!(is_missing(STATUS, "opencode"));
-        assert!(is_missing(STATUS, "omp"));
-        assert!(!is_missing(STATUS, "claude"));
-        assert!(!is_missing(STATUS, "codex"));
-        assert!(!is_missing(STATUS, "grok"));
-        assert!(!is_missing(STATUS, "kimi"));
-        assert!(!is_missing("", "opencode"));
-    }
-
-    #[test]
-    fn a_prefix_match_is_not_a_hit() {
-        // "open" must not match the "opencode:" line.
-        assert!(!is_missing(STATUS, "open"));
-    }
-
-    #[test]
-    fn session_backed_harnesses_report_their_integration_id() {
+    fn harnesses_map_to_expected_integrations() {
+        assert_eq!(integration_id(Harness::Claude), Some("claude"));
+        assert_eq!(integration_id(Harness::Codex), Some("codex"));
+        assert_eq!(integration_id(Harness::Grok), Some("grok"));
         assert_eq!(integration_id(Harness::Agy), None);
-        assert_eq!(integration_id(Harness::Muse), None);
-        assert_eq!(integration_id(Harness::Cursor), Some("cursor"));
         assert_eq!(integration_id(Harness::OpenCode), Some("opencode"));
         assert_eq!(integration_id(Harness::Pi), Some("pi"));
         assert_eq!(integration_id(Harness::Omp), Some("omp"));
         assert_eq!(integration_id(Harness::Devin), Some("devin"));
-    }
-
-    /// The marketplace `configure` action runs a fixed command line, so it
-    /// always selects every supported agent. A machine without omp must still
-    /// get its other collectors instead of a hard failure.
-    #[test]
-    fn a_failed_omp_install_only_aborts_an_explicit_omp_selection() {
-        let detail =
-            "omp extension directory not found at /home/u/.omp/agent/extensions. install omp first";
-        assert!(omp_install_failed(true, detail).is_ok());
-        let explicit =
-            omp_install_failed(false, detail).expect_err("explicit omp must fail loudly");
-        assert!(explicit.to_string().contains(detail), "{explicit}");
-    }
-
-    #[test]
-    fn only_a_selected_and_explicitly_missing_omp_is_auto_installed() {
-        assert!(needs_omp_install(&[Harness::Omp], STATUS));
-        assert!(!needs_omp_install(&[Harness::Pi], STATUS));
-        assert!(!needs_omp_install(
-            &[Harness::Omp],
-            "omp: current (v8) (/home/u/.omp/agent/extensions/herdr-agent-state.ts)"
-        ));
+        assert_eq!(integration_id(Harness::Muse), None);
+        assert_eq!(integration_id(Harness::Cursor), Some("cursor"));
     }
 }
