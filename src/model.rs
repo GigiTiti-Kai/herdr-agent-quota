@@ -713,8 +713,9 @@ impl ProviderSnapshot {
     /// in the DB gets its per-session active model. A pane without a
     /// `session_models` entry — a brand-new session, or one whose id is not in
     /// the DB — falls back to `snapshot.model`, the `config.json` default.
-    /// Agy may use the latest model only when its mismatched Herdr id can be
-    /// attributed to one unambiguous statusLine conversation.
+    /// Agy may use the latest model only when every retained observation
+    /// points at this same conversation. An exact hit in `session_windows`
+    /// is not permission to borrow another pane's label.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
         let Some(session_id) = session_id else {
             return self.model.as_deref();
@@ -725,10 +726,9 @@ impl ProviderSnapshot {
         }
         match self.provider {
             // A Muse session with no completed model call yet runs the
-            // `settings.json` default, like a fresh Devin session. Agy reaches
-            // this branch only after `session_for_lookup` proved the fallback
-            // unambiguous.
-            Provider::Devin | Provider::Muse | Provider::Cursor | Provider::Agy => {
+            // `settings.json` default, like a fresh Devin session.
+            Provider::Devin | Provider::Muse | Provider::Cursor => self.model.as_deref(),
+            Provider::Agy if self.only_observed_session() == Some(session_id) => {
                 self.model.as_deref()
             }
             _ => None,
@@ -738,8 +738,8 @@ impl ProviderSnapshot {
     /// Return context/cache diagnostics for a pane's session. A known session
     /// never falls back to provider-level data, because an older snapshot may
     /// belong to another pane. The global value is used only when the caller
-    /// has no session id at all. Agy can bridge a Herdr subagent id only when
-    /// exactly one statusLine conversation is observable.
+    /// has no session id at all. Agy may use the latest context only when
+    /// every retained observation points at this same conversation.
     pub fn context_for_session(&self, session_id: Option<&str>) -> Option<&ContextUsage> {
         let Some(session_id) = session_id else {
             return self.context.as_ref();
@@ -749,7 +749,9 @@ impl ProviderSnapshot {
             return Some(context);
         }
         match self.provider {
-            Provider::Agy => self.context.as_ref(),
+            Provider::Agy if self.only_observed_session() == Some(session_id) => {
+                self.context.as_ref()
+            }
             _ => None,
         }
     }
@@ -1581,6 +1583,42 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_with_windows_does_not_borrow_provider_model_or_context() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+            0,
+        )
+        .session_local()
+        .with_model(Some("Opus".to_string()))
+        .with_context(Some(ContextUsage::new(40.0).unwrap()));
+        snapshot.session_windows.insert(
+            "session-1".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+        snapshot.session_windows.insert(
+            "session-2".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+        );
+        snapshot
+            .session_models
+            .insert("session-2".to_string(), "Opus".to_string());
+        snapshot
+            .session_contexts
+            .insert("session-2".to_string(), ContextUsage::new(40.0).unwrap());
+
+        assert_eq!(snapshot.model_for_session(Some("session-1")), None);
+        assert!(snapshot.context_for_session(Some("session-1")).is_none());
+        assert_eq!(snapshot.model_for_session(Some("session-2")), Some("Opus"));
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("session-2"))
+                .map(|context| context.used_percent),
+            Some(40.0)
+        );
+    }
+
+    #[test]
     fn devin_new_session_without_model_switch_uses_config_default() {
         let mut snapshot = ProviderSnapshot::new(Provider::Devin, vec![], 0)
             .with_model(Some("SWE-1.7 Medium".to_string()));
@@ -1779,6 +1817,91 @@ mod tests {
         assert!(snapshot
             .context_for_session(Some("unknown-subagent"))
             .is_none());
+    }
+
+    #[test]
+    fn agy_windows_hit_does_not_borrow_another_panes_model_or_context() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Claude Sonnet".to_string()))
+        .with_context(Some(ContextUsage::new(70.0).unwrap()));
+        snapshot.session_windows.insert(
+            "w1:p1".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+        snapshot.session_windows.insert(
+            "w1:p2".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
+        );
+        snapshot
+            .session_models
+            .insert("w1:p2".to_string(), "Claude Sonnet".to_string());
+        snapshot
+            .session_contexts
+            .insert("w1:p2".to_string(), ContextUsage::new(70.0).unwrap());
+
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some("w1:p1"))
+                .first()
+                .unwrap()
+                .used_percent,
+            10.0
+        );
+        assert_eq!(snapshot.model_for_session(Some("w1:p1")), None);
+        assert!(snapshot.context_for_session(Some("w1:p1")).is_none());
+
+        assert_eq!(
+            snapshot.model_for_session(Some("w1:p2")),
+            Some("Claude Sonnet")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("w1:p2"))
+                .map(|context| context.used_percent),
+            Some(70.0)
+        );
+    }
+
+    #[test]
+    fn agy_single_observation_may_use_latest_model_when_session_maps_miss() {
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+            1,
+        )
+        .session_local()
+        .with_model(Some("Gemini Flash".to_string()))
+        .with_context(Some(ContextUsage::new(20.0).unwrap()));
+        snapshot.session_windows.insert(
+            "w1:p7".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
+        );
+
+        assert_eq!(
+            snapshot.model_for_session(Some("w1:p7")),
+            Some("Gemini Flash")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("w1:p7"))
+                .map(|context| context.used_percent),
+            Some(20.0)
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some("unknown-subagent")),
+            Some("Gemini Flash")
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("unknown-subagent"))
+                .map(|context| context.used_percent),
+            Some(20.0)
+        );
     }
 
     #[test]
