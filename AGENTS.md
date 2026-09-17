@@ -210,8 +210,11 @@ row — and only then `includedSpend / limit`. The three bars map onto at
 jsonl. Cache and context come from the interactive CLI's `afterAgentResponse`,
 `stop`, and `preCompact` hooks: token counts map the same way the CLI
 statusLine `current_usage` does (`fresh = input - cache_read - cache_write`);
-`context_usage_percent` wins when present, otherwise last `input_tokens`
-against `context_window_size` or Composer 2.x's documented 200k window.
+Context percent is `store.db` `token_details.used_tokens / max_tokens`, the
+same numbers the CLI footer prints (`Auto · 8.1%`). Only that protobuf field
+is read. Cache still comes from the hooks; `context_usage_percent` wins when
+present, otherwise last `input_tokens` against `context_window_size`,
+Composer 2.x's documented 200k window, or Auto/`default`'s 256k window.
 `configure` writes `herdr-agent-quota-hooks.sh` next to `hooks.json` and
 merges `bash '<script>'` into `afterAgentResponse`, `stop`, and `preCompact`.
 It never replaces Herdr's `sessionStart`. Cursor CLI loads user hooks at

@@ -28,10 +28,13 @@
 //! follow-up does not replace the session name. Placeholder titles such as
 //! `New Agent` fall back to the last `<user_query>` in
 //! `projects/*/agent-transcripts/<id>/<id>.jsonl`. Cursor panes are never
-//! read. Turn token counts are not in that jsonl. Cache and context come from
-//! the interactive CLI's `afterAgentResponse` / `stop` / `preCompact` hooks,
-//! stored as a mailbox under plugin state. A Cursor `statusLine` is not used:
-//! installing one replaces the native CLI footer.
+//! read. Turn token counts are not in that jsonl. Context percent is
+//! `store.db` `ConversationStateStructure.token_details` (`used_tokens` /
+//! `max_tokens`) — the same numbers the CLI footer prints as `Auto · 8.1%`.
+//! Only that protobuf field is read; conversation messages are not. Cache
+//! still comes from the interactive CLI's `afterAgentResponse` / `stop` /
+//! `preCompact` hooks. A Cursor `statusLine` is not used: installing one
+//! replaces the native CLI footer.
 //!
 //! Everything fails closed. A missing or unreadable percentage yields no
 //! window, never "0% used". Cache identity is `sha256("cursor\0" || token)` so
@@ -70,6 +73,12 @@ const HOOK_MAILBOX_DIR: &str = "cursor-hooks";
 /// Composer 2.x's documented context window. Used only when a hook payload
 /// does not name `context_window_size`. Other model ids fail closed.
 const COMPOSER_2_CONTEXT_WINDOW: u64 = 200_000;
+/// Auto/`default` afterAgentResponse omits `context_window_size`. Used only
+/// when `store.db` has no `token_details` and preCompact did not name a window.
+const AUTO_CONTEXT_WINDOW: u64 = 256_000;
+/// Conversation root blobs are a few kilobytes. Anything larger is not the
+/// token_details record this collector reads.
+const MAX_CONVERSATION_BLOB_BYTES: u64 = 256 * 1024;
 
 struct CursorCredentials {
     access_token: String,
@@ -447,6 +456,7 @@ fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, sessio
                 .session_summaries
                 .insert(session_id.clone(), prompt);
         }
+        overlay_store_context_at(snapshot, home, Some(session_id));
     }
 }
 
@@ -470,6 +480,127 @@ fn display_name_for_id(home: &Path, model_id: &str, catalog_id: Option<&str>) ->
 
 fn last_used_model(home: &Path, session_id: &str) -> Option<String> {
     json_text(store_meta(&find_chat_dir(home, session_id)?.join("store.db"))?.get("lastUsedModel"))
+}
+
+fn session_context_from_store(home: &Path, session_id: &str) -> Option<ContextUsage> {
+    let (used, max) =
+        conversation_token_details(&find_chat_dir(home, session_id)?.join("store.db"))?;
+    if max == 0 {
+        return None;
+    }
+    let used_percent = (used as f64 / max as f64 * 100.0).clamp(0.0, 100.0);
+    ContextUsage::new(used_percent).ok()
+}
+
+/// `used_tokens` / `max_tokens` from the conversation root blob.
+///
+/// Same fields the CLI footer uses. The blob is a protobuf
+/// `ConversationStateStructure`; only field 5 (`token_details`) is walked.
+fn conversation_token_details(path: &Path) -> Option<(u64, u64)> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let raw: String = connection
+        .query_row("SELECT value FROM meta LIMIT 1", [], |row| row.get(0))
+        .ok()?;
+    let blob_id = json_text(parse_store_meta(&raw)?.get("latestRootBlobId"))?;
+    if !is_blob_id(&blob_id) {
+        return None;
+    }
+    let data: Vec<u8> = connection
+        .query_row("SELECT data FROM blobs WHERE id = ?1", [blob_id], |row| {
+            row.get(0)
+        })
+        .ok()?;
+    if data.len() as u64 > MAX_CONVERSATION_BLOB_BYTES {
+        return None;
+    }
+    token_details_from_root_blob(&data)
+}
+
+fn is_blob_id(value: &str) -> bool {
+    (16..=128).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn token_details_from_root_blob(data: &[u8]) -> Option<(u64, u64)> {
+    let mut i = 0;
+    while i < data.len() {
+        let (key, next) = read_varint(data, i)?;
+        i = next;
+        let field = key >> 3;
+        let wire = key & 7;
+        match wire {
+            0 => {
+                let (_, next) = read_varint(data, i)?;
+                i = next;
+            }
+            1 => i = i.checked_add(8).filter(|end| *end <= data.len())?,
+            2 => {
+                let (len, next) = read_varint(data, i)?;
+                i = next;
+                let end = i
+                    .checked_add(len as usize)
+                    .filter(|end| *end <= data.len())?;
+                if field == 5 {
+                    return token_details_message(&data[i..end]);
+                }
+                i = end;
+            }
+            5 => i = i.checked_add(4).filter(|end| *end <= data.len())?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn token_details_message(data: &[u8]) -> Option<(u64, u64)> {
+    let mut i = 0;
+    let mut used = None;
+    let mut max = None;
+    while i < data.len() {
+        let (key, next) = read_varint(data, i)?;
+        i = next;
+        let field = key >> 3;
+        let wire = key & 7;
+        match wire {
+            0 => {
+                let (value, next) = read_varint(data, i)?;
+                i = next;
+                if field == 1 {
+                    used = Some(value);
+                } else if field == 2 {
+                    max = Some(value);
+                }
+            }
+            1 => i = i.checked_add(8).filter(|end| *end <= data.len())?,
+            2 => {
+                let (len, next) = read_varint(data, i)?;
+                i = next;
+                i = i
+                    .checked_add(len as usize)
+                    .filter(|end| *end <= data.len())?;
+            }
+            5 => i = i.checked_add(4).filter(|end| *end <= data.len())?,
+            _ => return None,
+        }
+    }
+    Some((used?, max.filter(|max| *max > 0)?))
+}
+
+fn read_varint(data: &[u8], mut i: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    while i < data.len() {
+        let byte = data[i];
+        i += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Some((value, i));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
 }
 
 fn find_chat_dir(home: &Path, session_id: &str) -> Option<PathBuf> {
@@ -665,6 +796,15 @@ pub struct HookObservation {
     pub context_window_size: Option<u64>,
 }
 
+/// Overlay live Cursor context for one session onto a quota snapshot.
+///
+/// `store.db` `token_details` is the CLI footer (`Auto · 8.1%`). The hook
+/// mailbox supplies cache, and fills context only when the store has none.
+pub fn overlay_live_context(snapshot: &mut ProviderSnapshot, session_id: Option<&str>) {
+    overlay_store_context(snapshot, session_id);
+    overlay_hook_context(snapshot, session_id);
+}
+
 /// Overlay the hook mailbox for one session onto a quota snapshot.
 ///
 /// Publish reads the cached quota snapshot, which may be older than the last
@@ -677,6 +817,29 @@ pub fn overlay_hook_context(snapshot: &mut ProviderSnapshot, session_id: Option<
     overlay_hook_context_at(snapshot, root.root(), session_id);
 }
 
+pub fn overlay_store_context(snapshot: &mut ProviderSnapshot, session_id: Option<&str>) {
+    let Ok(home) = cursor_data_home() else {
+        return;
+    };
+    overlay_store_context_at(snapshot, &home, session_id);
+}
+
+pub fn overlay_store_context_at(
+    snapshot: &mut ProviderSnapshot,
+    home: &Path,
+    session_id: Option<&str>,
+) {
+    let Some(session_id) = session_id.filter(|id| is_session_id(id)) else {
+        return;
+    };
+    let Some(context) = session_context_from_store(home, session_id) else {
+        return;
+    };
+    snapshot
+        .session_contexts
+        .insert(session_id.to_string(), context);
+}
+
 pub fn overlay_hook_context_at(
     snapshot: &mut ProviderSnapshot,
     state: &Path,
@@ -685,12 +848,21 @@ pub fn overlay_hook_context_at(
     let Some(session_id) = session_id.filter(|id| is_session_id(id)) else {
         return;
     };
-    let Some(context) = load_mailbox_context(&state.join(HOOK_MAILBOX_DIR), session_id) else {
+    let Some(hook) = load_mailbox_context(&state.join(HOOK_MAILBOX_DIR), session_id) else {
         return;
     };
-    snapshot
-        .session_contexts
-        .insert(session_id.to_string(), context);
+    match snapshot.session_contexts.get_mut(session_id) {
+        Some(existing) => {
+            if existing.cache.is_none() {
+                existing.cache = hook.cache;
+            }
+        }
+        None => {
+            snapshot
+                .session_contexts
+                .insert(session_id.to_string(), hook);
+        }
+    }
 }
 
 /// Merge one Cursor hook payload into the per-session mailbox.
@@ -826,8 +998,10 @@ fn documented_context_window(model: &str) -> Option<u64> {
         .strip_prefix("cursor-")
         .unwrap_or(model.trim())
         .to_ascii_lowercase();
-    id.starts_with("composer-2")
-        .then_some(COMPOSER_2_CONTEXT_WINDOW)
+    if id.starts_with("composer-2") {
+        return Some(COMPOSER_2_CONTEXT_WINDOW);
+    }
+    matches!(id.as_str(), "default" | "auto").then_some(AUTO_CONTEXT_WINDOW)
 }
 
 fn is_session_id(value: &str) -> bool {
@@ -1414,6 +1588,117 @@ mod tests {
     }
 
     #[test]
+    fn conversation_token_details_match_the_cli_footer_percent() {
+        let mut details = Vec::new();
+        put_varint_field(&mut details, 1, 20_696);
+        put_varint_field(&mut details, 2, 256_000);
+        let mut root = Vec::new();
+        put_len_field(&mut root, 1, &[0u8; 32]);
+        put_len_field(&mut root, 5, &details);
+        assert_eq!(token_details_from_root_blob(&root), Some((20_696, 256_000)));
+        let used: f64 = 20_696.0 / 256_000.0 * 100.0;
+        assert!(((used * 10.0).round() / 10.0 - 8.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_root_blob_without_token_details_yields_no_context() {
+        let mut root = Vec::new();
+        put_len_field(&mut root, 1, &[0u8; 32]);
+        put_varint_field(&mut root, 10, 1);
+        assert_eq!(token_details_from_root_blob(&root), None);
+    }
+
+    #[test]
+    fn store_token_details_are_the_session_context_percent() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "7d18d6db-00ce-4042-be42-e4185dd18b9d";
+        let blob_id = "9e8714f50925cd7a4695fa5fe229a8ac8f70ee8c0b80312232c6df44fa6f8b4e";
+        let mut details = Vec::new();
+        put_varint_field(&mut details, 1, 20_696);
+        put_varint_field(&mut details, 2, 256_000);
+        let mut root = Vec::new();
+        put_len_field(&mut root, 5, &details);
+        write_store(
+            &home
+                .join("chats")
+                .join("hash")
+                .join(session_id)
+                .join("store.db"),
+            &format!(r#"{{"agentId":"{session_id}","latestRootBlobId":"{blob_id}"}}"#),
+            blob_id,
+            &root,
+        );
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        overlay_store_context_at(&mut snapshot, home, Some(session_id));
+        let context = snapshot.context_for_session(Some(session_id)).unwrap();
+        assert!((context.used_percent - 20_696.0 / 256_000.0 * 100.0).abs() < 1e-9);
+        assert!(context.cache.is_none());
+    }
+
+    #[test]
+    fn store_token_details_win_over_hook_input_and_keep_hook_cache() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let state = dir.path().join("plugin-state");
+        let session_id = "7d18d6db-00ce-4042-be42-e4185dd18b9d";
+        let blob_id = "9e8714f50925cd7a4695fa5fe229a8ac8f70ee8c0b80312232c6df44fa6f8b4e";
+        let mut details = Vec::new();
+        put_varint_field(&mut details, 1, 20_696);
+        put_varint_field(&mut details, 2, 256_000);
+        let mut root = Vec::new();
+        put_len_field(&mut root, 5, &details);
+        write_store(
+            &home
+                .join("chats")
+                .join("hash")
+                .join(session_id)
+                .join("store.db"),
+            &format!(r#"{{"agentId":"{session_id}","latestRootBlobId":"{blob_id}"}}"#),
+            blob_id,
+            &root,
+        );
+        save_hook_observation(
+            &state,
+            &json!({
+                "conversation_id": session_id,
+                "model": "default",
+                "input_tokens": 20673,
+                "cache_read_tokens": 20480,
+                "cache_write_tokens": 0
+            }),
+        )
+        .unwrap();
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        overlay_store_context_at(&mut snapshot, home, Some(session_id));
+        overlay_hook_context_at(&mut snapshot, &state, Some(session_id));
+        let context = snapshot.context_for_session(Some(session_id)).unwrap();
+        assert!((context.used_percent - 20_696.0 / 256_000.0 * 100.0).abs() < 1e-9);
+        assert!(context.cache.is_some());
+    }
+
+    #[test]
+    fn auto_and_default_use_the_precompact_window_when_the_hook_omits_it() {
+        for model in ["default", "Auto", "auto"] {
+            let observation = parse_hook_payload(&json!({
+                "conversation_id": "50b33403-da5a-40f4-bb9e-5fc3566f91a4",
+                "model": model,
+                "input_tokens": 25600,
+                "cache_read_tokens": 20000,
+                "cache_write_tokens": 0
+            }))
+            .unwrap();
+            let context = context_from_observation(&observation)
+                .unwrap_or_else(|| panic!("{model} should render context"));
+            assert!(
+                (context.used_percent - 10.0).abs() < 1e-9,
+                "{model} used_percent {}",
+                context.used_percent
+            );
+        }
+    }
+
+    #[test]
     fn impossible_cache_counters_yield_context_without_cache() {
         let observation = parse_hook_payload(&json!({
             "conversation_id": "50b33403-da5a-40f4-bb9e-5fc3566f91a4",
@@ -1473,6 +1758,61 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn put_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+        put_varint(out, field << 3);
+        put_varint(out, value);
+    }
+
+    fn put_len_field(out: &mut Vec<u8>, field: u64, payload: &[u8]) {
+        put_varint(out, (field << 3) | 2);
+        put_varint(out, payload.len() as u64);
+        out.extend_from_slice(payload);
+    }
+
+    fn write_store(path: &Path, meta_json: &str, blob_id: &str, blob: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+        connection
+            .execute("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)", [])
+            .unwrap();
+        let hex: String = meta_json
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        connection
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('0', ?1)",
+                rusqlite::params![hex],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+                rusqlite::params![blob_id, blob],
+            )
+            .unwrap();
     }
 
     fn write_store_meta(path: &Path, json: &str) {

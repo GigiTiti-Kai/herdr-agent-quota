@@ -1401,20 +1401,26 @@ fn fold_cache_row(tokens: &mut BTreeMap<String, String>, row: RowStyle) {
 /// this caller does not have, so including them would report drift that no
 /// republish can settle.
 ///
-/// A pane carrying no quota row at all has never been published to, and is not
-/// drift: waking those would pull every quota-less pane into every pass.
+/// A pane that has never been published to is not drift: waking those would
+/// pull every quota-less pane into every pass. A pane that already carries
+/// plugin tokens but no window row is drift once the snapshot has windows —
+/// Claude/Agy statusLine only writes the mailbox, so an idle pane has no
+/// other way to pick up a session that just reported quota.
 pub(crate) fn quota_rows_have_drifted(
     current: &BTreeMap<String, String>,
     values: &MetadataTokens,
     shape: SidebarShape,
 ) -> bool {
-    if !QUOTA_WINDOW_TOKEN_NAMES
-        .into_iter()
-        .any(|name| current.contains_key(name))
-    {
-        return false;
-    }
     let desired = desired_tokens(values, "", shape);
+    let current_has_window = QUOTA_WINDOW_TOKEN_NAMES
+        .into_iter()
+        .any(|name| current.contains_key(name));
+    let desired_has_window = QUOTA_WINDOW_TOKEN_NAMES
+        .into_iter()
+        .any(|name| desired.contains_key(name));
+    if !current_has_window {
+        return desired_has_window && plugin_quota_present(current);
+    }
     QUOTA_WINDOW_TOKEN_NAMES
         .into_iter()
         .any(|name| current.get(name) != desired.get(name))
@@ -2625,7 +2631,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_placeholder_five_hour_does_not_fold_week_onto_context() {
+    fn a_missing_five_hour_window_folds_week_onto_context() {
         let snapshot = crate::model::ProviderSnapshot::new(
             Provider::Claude,
             vec![crate::model::UsageWindow::new(
@@ -2641,15 +2647,11 @@ mod tests {
             "prompt",
             SidebarShape::default(),
         );
-        assert_eq!(
-            desired.get("quota_5h_unknown").map(String::as_str),
-            Some("5h N/A")
-        );
+        assert!(!desired.contains_key("quota_5h_unknown"));
+        assert!(!desired.contains_key("quota_5h_normal"));
         assert!(!desired.contains_key("quota_5h_label"));
-        assert!(desired.contains_key("quota_week_normal"));
-        assert!(!desired.contains_key("quota_week_inline_normal"));
-        assert!(!desired.contains_key("quota_week_inline_warning"));
-        assert!(!desired.contains_key("quota_week_inline_danger"));
+        assert!(desired.contains_key("quota_week_inline_normal"));
+        assert!(!desired.contains_key("quota_week_normal"));
     }
 
     #[test]

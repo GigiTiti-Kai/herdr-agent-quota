@@ -90,7 +90,7 @@ fn agy_fixture_requires_an_identifiable_pool() {
     assert!(agy::parse_statusline(&value, 1).unwrap().windows.is_empty());
     value["model"] = serde_json::json!({"display_name": "Gemini Flash"});
     let snapshot = agy::parse_statusline(&value, 1).unwrap();
-    assert_eq!(snapshot.windows.len(), 2);
+    assert_eq!(snapshot.windows.len(), 3);
     assert!(
         (snapshot
             .window(WindowKind::Weekly)
@@ -99,6 +99,13 @@ fn agy_fixture_requires_an_identifiable_pool() {
             - 99.69)
             .abs()
             < 1e-9
+    );
+    assert_eq!(
+        snapshot
+            .window(WindowKind::Monthly)
+            .unwrap()
+            .display_label(),
+        "api"
     );
 }
 
