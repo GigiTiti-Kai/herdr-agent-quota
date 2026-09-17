@@ -1201,12 +1201,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    /// Serializes tests that mutate `HERDR_AGENT_QUOTA_SECURITY_BIN` — the
-    /// variable is process-global, and parallel tests would otherwise run
-    /// their `security` calls against each other's stubs.
+    /// Serializes tests that mutate the process-global credential environment,
+    /// including `HERDR_AGENT_QUOTA_SECURITY_BIN` and `XDG_CONFIG_HOME`.
     fn security_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+        crate::providers::test_support::env_guard()
     }
 
     /// Point `muse_config_dir` at a tempdir and return the approval marker's

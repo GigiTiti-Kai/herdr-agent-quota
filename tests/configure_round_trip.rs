@@ -1378,6 +1378,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
         "if [ \"$1 $2\" = \"api snapshot\" ]; then printf '%s\\n' '{snapshot}'; fi"
     )
     .unwrap();
+    drop(script);
 
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
@@ -1465,6 +1466,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
         "if [ \"$1 $2\" = \"api snapshot\" ]; then printf '%s\\n' '{snapshot}'; fi"
     )
     .unwrap();
+    drop(script);
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
@@ -1512,6 +1514,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
         "if [ \"$1 $2\" = \"api snapshot\" ]; then printf '%s\\n' '{snapshot}'; fi"
     )
     .unwrap();
+    drop(script);
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args([
             "watch",
@@ -1584,6 +1587,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
         snapshot_path.display()
     )
     .unwrap();
+    drop(script);
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args([
             "watch",

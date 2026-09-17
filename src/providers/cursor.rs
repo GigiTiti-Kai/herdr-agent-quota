@@ -892,12 +892,10 @@ fn prune_mailboxes(dir: &Path) {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+        crate::providers::test_support::env_guard()
     }
 
     fn period_fixture() -> Value {
