@@ -2,8 +2,8 @@ use crate::cache::CacheStore;
 use crate::cli::{AgentSelection, LowQuotaAlert};
 use crate::herdr::{
     current_focused_pane, find_agent_pane, list_agent_panes, list_agent_state,
-    plugin_quota_present, publish_pane_tokens, refresh_pane_topic, AgentPane, PaneQuotaUpdate,
-    PaneTokens,
+    plugin_quota_present, publish_pane_tokens, refresh_pane_topic, AgentPane, AgentStatus,
+    PaneQuotaUpdate, PaneTokens,
 };
 use crate::model::{
     BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution,
@@ -443,9 +443,17 @@ pub fn focus() -> Result<()> {
         };
         named_pane(&pane_id, harness)?
     };
-    let Some(pane) = pane else {
+    let Some(mut pane) = pane else {
         return Ok(());
     };
+    // We are the focus hook: Herdr has marked (or is marking) this pane seen.
+    // Inventory can still say `done` for a beat; force idle so the brand icon
+    // drops teal immediately instead of waiting for a later status event that
+    // may never come.
+    pane.focused = true;
+    if pane.status == AgentStatus::Done {
+        pane.status = AgentStatus::Idle;
+    }
     let cache = CacheStore::from_env()?;
     handle_named_pane(&cache, pane, None)
 }
@@ -1356,7 +1364,6 @@ fn tokens_for_loaded_snapshot(
 mod tests {
     use super::*;
     use crate::cli::{PercentStyle, SidebarLayout};
-    use crate::herdr::AgentStatus;
     use crate::model::{ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
     use tempfile::tempdir;
 
@@ -1370,6 +1377,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
+            focused: false,
         }
     }
 

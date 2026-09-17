@@ -219,11 +219,23 @@ pub struct AgentPane {
     pub tokens: BTreeMap<String, String>,
     /// From Herdr `agent_status`. Drives brand-icon colour and the watch pulse.
     pub status: AgentStatus,
+    /// Herdr `focused`. Done + focused must paint idle: focus marks seen, and
+    /// the inventory can briefly still say `done` when our focus hook runs.
+    pub focused: bool,
 }
 
 impl AgentPane {
     pub fn working(&self) -> bool {
         self.status.is_working()
+    }
+
+    /// Status the brand icon should mirror. Focus clears done immediately.
+    pub fn icon_status(&self) -> AgentStatus {
+        if self.focused && self.status == AgentStatus::Done {
+            AgentStatus::Idle
+        } else {
+            self.status
+        }
     }
 }
 
@@ -542,6 +554,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         .and_then(Value::as_str)
                         .map(AgentStatus::parse)
                         .unwrap_or_default();
+                    let focused = map.get("focused").and_then(Value::as_bool).unwrap_or(false);
                     panes.push(AgentPane {
                         pane_id: pane_id.to_string(),
                         workspace_id,
@@ -553,6 +566,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         topic,
                         tokens,
                         status,
+                        focused,
                     });
                 }
             }
@@ -993,7 +1007,7 @@ fn apply_group_and_icon(
     } else {
         glyph.to_string()
     };
-    let active = pane.status.icon_token();
+    let active = pane.icon_status().icon_token();
     for token in ["quota_icon", "quota_icon_working", "quota_icon_done"] {
         if token == active {
             desired.insert(token.to_string(), mark.clone());
@@ -1442,6 +1456,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
+            focused: false,
         };
         let mut panes = vec![
             pane("w1:p1", Harness::Muse, None),
@@ -1519,6 +1534,7 @@ mod tests {
                 ("quota_group".to_string(), "ifs".to_string()),
             ]),
             status: AgentStatus::Idle,
+            focused: false,
         };
         let sibling = AgentPane {
             pane_id: "w1:p2".to_string(),
@@ -1532,6 +1548,7 @@ mod tests {
                 ("quota_group".to_string(), "ifs".to_string()),
             ]),
             status: AgentStatus::Idle,
+            focused: false,
         };
         let inventory = vec![head.clone(), sibling.clone()];
         let heads = group_head_pane_ids(&inventory, std::slice::from_ref(&sibling), &[]);
@@ -1629,6 +1646,7 @@ mod tests {
                     topic: String::new(),
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
+                    focused: false,
                 },
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
@@ -1639,6 +1657,7 @@ mod tests {
                     topic: String::new(),
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
+                    focused: false,
                 },
                 AgentPane {
                     pane_id: "w1:p4".to_string(),
@@ -1649,6 +1668,7 @@ mod tests {
                     topic: String::new(),
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
+                    focused: false,
                 },
             ]
         );
@@ -1855,6 +1875,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::from([(String::from("quota_badge"), String::from("[A]"))]),
             status: AgentStatus::Idle,
+            focused: false,
         };
         let desired = BTreeMap::from([(String::from("quota_state"), String::from("?"))]);
         assert!(!metadata_matches(&pane.tokens, &desired));
@@ -1903,6 +1924,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
+            focused: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -1951,6 +1973,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
+            focused: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -2214,6 +2237,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
+            focused: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
@@ -2285,6 +2309,7 @@ mod tests {
             topic: String::new(),
             tokens,
             status: AgentStatus::Idle,
+            focused: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -2471,6 +2496,7 @@ mod tests {
             topic: String::new(),
             tokens,
             status: AgentStatus::Idle,
+            focused: false,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);
@@ -2516,6 +2542,7 @@ mod tests {
             topic: String::new(),
             tokens,
             status: AgentStatus::Idle,
+            focused: false,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);

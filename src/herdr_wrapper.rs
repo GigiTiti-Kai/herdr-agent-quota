@@ -62,6 +62,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
+            focused: false,
         }
     }
 
