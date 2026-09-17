@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Agent order defaults to `quota`: Space grouping with least headroom first
+  inside each space. `configure` also writes `ui.agent_panel_sort = "spaces"`
+  when the user has not set a sort themselves.
+- Default sidebar fields omit cache and TTL (`provider,topic,model,context,5h,7d,30d`).
+  Turn them on in settings when needed.
+- Sidebar identity uses Space group headers plus brand icons whose colour
+  mirrors Herdr `agent_status` (working / done / idle) — no `state_icon` ring.
+  README screenshots show the wide gauges layout only.
+
 ### Added
 
 - The Claude Code status line ends with a spending pace for the binding
@@ -30,9 +41,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Model comes from
   `cli-config.json` (`selectedModel` mapped through `model.displayName`); a
   session's `lastUsedModel` overrides it. The sidebar title uses Grok's hue.
-  The last
-  `<user_query>` in the session jsonl is the topic, so Cursor panes are never
-  read. Cache and context come from the interactive CLI's
+  The generated session title (`meta.json` `title`, else `store.db` `name`) is
+  the topic, so a follow-up does not replace the session name; placeholder
+  `New Agent` falls back to the last `<user_query>` in the session jsonl.
+  Cursor panes are never read. Cache and context come from the interactive CLI's
   `afterAgentResponse` / `stop` / `preCompact` hooks (token counts and, when
   present, `context_usage_percent` / `context_window_size`). Composer 2.x
   uses its documented 200k window when the hook omits the size. Cycle end is
@@ -43,6 +55,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Cursor sidebar topic prefers the generated session title over the last
+  `<user_query>`, so a follow-up like "look back at our todos" no longer
+  replaces the session name. Placeholder `New Agent` still falls back to the
+  last query.
+- Grok sidebar topic uses `summary.json` `generated_title` (else
+  `session_summary`) from the local session metadata, so a pane whose last
+  prompt has scrolled off still has a name. Chat history is not read.
 - Codex sidebar model no longer sticks on the session-start `turn_context`.
   A long turn writes `turn_context` once at the beginning, then enough
   `token_count` / tool output that the 256 KB tail has no model line. The

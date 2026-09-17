@@ -110,8 +110,8 @@ pub enum Command {
         /// context, 5h, 7d. The error token is always shown.
         #[arg(long, value_parser = parse_field_set)]
         fields: Option<FieldSet>,
-        /// Whether provider and model carry each agent's brand hue. Severity
-        /// colours are unaffected.
+        /// Deprecated compatibility setting. Identity text now follows the
+        /// sidebar theme; status colour lives on the brand icon.
         #[arg(long, value_enum)]
         brand_colors: Option<BrandColors>,
         /// Blank rows between agent panes. `1` (default) separates them;
@@ -274,7 +274,11 @@ impl SidebarField {
     }
 }
 
-/// Which quota fields the sidebar shows. Every field is on by default.
+/// Which quota fields the sidebar shows.
+///
+/// Default is provider, topic, model, context, 5h, 7d, and 30d. Cache and TTL
+/// stay off until the user turns them on — most installs care about quota and
+/// context first, and those two rows add noise on a gauges layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSet(u16);
 
@@ -437,6 +441,8 @@ impl FieldSet {
 impl Default for FieldSet {
     fn default() -> Self {
         Self::all()
+            .toggled(SidebarField::Cache)
+            .toggled(SidebarField::Ttl)
     }
 }
 
@@ -453,11 +459,8 @@ fn parse_field_set(value: &str) -> Result<FieldSet, String> {
     })
 }
 
-/// Whether provider and model carry each agent's brand hue.
-///
-/// Herdr owns the sidebar theme; this is the only colour the plugin writes of
-/// its own, so it is the only colour it can offer to turn off. Severity
-/// colours stay in both settings: they are information, not decoration.
+/// Legacy preference retained so older managed rows can be recognised and
+/// removed during an upgrade or uninstall. It no longer changes new rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum BrandColors {
     #[default]
@@ -467,17 +470,6 @@ pub enum BrandColors {
 
 impl BrandColors {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_BRAND_COLORS";
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
-
-    pub fn is_on(self) -> bool {
-        self == Self::On
-    }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
@@ -632,24 +624,30 @@ fn parse_row_gap(value: &str) -> Result<SidebarRowGap, String> {
 
 /// How Herdr's Agent panel is ordered.
 ///
-/// `quota` hands Herdr a declarative Agent view sorted by this plugin's
-/// `quota_headroom` token, so the agent closest to its limit sits at the top.
-/// Herdr keeps exactly one such view, and an active one replaces the user's
-/// own `ui.agent_panel_sort` policy until it is cleared. That is why the
-/// default is `default`: the panel belongs to the user, not to this plugin.
+/// `quota` hands Herdr a declarative Agent view that keeps workspaces
+/// contiguous (`workspace_order`) and ranks by this plugin's
+/// `quota_headroom` token inside each space, so the agent closest to its
+/// limit sits at the top of its group. Herdr keeps exactly one such view,
+/// and an active one replaces the user's own `ui.agent_panel_sort` policy
+/// until it is cleared.
+///
+/// Default is `quota`: Space grouping is what most installs want with the
+/// `$quota_group` headers, and ranking by headroom is a free extra on top.
+/// Choose `default` to hand the panel back to Herdr's own policy (also
+/// Space-grouped unless the user set `priority`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum AgentOrder {
     /// Leave Herdr's own ordering alone.
-    #[default]
     Default,
-    /// Least quota left first.
+    /// By space, then least quota left first.
+    #[default]
     Quota,
 }
 
 impl AgentOrder {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_AGENT_ORDER";
     /// Herdr's label for the view, shown where it names the active sort.
-    pub const LABEL: &'static str = "Quota headroom";
+    pub const LABEL: &'static str = "Quota by space";
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -665,7 +663,7 @@ impl AgentOrder {
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "default" | "herdr" | "off" => Some(Self::Default),
-            "quota" | "headroom" | "on" => Some(Self::Quota),
+            "quota" | "headroom" | "grouped" | "on" => Some(Self::Quota),
             _ => None,
         }
     }
@@ -992,7 +990,7 @@ mod tests {
         }
         assert_eq!(AgentOrder::parse(" QUOTA "), Some(AgentOrder::Quota));
         assert_eq!(AgentOrder::parse("sideways"), None);
-        assert_eq!(AgentOrder::default(), AgentOrder::Default);
+        assert_eq!(AgentOrder::default(), AgentOrder::Quota);
     }
 
     #[test]
@@ -1309,6 +1307,27 @@ mod tests {
         assert_eq!(SidebarRowGap::parse("2"), None);
         assert_eq!(SidebarRowGap::parse("0.5"), None);
         assert_eq!(SidebarRowGap::default().as_u8(), 1);
+    }
+
+    /// Default omits cache and TTL: quota + context are the usual install, and
+    /// those two rows are optional in settings.
+    #[test]
+    fn the_default_field_set_omits_cache_and_ttl() {
+        let fields = FieldSet::default();
+        assert!(fields.contains(SidebarField::Provider));
+        assert!(fields.contains(SidebarField::Topic));
+        assert!(fields.contains(SidebarField::Model));
+        assert!(fields.contains(SidebarField::Context));
+        assert!(fields.contains(SidebarField::FiveHour));
+        assert!(fields.contains(SidebarField::Week));
+        assert!(fields.contains(SidebarField::Month));
+        assert!(!fields.contains(SidebarField::Cache));
+        assert!(!fields.contains(SidebarField::Ttl));
+        assert_eq!(
+            FieldSet::parse(&fields.as_list()),
+            Some(fields),
+            "default selection must round-trip without becoming all()"
+        );
     }
 
     /// A build without a provider field wrote "everything on" as the other

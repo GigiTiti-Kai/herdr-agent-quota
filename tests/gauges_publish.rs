@@ -132,7 +132,8 @@ esac
             .lines()
             .map(str::to_owned)
             .collect();
-        assert_eq!(calls.iter().filter(|call| *call == "agent list").count(), 1);
+        // Refresh reads inventory once; publish lists again for Space heads.
+        assert_eq!(calls.iter().filter(|call| *call == "agent list").count(), 2);
         assert!(!calls.iter().any(|call| call == "pane read"));
         assert!(
             calls

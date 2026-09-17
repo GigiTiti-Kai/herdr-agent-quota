@@ -1,4 +1,4 @@
-use crate::cli::{FieldSet, PercentStyle, SidebarLayout};
+use crate::cli::{FieldSet, PercentStyle, SidebarField, SidebarLayout};
 use crate::model::{
     format_percent, live_windows, printed_percent, window_in, Provider, ProviderSnapshot, ResetAt,
     Severity, UsageWindow, WindowKind,
@@ -188,8 +188,7 @@ impl MetadataTokens {
             } else {
                 snapshot.windows_for_session(session_id)
             },
-            style,
-            shape,
+            RowStyle::new(style, shape),
         )
     }
 
@@ -208,6 +207,24 @@ impl MetadataTokens {
         style: PercentStyle,
         shape: SidebarShape,
     ) -> Self {
+        Self::from_snapshot_for_pane_with_fields(
+            snapshot,
+            now_unix,
+            session_id,
+            style,
+            shape,
+            FieldSet::all(),
+        )
+    }
+
+    pub fn from_snapshot_for_pane_with_fields(
+        snapshot: &ProviderSnapshot,
+        now_unix: u64,
+        session_id: Option<&str>,
+        style: PercentStyle,
+        shape: SidebarShape,
+        fields: FieldSet,
+    ) -> Self {
         let quota_model = match session_id {
             Some(session_id) => snapshot.model_for_session(Some(session_id)),
             None => snapshot.model.as_deref(),
@@ -221,8 +238,11 @@ impl MetadataTokens {
             quota_model,
             context,
             windows,
-            style,
-            shape,
+            RowStyle {
+                percent: style,
+                shape,
+                fields,
+            },
         )
     }
 
@@ -232,13 +252,19 @@ impl MetadataTokens {
         model: Option<&str>,
         context: Option<&crate::model::ContextUsage>,
         windows: &[UsageWindow],
-        style: PercentStyle,
-        shape: SidebarShape,
+        row: RowStyle,
     ) -> Self {
+        let style = row.percent;
+        let shape = row.shape;
+        let fields = row.fields;
         let live = live_windows(windows, now_unix);
         let windows = live.as_slice();
         let quota_provider = snapshot.provider.display_name().to_string();
         let quota_model = model.unwrap_or_default().to_string();
+        let quota_provider_model =
+            provider_model_label(&quota_provider, &quota_model, shape.content_width);
+        let narrow_identity =
+            shape.content_width > 0 && shape.content_width < NARROW_IDENTITY_CONTENT_WIDTH;
         let omp_windows = snapshot.source.starts_with("omp.");
         let short_window = if omp_windows {
             window_in(windows, WindowKind::FiveHour)
@@ -255,8 +281,12 @@ impl MetadataTokens {
             five_hour_slot(windows, snapshot.provider, now_unix, style, shape)
         };
         Self {
-            quota_provider_model: provider_model_label(&quota_provider, &quota_model),
-            quota_provider,
+            quota_provider_model,
+            quota_provider: if narrow_identity && !quota_model.is_empty() {
+                String::new()
+            } else {
+                quota_provider
+            },
             quota_model,
             quota_5h_severity: short_window
                 .map(|window| Severity::for_window(window, now_unix))
@@ -281,7 +311,7 @@ impl MetadataTokens {
             quota_cache_ttl: sidebar_cache_ttl(context, now_unix),
             quota_cache_state: sidebar_cache_state(context, now_unix),
             quota_error: None,
-            quota_headroom: headroom(windows),
+            quota_headroom: headroom(windows, fields),
         }
     }
 
@@ -359,11 +389,20 @@ impl MetadataTokens {
 ///
 /// Rounded down, so a window one point above a threshold is never rounded
 /// onto the wrong side of it.
-fn headroom(windows: &[UsageWindow]) -> Option<u8> {
+fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
     [
-        window_in(windows, WindowKind::FiveHour),
-        window_in(windows, WindowKind::Weekly),
-        window_in(windows, WindowKind::Monthly),
+        fields
+            .contains(SidebarField::FiveHour)
+            .then(|| window_in(windows, WindowKind::FiveHour))
+            .flatten(),
+        fields
+            .contains(SidebarField::Week)
+            .then(|| window_in(windows, WindowKind::Weekly))
+            .flatten(),
+        fields
+            .contains(SidebarField::Month)
+            .then(|| window_in(windows, WindowKind::Monthly))
+            .flatten(),
     ]
     .into_iter()
     .flatten()
@@ -371,12 +410,18 @@ fn headroom(windows: &[UsageWindow]) -> Option<u8> {
     .min()
 }
 
-fn provider_model_label(provider: &str, model: &str) -> String {
+/// Below this content width the logo already names the vendor, so the
+/// identity label keeps only the model (radar-style narrow reading).
+const NARROW_IDENTITY_CONTENT_WIDTH: usize = 22;
+
+fn provider_model_label(provider: &str, model: &str, content_width: usize) -> String {
     if model.is_empty() {
-        provider.to_string()
-    } else {
-        format!("{provider}/{model}")
+        return provider.to_string();
     }
+    if content_width > 0 && content_width < NARROW_IDENTITY_CONTENT_WIDTH {
+        return model.to_string();
+    }
+    format!("{provider}/{model}")
 }
 
 fn window_severity(windows: &[UsageWindow], kind: WindowKind, now_unix: u64) -> Option<Severity> {
@@ -781,6 +826,24 @@ mod tests {
         // 5h has 60 left, 7d has 25, 30d has 2.
         let tokens = MetadataTokens::from_snapshot(&snapshot, 0);
         assert_eq!(tokens.quota_headroom, Some(2));
+        let visible = MetadataTokens::from_snapshot_for_pane_with_fields(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::default(),
+            FieldSet::parse("5h,7d").unwrap(),
+        );
+        assert_eq!(visible.quota_headroom, Some(25));
+        let hidden = MetadataTokens::from_snapshot_for_pane_with_fields(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::default(),
+            FieldSet::parse("none").unwrap(),
+        );
+        assert_eq!(hidden.quota_headroom, None);
     }
 
     #[test]
@@ -1252,6 +1315,32 @@ mod tests {
         assert_eq!(values.quota_cache, "");
         assert_eq!(values.quota_cache_ttl, "");
         assert_eq!(values.quota_error, None);
+    }
+
+    #[test]
+    fn a_narrow_sidebar_keeps_only_the_model_beside_the_logo() {
+        let snapshot =
+            ProviderSnapshot::new(Provider::Grok, vec![], 0).with_model(Some("grok-4.6".into()));
+        let wide = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::new(SidebarLayout::Packed, 30),
+        );
+        assert_eq!(wide.quota_provider_model, "Grok/grok-4.6");
+        assert_eq!(wide.quota_provider, "Grok");
+        let narrow = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::new(SidebarLayout::Packed, 22),
+        );
+        // content_width = 22 - 4 = 18 < 22 → model only
+        assert_eq!(narrow.quota_provider_model, "grok-4.6");
+        assert!(narrow.quota_provider.is_empty());
+        assert_eq!(narrow.quota_model, "grok-4.6");
     }
 
     #[test]

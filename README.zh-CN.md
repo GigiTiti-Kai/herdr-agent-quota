@@ -1,33 +1,26 @@
 # herdr-agent-quota
 
-在 Herdr Agent 侧栏显示模型、上下文、提示词缓存用量和订阅额度。
+在 Herdr Agent 侧栏显示模型、上下文和订阅额度——按 Space 分组，并用品牌图标承载
+agent 状态。
 
 [![CI](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml/badge.svg)](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [English](README.md)
 
-<table>
-<tr><th>gauges（默认）</th><th>窄屏</th></tr>
-<tr>
-<td valign="top"><img src="docs/screenshots/sidebar-gauges.png" alt="条形布局" width="276"></td>
-<td valign="top"><img src="docs/screenshots/sidebar-gauges-narrow.png" alt="窄屏下的条形布局" width="244"></td>
-</tr>
-</table>
+<img src="docs/screenshots/sidebar-gauges.png" alt="按 Space 分组的 gauges 侧栏" width="320">
 
-插件保留 Herdr 原生的机器／工作区／标签页行、自定义样式和 worktree 分组。
-带品牌色的 provider/model 行就是 agent 身份，因此不再保留灰色的原生 `agent` 行，
-避免 `grok` 叠在 `Grok/grok-4.6` 上面。按额度排序和低额度通知默认关闭。
-空字段自动折叠，百分比可选择显示剩余或已用额度。
+Agent 按所属 Space 分组。每一行只用本插件的品牌图标，不再画 Herdr 原生状态圈；
+图标颜色跟随 agent——工作中为黄、完成后为青绿；聚焦该 pane，或焦点从它移走后变为墨白。其他未读的绿色 pane 不受影响。
+Provider／模型保持墨白色；进度条上的严重程度色仍表示剩余额度。
+
 默认布局是 `gauges`：在每个额度数字旁加一条进度条。进度条长度始终对应旁边打印的数字；
 `cx`、`5h`、`7d`、`30d` 都跟随 `quota-percent`。标签列三个字符，内置周期对齐；
-服务商自定义的窗口名过长时退回普通数字行，而不是截断进度条。
-cache 与 TTL 或 `no cached` 在空间足够时合为一行。进度条按当前连接的 Herdr endpoint
-侧栏宽度定长（已计入缩进和滚动条），太窄时直接不画，不会截断数字。
-调整宽度后用 `prefix+shift+r` 刷新。`gauges` 下 `cx` 行也有自己的严重程度配色，
-与 `5h`、`7d` 共用同一套低饱和绿/黄/红：无论数字显示的是剩余还是已用，配色一律按
-剩余量分档——上下文剩余不足 50% 转黄，不足 20% 转红。布局、字段和百分比口径
-都可以在设置面板里改。
+服务商自定义的窗口名过长时退回普通数字行，而不是截断进度条。进度条按当前连接的
+Herdr endpoint 侧栏宽度定长（已计入缩进和滚动条）。空字段自动折叠，百分比可选择
+显示剩余或已用额度。Cache 与 TTL 默认关闭（需要时可在设置里打开）。Agent order
+默认按 Space 分组，组内剩余额度最少的优先。低额度通知默认关闭，直到你设置阈值。
+布局、字段和百分比口径都可以在设置面板里改（`prefix+shift+q`）。
 
 ## 安装与升级
 
@@ -69,9 +62,8 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Layout | `gauges`（默认）在每个额度数字旁加进度条；`packed` 合并相关字段；`stacked` 将字段分行显示 |
 | Row gap | Agent 之间保留零行或一行空白 |
 | Watch interval | 30 秒–1 小时，默认 60 秒 |
-| Fields | 提供方、主题、模型、缓存、TTL、上下文、短期／长期／月度额度 |
-| Brand colors | 开启或关闭品牌色 |
-| Agent order | Herdr 默认排序，或剩余额度最少的优先 |
+| Fields | 默认开启提供方、主题、模型、上下文、短期／长期／月度额度；cache 与 TTL 可选 |
+| Agent order | 按 Space 分组，组内剩余额度最少优先（默认）；或使用 Herdr 自己的排序 |
 | Low quota alert | 关闭，或设置 1%–100% 的提醒阈值 |
 | Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor |
 
@@ -100,7 +92,8 @@ Claude Code 状态栏保留用户自己的 statusLine 输出，并在末尾追�
 
 额度窗口保留上游定义。模型、上下文和缓存数据优先来自已识别的会话。
 `ttl≈` 表示估算的提示词缓存寿命，不保证实际过期时间。
-主题提取只读取事件点名窗格的可见屏幕；内容滚走后保留已有主题。
+主题提取只读取事件点名窗格的可见屏幕；内容滚走后保留已有主题。Cursor 和 Grok
+使用本地会话元数据里的生成标题；Muse 使用 transcript 中的最后一条提示。
 
 所有受支持的工作中 agent 共用一个后台 watcher，请求间隔至少 60 秒，并在回合结束后
 完成收尾刷新。OMP 另有自身的五分钟 usage 缓存。共享已确认额度来源的闲置窗格会收到同一读数。

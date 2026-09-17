@@ -191,10 +191,14 @@ printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","agent":"codex","agent_st
         .status()
         .unwrap()
         .success());
-    assert!(fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .all(|line| line == "agent list"));
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .all(|line| { line == "agent list" || line == "workspace list" }),
+        "unexpected Herdr calls: {}",
+        fs::read_to_string(&log).unwrap()
+    );
     let cache = herdr_agent_quota::cache::CacheStore::new(dir.path());
     assert!(!cache
         .should_debounce(

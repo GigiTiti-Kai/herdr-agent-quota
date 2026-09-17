@@ -23,12 +23,15 @@
 //!
 //! Model and topic are local. `cli-config.json` `model.displayName` is the
 //! account default; a session's `chats/<hash>/<id>/store.db` meta
-//! `lastUsedModel` overrides it when present. The last `<user_query>` in
-//! `projects/*/agent-transcripts/<id>/<id>.jsonl` is the topic, so Cursor
-//! panes are never read. Turn token counts are not in that jsonl. Cache and
-//! context come from the interactive CLI's `afterAgentResponse` / `stop` /
-//! `preCompact` hooks, stored as a mailbox under plugin state. A Cursor
-//! `statusLine` is not used: installing one replaces the native CLI footer.
+//! `lastUsedModel` overrides it when present. The topic is the generated
+//! session title (`meta.json` `title`, else `store.db` `name`), so a later
+//! follow-up does not replace the session name. Placeholder titles such as
+//! `New Agent` fall back to the last `<user_query>` in
+//! `projects/*/agent-transcripts/<id>/<id>.jsonl`. Cursor panes are never
+//! read. Turn token counts are not in that jsonl. Cache and context come from
+//! the interactive CLI's `afterAgentResponse` / `stop` / `preCompact` hooks,
+//! stored as a mailbox under plugin state. A Cursor `statusLine` is not used:
+//! installing one replaces the native CLI footer.
 //!
 //! Everything fails closed. A missing or unreadable percentage yields no
 //! window, never "0% used". Cache identity is `sha256("cursor\0" || token)` so
@@ -466,29 +469,29 @@ fn display_name_for_id(home: &Path, model_id: &str, catalog_id: Option<&str>) ->
 }
 
 fn last_used_model(home: &Path, session_id: &str) -> Option<String> {
+    json_text(store_meta(&find_chat_dir(home, session_id)?.join("store.db"))?.get("lastUsedModel"))
+}
+
+fn find_chat_dir(home: &Path, session_id: &str) -> Option<PathBuf> {
     let chats = home.join("chats");
     let Ok(entries) = fs::read_dir(&chats) else {
         return None;
     };
     for entry in entries.flatten().take(MAX_PROJECT_DIRS) {
-        let db = entry.path().join(session_id).join("store.db");
-        if !db.is_file() {
-            continue;
-        }
-        if let Some(model) = last_used_model_from_store(&db) {
-            return Some(model);
+        let dir = entry.path().join(session_id);
+        if dir.is_dir() {
+            return Some(dir);
         }
     }
     None
 }
 
-fn last_used_model_from_store(path: &Path) -> Option<String> {
+fn store_meta(path: &Path) -> Option<Value> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     let raw: String = connection
         .query_row("SELECT value FROM meta LIMIT 1", [], |row| row.get(0))
         .ok()?;
-    let value = parse_store_meta(&raw)?;
-    json_text(value.get("lastUsedModel"))
+    parse_store_meta(&raw)
 }
 
 fn parse_store_meta(raw: &str) -> Option<Value> {
@@ -521,9 +524,29 @@ fn from_hex_digit(digit: u8) -> Option<u8> {
 }
 
 fn session_prompt(home: &Path, session_id: &str) -> Option<String> {
-    let path = find_transcript(home, session_id)?;
-    let tail = read_tail(&path, SESSION_TAIL_BYTES)?;
-    last_user_query(&tail)
+    session_title(home, session_id).or_else(|| {
+        let path = find_transcript(home, session_id)?;
+        let tail = read_tail(&path, SESSION_TAIL_BYTES)?;
+        last_user_query(&tail)
+    })
+}
+
+fn session_title(home: &Path, session_id: &str) -> Option<String> {
+    let dir = find_chat_dir(home, session_id)?;
+    titled_value(
+        read_bounded_json(&dir.join("meta.json"))
+            .as_ref()
+            .and_then(|value| value.get("title")),
+    )
+    .or_else(|| titled_value(store_meta(&dir.join("store.db"))?.get("name")))
+}
+
+fn titled_value(value: Option<&Value>) -> Option<String> {
+    json_text(value).filter(|title| !is_placeholder_title(title))
+}
+
+fn is_placeholder_title(title: &str) -> bool {
+    title.eq_ignore_ascii_case("new agent")
 }
 
 fn find_transcript(home: &Path, session_id: &str) -> Option<PathBuf> {
@@ -608,11 +631,9 @@ fn user_query_from(text: &str) -> Option<String> {
 }
 
 fn summary_line(prompt: &str) -> Option<String> {
-    let line = prompt
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
-    Some(line.chars().take(MAX_SUMMARY_CHARS).collect())
+    let collapsed: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let line = collapsed.trim_start_matches([':', '：']).trim();
+    (!line.is_empty()).then(|| line.chars().take(MAX_SUMMARY_CHARS).collect())
 }
 
 fn read_bounded_json(path: &Path) -> Option<Value> {
@@ -871,12 +892,10 @@ fn prune_mailboxes(dir: &Path) {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+        crate::providers::test_support::env_guard()
     }
 
     fn period_fixture() -> Value {
@@ -1146,6 +1165,30 @@ mod tests {
     }
 
     #[test]
+    fn a_multiline_user_query_collapses_to_one_summary_line() {
+        let tail = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nThoroughness: very thorough.\n\nExplore the repo\n</user_query>"}]}}"#,
+            "\n"
+        );
+        assert_eq!(
+            last_user_query(tail).as_deref(),
+            Some("Thoroughness: very thorough. Explore the repo")
+        );
+    }
+
+    #[test]
+    fn a_leading_fullwidth_colon_is_stripped_from_the_query() {
+        let tail = concat!(
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\n： https://example.test/pull/5 review this\n</user_query>"}]}}"#,
+            "\n"
+        );
+        assert_eq!(
+            last_user_query(tail).as_deref(),
+            Some("https://example.test/pull/5 review this")
+        );
+    }
+
+    #[test]
     fn cli_config_display_name_is_the_configured_model() {
         let config = json!({
             "model": {
@@ -1206,6 +1249,90 @@ mod tests {
             snapshot.session_models.get(session_id).map(String::as_str),
             Some("Composer 2.5")
         );
+        assert_eq!(
+            snapshot
+                .session_summaries
+                .get(session_id)
+                .map(String::as_str),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn a_generated_session_title_wins_over_the_last_user_query() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "40ca7390-d1e9-463d-b852-68a2693b1b75";
+        let chat = home.join("chats").join("hash").join(session_id);
+        fs::create_dir_all(&chat).unwrap();
+        write_store_meta(
+            &chat.join("store.db"),
+            r#"{"agentId":"40ca7390-d1e9-463d-b852-68a2693b1b75","name":"Project Architecture Review","lastUsedModel":"default"}"#,
+        );
+        write_follow_up_transcript(home, session_id);
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, home, &[session_id.to_string()]);
+        assert_eq!(
+            snapshot
+                .session_summaries
+                .get(session_id)
+                .map(String::as_str),
+            Some("Project Architecture Review")
+        );
+    }
+
+    #[test]
+    fn meta_json_title_is_used_when_store_name_is_a_placeholder() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "40ca7390-d1e9-463d-b852-68a2693b1b75";
+        let chat = home.join("chats").join("hash").join(session_id);
+        fs::create_dir_all(&chat).unwrap();
+        fs::write(
+            chat.join("meta.json"),
+            r#"{"schemaVersion":1,"title":"Project Architecture Review"}"#,
+        )
+        .unwrap();
+        write_store_meta(
+            &chat.join("store.db"),
+            r#"{"agentId":"40ca7390-d1e9-463d-b852-68a2693b1b75","name":"New Agent"}"#,
+        );
+        write_follow_up_transcript(home, session_id);
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, home, &[session_id.to_string()]);
+        assert_eq!(
+            snapshot
+                .session_summaries
+                .get(session_id)
+                .map(String::as_str),
+            Some("Project Architecture Review")
+        );
+    }
+
+    #[test]
+    fn placeholder_new_agent_title_falls_back_to_the_user_query() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "50b33403-da5a-40f4-bb9e-5fc3566f91a4";
+        let chat = home.join("chats").join("hash").join(session_id);
+        fs::create_dir_all(&chat).unwrap();
+        write_store_meta(
+            &chat.join("store.db"),
+            r#"{"agentId":"50b33403-da5a-40f4-bb9e-5fc3566f91a4","name":"New Agent"}"#,
+        );
+        let transcripts = home
+            .join("projects")
+            .join("repo")
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&transcripts).unwrap();
+        fs::write(
+            transcripts.join(format!("{session_id}.jsonl")),
+            include_str!("../../tests/fixtures/cursor/session-tail.jsonl"),
+        )
+        .unwrap();
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, home, &[session_id.to_string()]);
         assert_eq!(
             snapshot
                 .session_summaries
@@ -1329,6 +1456,23 @@ mod tests {
             .context_for_session(Some("50b33403-da5a-40f4-bb9e-5fc3566f91a4"))
             .unwrap();
         assert!((context.used_percent - 10.0).abs() < 1e-9);
+    }
+
+    fn write_follow_up_transcript(home: &Path, session_id: &str) {
+        let transcripts = home
+            .join("projects")
+            .join("repo")
+            .join("agent-transcripts")
+            .join(session_id);
+        fs::create_dir_all(&transcripts).unwrap();
+        fs::write(
+            transcripts.join(format!("{session_id}.jsonl")),
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\n你从头回顾一下我们讨论的待办和问题处都做了吗？\n</user_query>"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
     }
 
     fn write_store_meta(path: &Path, json: &str) {

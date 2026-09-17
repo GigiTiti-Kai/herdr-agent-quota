@@ -10,6 +10,18 @@ fn pane_focus_uses_the_quota_only_focus_path() {
 }
 
 #[test]
+fn workspace_and_tab_focus_reach_the_focus_path() {
+    let manifest = include_str!("../herdr-plugin.toml");
+    for on in ["workspace.focused", "tab.focused"] {
+        let hook = manifest
+            .split("[[events]]")
+            .find(|event| event.contains(&format!("on = \"{on}\"")))
+            .expect("workspace and tab focus must be hooked");
+        assert!(hook.contains(" focus\"]"), "{on}: {hook}");
+    }
+}
+
+#[test]
 fn plugin_exposes_one_click_configure_and_uninstall_actions() {
     let manifest = include_str!("../herdr-plugin.toml");
     assert!(manifest.contains("id = \"configure\""));

@@ -1,38 +1,31 @@
 # herdr-agent-quota
 
-Model, context, prompt-cache usage, and subscription quota in Herdr's Agent sidebar.
+Model, context, and subscription quota in Herdr's Agent sidebar — grouped by
+Space, with brand icons that carry agent status.
 
 [![CI](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml/badge.svg)](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [简体中文](README.zh-CN.md)
 
-<table>
-<tr><th>gauges (default)</th><th>narrow</th></tr>
-<tr>
-<td valign="top"><img src="docs/screenshots/sidebar-gauges.png" alt="Gauges sidebar" width="276"></td>
-<td valign="top"><img src="docs/screenshots/sidebar-gauges-narrow.png" alt="Gauges sidebar on a narrow width" width="244"></td>
-</tr>
-</table>
+<img src="docs/screenshots/sidebar-gauges.png" alt="Space-grouped gauges sidebar" width="320">
 
-The plugin preserves Herdr's native machine/workspace/tab row, custom styles,
-and worktree grouping. The branded provider/model line is the agent identity;
-the native `agent` row is omitted so `grok` does not sit above `Grok/grok-4.6`.
-Optional quota ordering and low-quota notifications are disabled by default.
-Empty fields collapse; percentages can show remaining or used quota.
-The default layout is `gauges`: a meter beside each quota number. Bars fill
-to the printed number, and `cx`, `5h`, `7d`, and `30d` all follow
-`quota-percent`. Labels are three characters so those periods align; a
-provider-named window too long for that column keeps a plain row instead of
-a truncated bar. Cache shares a line with TTL or `no cached` when space allows.
-Meters size to the connected Herdr endpoint's sidebar — indent and scrollbar
-included — and disappear when the width is too narrow. A resize takes effect
-on the next refresh or pane
-event (`prefix+shift+r`). Under `gauges` the `cx` row takes a severity
-colour of its own, on the same muted green/amber/red scale as `5h` and
-`7d`: colour always reads the headroom left — amber below 50% of the
-context left, red below 20%. Switch layout, fields, and percentages from
-the settings pane.
+Agents are grouped under their Space. Each row leads with this plugin's brand
+icon — not Herdr's status ring. The icon colour tracks the agent: yellow while
+working, teal while done (until you focus it or move focus away from it), ink-white when idle.
+Provider and model stay ink-white; severity colours on the meters still mean
+remaining headroom.
+
+The default layout is `gauges`: a meter beside each quota number. Bars fill to
+the printed number, and `cx`, `5h`, `7d`, and `30d` all follow `quota-percent`.
+Labels are three characters so those periods align; a provider-named window too
+long for that column keeps a plain row instead of a truncated bar. Meters size
+to the connected Herdr endpoint's sidebar — indent and scrollbar included.
+Empty fields collapse; percentages can show remaining or used quota. Cache and
+TTL are off by default (turn them on in settings if you want them). Agent order
+defaults to Space grouping with least quota left first inside each space.
+Low-quota notifications stay off until you set a threshold. Switch layout,
+fields, and percentages from the settings pane (`prefix+shift+q`).
 
 ## Install and upgrade
 
@@ -77,9 +70,8 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Layout | `gauges` (default) adds a meter beside each quota number; `packed` groups related fields; `stacked` gives each field a row |
 | Row gap | Zero or one blank line between agents |
 | Watch interval | 30 seconds–1 hour; default 60 seconds |
-| Fields | Provider, topic, model, cache, TTL, context, short/long/monthly quota |
-| Brand colors | On or off |
-| Agent order | Herdr default or lowest remaining quota first |
+| Fields | Provider, topic, model, context, short/long/monthly quota on by default; cache and TTL optional |
+| Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
 | Low quota alert | Off or a threshold from 1% to 100% |
 | Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor |
 
@@ -94,7 +86,7 @@ Installer options are also available through `./install.sh --help`.
 | Grok | CLI billing endpoint; 7d or 30d | Current CLI credentials |
 | Devin | CLI usage endpoint; 1d and 7d | Current CLI credentials |
 | Muse Code | CLI subscription endpoint; 5h and 7d | Current CLI account login; session via Muse's session lock (Linux) |
-| Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the desktop `state.vscdb` access token; model and topic from local session files; cache and context from CLI hooks |
+| Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the desktop `state.vscdb` access token; model from local session files; topic from the generated session title; cache and context from CLI hooks |
 | Claude Code | StatusLine; 5h and 7d | Exact session observation |
 | Agy / Antigravity | StatusLine; 5h and 7d | Exact session and identifiable model pool |
 | OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
@@ -111,8 +103,10 @@ reset further away than the window is long, or in the first 5% of the window.
 
 Quota windows retain their provider's meaning. Model, context, and cache data
 come from the identified session when available. `ttl≈` marks an estimated
-prompt-cache lifetime, not a guaranteed expiry. Topic extraction uses only the
-named pane's visible screen and preserves the last topic when it scrolls away.
+prompt-cache lifetime, not a guaranteed expiry. Topic extraction uses the
+named pane's visible screen for most agents and preserves the last topic when
+it scrolls away. Cursor and Grok use the generated session title from local
+session metadata instead; Muse uses the last prompt in its transcript.
 
 All supported working agents participate in one background watcher. Requests
 are debounced for 60 seconds, including a final refresh after a turn settles.

@@ -188,7 +188,7 @@ fn opencode_context(paths: &OpenCodePaths, session: &SessionEvidence) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::AgentPane;
+    use crate::herdr::{AgentPane, AgentStatus};
     use crate::model::{CredentialScope, Provider};
     use crate::opencode::{parse_auth_json, AuthReadError, SessionEvidence, SessionLookup};
     use std::collections::BTreeMap;
@@ -199,6 +199,7 @@ mod tests {
     fn pane(harness: Harness, session_id: Option<&str>) -> AgentPane {
         AgentPane {
             pane_id: "w1:p9".to_string(),
+            workspace_id: "w1".to_string(),
             harness,
             session: session_id.map(|value| crate::herdr::AgentSession {
                 kind: Some("id".to_string()),
@@ -207,6 +208,8 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
         }
     }
 

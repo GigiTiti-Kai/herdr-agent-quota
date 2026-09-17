@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,7 +29,25 @@ const LOW_QUOTA_ALERT_FILE: &str = "low-quota-alert";
 /// One line per provider that is currently below the alert threshold, so a
 /// crossing notifies once instead of on every refresh.
 const LOW_QUOTA_ALERTED_FILE: &str = "low-quota-alerted";
+/// Panes that are mid-turn (`working`), finished but not yet acknowledged
+/// (`unseen`), or acknowledged since their last turn (`seen`). Brand-icon colour cannot use Herdr's server `agent_status`
+/// alone: same-tab completions are reported `idle` while the TUI ring is
+/// still teal. This file is the plugin's own seen-state.
+const ICON_ATTENTION_FILE: &str = "icon-attention.json";
 const MAX_STATUSLINE_SESSIONS: usize = 128;
+
+/// Working / unseen pane ids for `$quota_icon_*` colour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IconAttention {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub working: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unseen: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub seen: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_focused: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct CacheStore {
@@ -630,11 +648,6 @@ impl CacheStore {
             .and_then(BrandColors::parse)
     }
 
-    pub fn set_brand_colors(&self, colors: BrandColors) -> Result<()> {
-        self.ensure()?;
-        fs::write(self.brand_colors_path(), colors.as_str()).context("write brand colors")
-    }
-
     pub fn clear_brand_colors(&self) -> Result<()> {
         match fs::remove_file(self.brand_colors_path()) {
             Ok(()) => Ok(()),
@@ -713,6 +726,62 @@ impl CacheStore {
         self.ensure()?;
         fs::write(self.low_quota_alerted_path(), sources.join("\n"))
             .context("write low quota alert state")
+    }
+
+    pub fn icon_attention(&self) -> IconAttention {
+        fs::read(self.icon_attention_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn icon_attention_exists(&self) -> bool {
+        self.icon_attention_path().exists()
+    }
+
+    /// Serialize focus, event, and watcher updates to the same pane state.
+    pub fn lock_icon_attention(&self) -> Result<File> {
+        self.ensure()?;
+        let path = self.root.join("icon-attention.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        Ok(file)
+    }
+
+    pub fn set_icon_attention(&self, attention: &IconAttention) -> Result<()> {
+        // Always persist, even when both sets are empty. A missing file means
+        // "never tracked" and hydrates leftover `$quota_icon_done` tokens; an
+        // empty file means "everything has been seen".
+        self.ensure()?;
+        let destination = self.icon_attention_path();
+        let unchanged = fs::read(&destination)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<IconAttention>(&bytes).ok())
+            .as_ref()
+            == Some(attention);
+        if unchanged {
+            return Ok(());
+        }
+        let temporary = self
+            .root
+            .join(format!(".{ICON_ATTENTION_FILE}.{}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec(attention).context("serialize icon attention")?;
+        Self::atomic_replace(&destination, &temporary, bytes)
+    }
+
+    pub fn clear_icon_attention(&self) -> Result<()> {
+        match fs::remove_file(self.icon_attention_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove icon attention state"),
+        }
     }
 
     pub fn validate_watch_interval_seconds(seconds: u64) -> Result<u64> {
@@ -867,6 +936,10 @@ impl CacheStore {
 
     fn low_quota_alerted_path(&self) -> PathBuf {
         self.root.join(LOW_QUOTA_ALERTED_FILE)
+    }
+
+    fn icon_attention_path(&self) -> PathBuf {
+        self.root.join(ICON_ATTENTION_FILE)
     }
 
     fn valid_watch_interval(seconds: u64) -> Option<u64> {
@@ -1207,6 +1280,24 @@ mod tests {
             vec![UsageWindow::new(WindowKind::Weekly, 42.5, None).unwrap()],
             123,
         )
+    }
+
+    #[test]
+    fn icon_attention_round_trips_and_clears_when_empty() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        assert_eq!(cache.icon_attention(), IconAttention::default());
+        let mut attention = IconAttention::default();
+        attention.working.insert("w1:p1".into());
+        attention.unseen.insert("w1:p2".into());
+        cache.set_icon_attention(&attention).unwrap();
+        assert_eq!(cache.icon_attention(), attention);
+        cache.set_icon_attention(&IconAttention::default()).unwrap();
+        assert_eq!(cache.icon_attention(), IconAttention::default());
+        assert!(
+            directory.path().join("icon-attention.json").exists(),
+            "empty attention must stay on disk so hydrate does not re-run"
+        );
     }
 
     #[test]

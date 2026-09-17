@@ -52,6 +52,7 @@ mod tests {
     fn pane(harness: Harness, pane_id: &str, session: Option<&str>) -> AgentPane {
         AgentPane {
             pane_id: pane_id.to_string(),
+            workspace_id: "w1".to_string(),
             harness,
             session: session.map(|value| AgentSession {
                 kind: Some("id".to_string()),
@@ -60,6 +61,8 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
         }
     }
 
