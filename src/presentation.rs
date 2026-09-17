@@ -1,4 +1,4 @@
-use crate::cli::{FieldSet, PercentStyle, SidebarLayout};
+use crate::cli::{FieldSet, PercentStyle, SidebarField, SidebarLayout};
 use crate::model::{
     format_percent, live_windows, printed_percent, window_in, Provider, ProviderSnapshot, ResetAt,
     Severity, UsageWindow, WindowKind,
@@ -188,8 +188,7 @@ impl MetadataTokens {
             } else {
                 snapshot.windows_for_session(session_id)
             },
-            style,
-            shape,
+            RowStyle::new(style, shape),
         )
     }
 
@@ -208,6 +207,24 @@ impl MetadataTokens {
         style: PercentStyle,
         shape: SidebarShape,
     ) -> Self {
+        Self::from_snapshot_for_pane_with_fields(
+            snapshot,
+            now_unix,
+            session_id,
+            style,
+            shape,
+            FieldSet::all(),
+        )
+    }
+
+    pub fn from_snapshot_for_pane_with_fields(
+        snapshot: &ProviderSnapshot,
+        now_unix: u64,
+        session_id: Option<&str>,
+        style: PercentStyle,
+        shape: SidebarShape,
+        fields: FieldSet,
+    ) -> Self {
         let quota_model = match session_id {
             Some(session_id) => snapshot.model_for_session(Some(session_id)),
             None => snapshot.model.as_deref(),
@@ -221,8 +238,11 @@ impl MetadataTokens {
             quota_model,
             context,
             windows,
-            style,
-            shape,
+            RowStyle {
+                percent: style,
+                shape,
+                fields,
+            },
         )
     }
 
@@ -232,9 +252,11 @@ impl MetadataTokens {
         model: Option<&str>,
         context: Option<&crate::model::ContextUsage>,
         windows: &[UsageWindow],
-        style: PercentStyle,
-        shape: SidebarShape,
+        row: RowStyle,
     ) -> Self {
+        let style = row.percent;
+        let shape = row.shape;
+        let fields = row.fields;
         let live = live_windows(windows, now_unix);
         let windows = live.as_slice();
         let quota_provider = snapshot.provider.display_name().to_string();
@@ -289,7 +311,7 @@ impl MetadataTokens {
             quota_cache_ttl: sidebar_cache_ttl(context, now_unix),
             quota_cache_state: sidebar_cache_state(context, now_unix),
             quota_error: None,
-            quota_headroom: headroom(windows),
+            quota_headroom: headroom(windows, fields),
         }
     }
 
@@ -367,11 +389,20 @@ impl MetadataTokens {
 ///
 /// Rounded down, so a window one point above a threshold is never rounded
 /// onto the wrong side of it.
-fn headroom(windows: &[UsageWindow]) -> Option<u8> {
+fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
     [
-        window_in(windows, WindowKind::FiveHour),
-        window_in(windows, WindowKind::Weekly),
-        window_in(windows, WindowKind::Monthly),
+        fields
+            .contains(SidebarField::FiveHour)
+            .then(|| window_in(windows, WindowKind::FiveHour))
+            .flatten(),
+        fields
+            .contains(SidebarField::Week)
+            .then(|| window_in(windows, WindowKind::Weekly))
+            .flatten(),
+        fields
+            .contains(SidebarField::Month)
+            .then(|| window_in(windows, WindowKind::Monthly))
+            .flatten(),
     ]
     .into_iter()
     .flatten()
@@ -749,6 +780,24 @@ mod tests {
         // 5h has 60 left, 7d has 25, 30d has 2.
         let tokens = MetadataTokens::from_snapshot(&snapshot, 0);
         assert_eq!(tokens.quota_headroom, Some(2));
+        let visible = MetadataTokens::from_snapshot_for_pane_with_fields(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::default(),
+            FieldSet::parse("5h,7d").unwrap(),
+        );
+        assert_eq!(visible.quota_headroom, Some(25));
+        let hidden = MetadataTokens::from_snapshot_for_pane_with_fields(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::default(),
+            FieldSet::parse("none").unwrap(),
+        );
+        assert_eq!(hidden.quota_headroom, None);
     }
 
     #[test]

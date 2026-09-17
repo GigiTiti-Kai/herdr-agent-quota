@@ -12,7 +12,7 @@ Space, with brand icons that carry agent status.
 
 Agents are grouped under their Space. Each row leads with this plugin's brand
 icon — not Herdr's status ring. The icon colour tracks the agent: yellow while
-working, teal while done (until you focus the pane), ink-white when idle.
+working, teal while done (until you focus it or move focus away from it), ink-white when idle.
 Provider and model stay ink-white; severity colours on the meters still mean
 remaining headroom.
 

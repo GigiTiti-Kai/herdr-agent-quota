@@ -46,6 +46,16 @@ id = "focused-agent-quota-refresh"
 on = "pane.focused"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" focus"]
 
+[[events]]
+id = "focused-workspace-agent-quota-refresh"
+on = "workspace.focused"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" focus"]
+
+[[events]]
+id = "focused-tab-agent-quota-refresh"
+on = "tab.focused"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" focus"]
+
 [[panes]]
 id = "dashboard"
 title = "Agent quota"

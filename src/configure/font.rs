@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const FONT_FAMILY: &str = "Herdr Agent Icons Max";
 const FONT_BASENAME: &str = "HerdrAgentIconsMax";
@@ -18,12 +18,13 @@ const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/HerdrAgentIconsMax-
 const CODEPOINT_RANGES: [(&str, &str); 2] = [("E1A0", "E1B6"), ("E1C0", "E1C5")];
 const MARKER_START: &str = "# BEGIN herdr-agent-quota font";
 const MARKER_END: &str = "# END herdr-agent-quota font";
+const OWNED_FONT_FILE: &str = "owned-font";
 
 /// Copy the font into the user font directory and write Ghostty / kitty maps
 /// when those configs already exist. Never creates a terminal config from
 /// scratch.
-pub fn install() -> Result<Vec<String>> {
-    let mut notes = install_font()?;
+pub fn install(state_dir: &Path) -> Result<Vec<String>> {
+    let mut notes = install_font(state_dir)?;
     let mapped = configure_terminals()?;
     if mapped.is_empty() {
         notes.push(
@@ -37,7 +38,7 @@ pub fn install() -> Result<Vec<String>> {
     Ok(notes)
 }
 
-fn install_font() -> Result<Vec<String>> {
+fn install_font(state_dir: &Path) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     let dir = user_font_dir();
     fs::create_dir_all(&dir).with_context(|| format!("create font dir {}", dir.display()))?;
@@ -48,28 +49,41 @@ fn install_font() -> Result<Vec<String>> {
     } else {
         fs::write(&target, FONT_BYTES)
             .with_context(|| format!("write font {}", target.display()))?;
+        fs::write(state_dir.join(OWNED_FONT_FILE), hash.as_bytes())
+            .context("record installed font ownership")?;
         notes.push(format!("font: installed {}", target.display()));
     }
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if path == target {
-                continue;
-            }
-            if name.starts_with(FONT_BASENAME) && name.ends_with(".ttf") {
-                match fs::remove_file(&path) {
-                    Ok(()) => notes.push(format!("font: removed old {name}")),
-                    Err(_) => notes.push(format!(
-                        "font: {name} is in use; restart the terminal and re-run configure"
-                    )),
-                }
-            }
+    Ok(notes)
+}
+
+/// Remove only config blocks we marked and a font file this installation
+/// created. A pre-existing shared font must remain available to other tools.
+pub fn uninstall(state_dir: &Path) -> Result<()> {
+    for target in terminal_targets() {
+        if !target.path.exists() {
+            continue;
+        }
+        let original = fs::read_to_string(&target.path)
+            .with_context(|| format!("read {} config {}", target.name, target.path.display()))?;
+        if let Some(updated) = remove_marked(&original) {
+            fs::write(&target.path, updated).with_context(|| {
+                format!("write {} config {}", target.name, target.path.display())
+            })?;
         }
     }
-    Ok(notes)
+    let marker = state_dir.join(OWNED_FONT_FILE);
+    if fs::read_to_string(&marker).ok().as_deref() == Some(font_hash().as_str()) {
+        let target = user_font_dir().join(format!("{FONT_BASENAME}-{}.ttf", font_hash()));
+        match fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove font {}", target.display()))
+            }
+        }
+        fs::remove_file(marker).context("remove installed font ownership marker")?;
+    }
+    Ok(())
 }
 
 fn configure_terminals() -> Result<Vec<String>> {
@@ -185,6 +199,22 @@ fn upsert_marked(text: &str, body: &str) -> String {
     next
 }
 
+fn remove_marked(text: &str) -> Option<String> {
+    let from = text.find(MARKER_START)?;
+    let end = text[from..].find(MARKER_END)?;
+    let to = from + end + MARKER_END.len();
+    let before = text[..from].trim_end_matches('\n');
+    let after = text[to..].trim_start_matches('\n');
+    let mut output = before.to_owned();
+    if !output.is_empty() && !after.is_empty() {
+        output.push_str("\n\n");
+    } else if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(after);
+    Some(output)
+}
+
 fn user_font_dir() -> PathBuf {
     let home = directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
@@ -221,6 +251,7 @@ mod tests {
         assert_eq!(first, again);
         assert!(first.contains("font-codepoint-map"));
         assert_eq!(first.matches(MARKER_START).count(), 1);
+        assert_eq!(remove_marked(&first), Some("# existing\n".into()));
     }
 
     #[test]

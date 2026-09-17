@@ -9,7 +9,6 @@
 #   ./install.sh --row-gap 0
 #   ./install.sh --quota-percent used
 #   ./install.sh --fields topic,model,context,5h,7d
-#   ./install.sh --brand-colors off
 #   ./install.sh --agent-order default
 #   ./install.sh --low-quota-alert 10
 #
@@ -32,8 +31,8 @@
 # 30d. Default is provider, topic, model, context, 5h, 7d, 30d (cache and TTL
 # off). The error token is always shown.
 #
-# --brand-colors on (default) tints provider and model with each agent's hue;
-# off leaves them in the sidebar's own text colour. Severity colours stay.
+# --brand-colors is accepted for compatibility with older installs but has no
+# effect; identity text follows the sidebar theme and icons show status colour.
 #
 # --agent-order quota (default) keeps each Space contiguous and ranks by
 # least quota left inside the space; it replaces the panel's sort until it
@@ -64,7 +63,6 @@ SIDEBAR_LAYOUT=""
 ROW_GAP=""
 QUOTA_PERCENT=""
 FIELDS=""
-BRAND_COLORS=""
 AGENT_ORDER=""
 LOW_QUOTA_ALERT=""
 
@@ -102,7 +100,10 @@ while (($# > 0)); do
       ;;
     --brand-colors)
       (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
-      BRAND_COLORS="$2"
+      case "$2" in
+        on|off) ;;
+        *) die "brand-colors must be on or off" ;;
+      esac
       shift 2
       ;;
     --agent-order)
@@ -146,10 +147,6 @@ case "$QUOTA_PERCENT" in
   ""|remaining|used) ;;
   *) die "quota-percent must be remaining or used" ;;
 esac
-case "$BRAND_COLORS" in
-  ""|on|off) ;;
-  *) die "brand-colors must be on or off" ;;
-esac
 case "$AGENT_ORDER" in
   ""|default|quota) ;;
   *) die "agent-order must be default or quota" ;;
@@ -189,7 +186,6 @@ write_plugin_pref sidebar-layout "$SIDEBAR_LAYOUT"
 write_plugin_pref row-gap "$ROW_GAP"
 write_plugin_pref quota-percent "$QUOTA_PERCENT"
 write_plugin_pref fields "$FIELDS"
-write_plugin_pref brand-colors "$BRAND_COLORS"
 write_plugin_pref agent-order "$AGENT_ORDER"
 write_plugin_pref low-quota-alert "$LOW_QUOTA_ALERT"
 

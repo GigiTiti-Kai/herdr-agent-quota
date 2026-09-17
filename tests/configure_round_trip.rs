@@ -906,7 +906,44 @@ fn quota_refresh_does_not_report_metadata_to_a_scrolled_pane() {
 }
 
 #[test]
-fn focus_refreshes_only_the_selected_provider_without_reading_the_pane() {
+fn a_scrolled_pane_completion_reports_only_icon_tokens() {
+    let state = tempdir().unwrap();
+    let log = state.path().join("herdr.log");
+    let herdr = state.path().join("herdr");
+    fs::write(
+        &herdr,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
+            log.display(),
+            r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_status":"idle","tokens":{"quota_icon_working":"YELLOW","quota_5h_normal":"5h 80%"}}]}}"#,
+            r#"{"result":{"pane":{"scroll":{"offset_from_bottom":12}}}}"#,
+        ),
+    )
+    .unwrap();
+    chmod_exec(&herdr);
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("event")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"claude","status":"idle"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let calls = fs::read_to_string(log).unwrap();
+    let reports = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p1"))
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 1, "{calls}");
+    assert!(reports[0].contains("quota_icon_done="), "{calls}");
+    assert!(!reports[0].contains("quota_5h"), "{calls}");
+}
+
+#[test]
+fn focus_paints_icons_without_reading_the_pane_or_collectors() {
     let state = tempdir().unwrap();
     let log = state.path().join("herdr.log");
     let herdr = state.path().join("herdr");
@@ -916,31 +953,43 @@ fn focus_refreshes_only_the_selected_provider_without_reading_the_pane() {
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"pane current\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
             log.display(),
             r#"{"result":{"pane":{"agent":"claude","pane_id":"w1:p1"}}}"#,
-            r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1"}]}}"#,
-            r#"{"result":{"pane":{"scroll":{"offset_from_bottom":0}}}}"#,
+            r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_status":"idle","tokens":{"quota_icon_done":"TEAL","quota_provider":"Claude","quota_provider_model":"Claude"}}]}}"#,
+            r#"{"result":{"pane":{"scroll":{"offset_from_bottom":12}}}}"#,
         ),
     )
     .unwrap();
     let mut permissions = fs::metadata(&herdr).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&herdr, permissions).unwrap();
-    run_claude_collector(
-        state.path(),
-        &herdr,
-        include_bytes!("fixtures/claude/statusline-both.json"),
-    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_PLUGIN_EVENT_JSON")
         .output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(log).unwrap();
-    assert!(calls.contains("pane current"));
-    assert!(!calls.contains("pane read"));
-    assert!(calls.contains("pane report-metadata w1:p1"));
+    assert!(calls.contains("pane current"), "{calls}");
+    assert!(!calls.contains("pane read"), "{calls}");
+    let paint = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p1"))
+        .collect::<Vec<_>>();
+    assert!(!paint.is_empty(), "{calls}");
+    let joined = paint.join("\n");
+    assert!(
+        joined.contains("quota_icon=") || joined.contains("--token quota_icon="),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("clear-token quota_icon_done")
+            || joined.contains("--clear-token quota_icon_done"),
+        "{joined}"
+    );
+    assert!(!joined.contains("quota_provider"), "{joined}");
+    assert!(!joined.contains("quota_group"), "{joined}");
 }
 
 #[test]
@@ -1293,13 +1342,697 @@ fn focus_event_uses_its_pane_even_when_the_current_focus_differs() {
         );
         let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
         assert!(!calls.contains("pane current"), "{calls}");
+        assert!(!calls.contains("pane read"), "{calls}");
+        // Icon-only focus: inventory reads for paint, no collector spawn.
         assert!(
-            (1..=2).contains(&calls.matches("agent list").count()),
+            (1..=6).contains(&calls.matches("agent list").count()),
             "{calls}"
         );
-        assert!(!calls.contains("pane read"), "{calls}");
         assert_no_original_four_collection(state.path(), &herdr_log, &codex_log);
     }
+}
+
+#[test]
+fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
+    let state = tempdir().unwrap();
+    let initial_attention =
+        r#"{"working":["w5:pB"],"unseen":["w9:p1","w9:p6"],"last_focused":"w5:pB"}"#;
+    fs::write(state.path().join("icon-attention.json"), initial_attention).unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"codex","pane_id":"w5:pB","agent_status":"working","focused":true,
+         "tokens":{"quota_icon_working":"YELLOW","quota_provider":"Codex","quota_provider_model":"Codex"}},
+        {"agent":"cursor","pane_id":"w9:p1","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"cursor","pane_id":"w9:p6","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"OTHER_GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w5:pB"}}}"#),
+    );
+    let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w9","focused_tab_id":"w9:t1","focused_pane_id":"w9:p1","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t1"}],"layouts":[{"workspace_id":"w9","tab_id":"w9:t1","focused_pane_id":"w9:p1"}]}}}"#;
+    let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
+    writeln!(
+        script,
+        "if [ \"$1 $2\" = \"api snapshot\" ]; then printf '%s\\n' '{snapshot}'; fi"
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("focus")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"workspace_focused","data":{"type":"workspace_focused","workspace_id":"w9"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert!(
+        calls.contains("pane report-metadata w9:p1")
+            && calls.contains("--clear-token quota_icon_done"),
+        "focused green pane must become white: {calls}"
+    );
+    assert!(
+        !calls.contains("pane report-metadata w9:p6"),
+        "other unseen green pane must stay green: {calls}"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(state.path().join("icon-attention.json")).unwrap()
+        )
+        .unwrap()["last_focused"],
+        "w9:p1"
+    );
+
+    fs::write(state.path().join("icon-attention.json"), initial_attention).unwrap();
+    fs::remove_file(&herdr_log).unwrap();
+    let tab_output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("focus")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"tab_focused","data":{"type":"tab_focused","tab_id":"w9:t1","workspace_id":"w9"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        tab_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tab_output.stderr)
+    );
+    let tab_calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert!(
+        tab_calls.contains("pane report-metadata w9:p1")
+            && !tab_calls.contains("pane report-metadata w9:p6"),
+        "tab focus must clear only its focused pane: {tab_calls}"
+    );
+}
+
+#[test]
+fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
+    let state = tempdir().unwrap();
+    fs::write(
+        state.path().join("icon-attention.json"),
+        r#"{"unseen":["w9:p1"],"last_focused":"w5:pB"}"#,
+    )
+    .unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w9:p1","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w9:p1"}}}"#),
+    );
+    let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w5","focused_tab_id":"w5:t1","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t1"}],"layouts":[{"tab_id":"w9:t1","focused_pane_id":"w9:p1"}]}}}"#;
+    let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
+    writeln!(
+        script,
+        "if [ \"$1 $2\" = \"api snapshot\" ]; then printf '%s\\n' '{snapshot}'; fi"
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("focus")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"workspace_focused","data":{"workspace_id":"w9"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert!(!calls.contains("pane report-metadata"), "{calls}");
+    let attention: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.path().join("icon-attention.json")).unwrap())
+            .unwrap();
+    assert_eq!(attention["last_focused"], "w5:pB");
+    assert_eq!(attention["unseen"], serde_json::json!(["w9:p1"]));
+}
+
+#[test]
+fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
+    let state = tempdir().unwrap();
+    fs::write(
+        state.path().join("icon-attention.json"),
+        r#"{"unseen":["w1:p1","w1:p3"],"last_focused":"w1:p1"}"#,
+    )
+    .unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"grok","pane_id":"w1:p2","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon":"WHITE","quota_provider":"Grok","quota_provider_model":"Grok"}},
+        {"agent":"cursor","pane_id":"w1:p3","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"OTHER_GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, _) =
+        install_logged_herdr_and_codex(state.path(), inventory, None);
+    let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w1","focused_tab_id":"w1:t1","focused_pane_id":"w1:p2"}}}"#;
+    let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
+    writeln!(
+        script,
+        "if [ \"$1 $2\" = \"api snapshot\" ]; then printf '%s\\n' '{snapshot}'; fi"
+    )
+    .unwrap();
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .args([
+            "watch",
+            "--provider",
+            "all",
+            "--interval-seconds",
+            "30",
+            "--defer",
+        ])
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut calls = String::new();
+    while Instant::now() < deadline {
+        calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+        if calls.contains("pane report-metadata w1:p1") {
+            break;
+        }
+        if watcher.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = watcher.kill();
+    let watcher_output = watcher.wait_with_output().unwrap();
+    assert!(
+        calls.contains("pane report-metadata w1:p1")
+            && calls.contains("--clear-token quota_icon_done"),
+        "missed focus must turn the previous pane white: {calls}; watcher: {}",
+        String::from_utf8_lossy(&watcher_output.stderr)
+    );
+    assert!(
+        !calls.contains("pane report-metadata w1:p3"),
+        "unrelated green pane must remain green: {calls}"
+    );
+}
+
+#[test]
+fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
+    let state = tempdir().unwrap();
+    fs::write(
+        state.path().join("icon-attention.json"),
+        r#"{"unseen":["w1:p1"],"last_focused":"w1:p1"}"#,
+    )
+    .unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"grok","pane_id":"w1:p2","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon":"WHITE","quota_provider":"Grok","quota_provider_model":"Grok"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, _) =
+        install_logged_herdr_and_codex(state.path(), inventory, None);
+    let snapshot_path = state.path().join("snapshot.json");
+    fs::write(
+        &snapshot_path,
+        r#"{"result":{"snapshot":{"focused_pane_id":"w1:p1"}}}"#,
+    )
+    .unwrap();
+    let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
+    writeln!(
+        script,
+        "if [ \"$1 $2\" = \"api snapshot\" ]; then cat '{}'; fi",
+        snapshot_path.display()
+    )
+    .unwrap();
+    let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .args([
+            "watch",
+            "--provider",
+            "all",
+            "--interval-seconds",
+            "30",
+            "--defer",
+        ])
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first_poll_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_poll_deadline {
+        if fs::read_to_string(&herdr_log)
+            .unwrap_or_default()
+            .contains("api snapshot")
+        {
+            break;
+        }
+        if watcher.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(1100));
+    let before = fs::read_to_string(&herdr_log).unwrap_or_default();
+    fs::write(
+        &snapshot_path,
+        r#"{"result":{"snapshot":{"focused_pane_id":"w1:p2"}}}"#,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = String::new();
+    while Instant::now() < deadline {
+        after = fs::read_to_string(&herdr_log).unwrap_or_default();
+        if after.contains("pane report-metadata w1:p1") {
+            break;
+        }
+        if watcher.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = watcher.kill();
+    let watcher_output = watcher.wait_with_output().unwrap();
+    assert!(
+        !before.contains("pane report-metadata w1:p1"),
+        "completion must remain green while still focused: {before}"
+    );
+    assert!(
+        after.contains("pane report-metadata w1:p1")
+            && after.contains("--clear-token quota_icon_done"),
+        "focus loss must clear green: {after}; watcher: {}",
+        String::from_utf8_lossy(&watcher_output.stderr)
+    );
+}
+
+#[test]
+fn focusing_a_done_pane_clears_the_teal_icon_immediately() {
+    let state = tempdir().unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"done","focused":false,
+         "tokens":{"quota_icon_done":"TEAL","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"grok","pane_id":"w1:p2","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon":"x","quota_provider":"Grok","quota_provider_model":"Grok"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        Some(r#"{"result":{"pane":{"agent":"grok","pane_id":"w1:p2"}}}"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("focus")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env_remove("OPENCODE_API_KEY")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","workspace_id":"w1"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    let paint = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p1"))
+        .collect::<Vec<_>>();
+    assert!(
+        !paint.is_empty(),
+        "focus must republish the focused pane: {calls}"
+    );
+    let joined = paint.join("\n");
+    assert!(
+        joined.contains("quota_icon=") || joined.contains("--token quota_icon="),
+        "must publish idle brand icon: {joined}"
+    );
+    assert!(
+        joined.contains("clear-token quota_icon_done")
+            || joined.contains("--clear-token quota_icon_done"),
+        "must clear teal done twin: {joined}"
+    );
+    assert!(!calls.contains("pane read"), "{calls}");
+    assert_no_original_four_collection(state.path(), &herdr_log, &codex_log);
+}
+
+#[test]
+fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
+    let state = tempdir().unwrap();
+    fs::write(
+        state.path().join("icon-attention.json"),
+        r#"{"unseen":["w1:p1"]}"#,
+    )
+    .unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"working","focused":true,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p1"}}}"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("focus")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","workspace_id":"w1"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    let paint = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p1"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        paint.contains("--token quota_icon="),
+        "green pane must become white: {paint}"
+    );
+    assert!(
+        paint.contains("--clear-token quota_icon_done"),
+        "green token must clear: {paint}"
+    );
+}
+
+#[test]
+fn focus_change_clears_only_the_previous_green_pane() {
+    let state = tempdir().unwrap();
+    fs::write(
+        state.path().join("icon-attention.json"),
+        r#"{"last_focused":"w1:p1"}"#,
+    )
+    .unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","tab_id":"w1:t1","agent_status":"done","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"grok","pane_id":"w1:p2","tab_id":"w1:t1","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon":"WHITE","quota_provider":"Grok","quota_provider_model":"Grok"}},
+        {"agent":"codex","pane_id":"w1:p3","tab_id":"w1:t1","agent_status":"done","focused":false,
+         "tokens":{"quota_icon_done":"OTHER","quota_provider":"Codex","quota_provider_model":"Codex"}},
+        {"agent":"codex","pane_id":"w1:p4","tab_id":"w1:t1","agent_status":"working","focused":false,
+         "tokens":{"quota_icon_working":"YELLOW","quota_provider":"Codex","quota_provider_model":"Codex"}},
+        {"agent":"cursor","pane_id":"w1:p5","tab_id":"w1:t2","agent_status":"done","focused":false,
+         "tokens":{"quota_icon_done":"OTHER","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        Some(r#"{"result":{"pane":{"agent":"grok","pane_id":"w1:p2"}}}"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("focus")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p2","workspace_id":"w1"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    let sibling = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p1"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        sibling.contains("--token quota_icon="),
+        "previous green pane must become white: {calls}"
+    );
+    assert!(
+        sibling.contains("--clear-token quota_icon_done"),
+        "green token must clear: {calls}"
+    );
+    assert!(
+        !calls.contains("pane report-metadata w1:p3"),
+        "unseen green sibling in the same tab must stay green: {calls}"
+    );
+    assert!(
+        !calls.contains("pane report-metadata w1:p5"),
+        "other tab must stay green: {calls}"
+    );
+    let working_sibling = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p4"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !working_sibling.contains("--token quota_icon="),
+        "working sibling must stay yellow: {calls}"
+    );
+    assert!(
+        !calls.contains("pane read"),
+        "focus must read no terminal: {calls}"
+    );
+}
+
+#[test]
+fn focus_to_a_non_agent_pane_acknowledges_the_previous_agent() {
+    let state = tempdir().unwrap();
+    fs::write(
+        state.path().join("icon-attention.json"),
+        r#"{"unseen":["w1:p1"],"last_focused":"w1:p1"}"#,
+    )
+    .unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"GREEN"}}
+    ]}}"#;
+    let (herdr, herdr_log, _, _) = install_logged_herdr_and_codex(state.path(), inventory, None);
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("focus")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_focused","data":{"pane_id":"w1:p9","workspace_id":"w1"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let calls = fs::read_to_string(herdr_log).unwrap_or_default();
+    assert!(
+        calls.contains("pane report-metadata w1:p1")
+            && calls.contains("--clear-token quota_icon_done"),
+        "{calls}"
+    );
+    assert!(!calls.contains("pane report-metadata w1:p9"), "{calls}");
+}
+
+#[test]
+fn completion_stays_teal_even_when_the_pane_was_already_focused() {
+    let state = tempdir().unwrap();
+    // Production trap: status hooks set HERDR_PANE_ID to the *event* pane, so
+    // `herdr pane current` would return the finisher. Event must ignore that
+    // and use the event pane. Same-tab idle must remain teal until a later
+    // pane.focused event, whether or not it was already focused at finish.
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon":"x","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"cursor","pane_id":"w1:p2","agent_status":"working","focused":false,
+         "tokens":{"quota_icon_working":"Y","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        // Deliberately lie like production: pane current == event pane.
+        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p2"}}}"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("event")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env("HERDR_PANE_ID", "w1:p2")
+        .env_remove("OPENCODE_API_KEY")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"cursor","agent_status":"idle"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert!(
+        !calls.contains("pane current"),
+        "event must not call pane current (HERDR_PANE_ID trap): {calls}"
+    );
+    let paint = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p2"))
+        .collect::<Vec<_>>();
+    assert!(!paint.is_empty(), "completion must publish: {calls}");
+    let joined = paint.join("\n");
+    assert!(
+        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
+        "unfocused same-tab idle must stay teal: {joined}"
+    );
+    assert!(!calls.contains("pane read"), "{calls}");
+    assert!(!codex_log.exists(), "codex stub must stay idle");
+
+    // A finish in the already focused pane also paints teal.
+    let state = tempdir().unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"working","focused":true,
+         "tokens":{"quota_icon_working":"Y","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p1"}}}"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("event")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env_remove("OPENCODE_API_KEY")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"cursor","agent_status":"idle"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert!(
+        !calls.contains("pane current"),
+        "event must not call pane current: {calls}"
+    );
+    let paint = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p1"))
+        .collect::<Vec<_>>();
+    assert!(
+        !paint.is_empty(),
+        "focused completion must publish: {calls}"
+    );
+    let joined = paint.join("\n");
+    assert!(
+        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
+        "focused completion must stay teal: {joined}"
+    );
+    assert!(
+        !joined.contains("--token quota_icon=") && !joined.contains(" quota_icon="),
+        "focused completion must clear white: {joined}"
+    );
+    assert!(!calls.contains("pane read"), "{calls}");
+    assert!(!codex_log.exists(), "codex stub must stay idle");
+}
+
+#[test]
+fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
+    let state = tempdir().unwrap();
+    // Watch often paints idle-white and clears `$quota_icon_working` before
+    // the completion event runs. The working set must still force teal.
+    fs::write(
+        state.path().join("icon-attention.json"),
+        r#"{"working":["w1:p2"]}"#,
+    )
+    .unwrap();
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon":"x","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"cursor","pane_id":"w1:p2","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon":"x","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+    ]}}"#;
+    let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
+        state.path(),
+        inventory,
+        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p2"}}}"#),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .arg("event")
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env("CODEX_BIN_PATH", &codex)
+        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        .env("HERDR_PANE_ID", "w1:p2")
+        .env_remove("OPENCODE_API_KEY")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"cursor","agent_status":"idle"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
+    assert!(
+        !calls.contains("pane current"),
+        "event must not call pane current: {calls}"
+    );
+    let paint = calls
+        .lines()
+        .filter(|line| line.contains("pane report-metadata w1:p2"))
+        .collect::<Vec<_>>();
+    assert!(!paint.is_empty(), "completion must publish: {calls}");
+    let joined = paint.join("\n");
+    assert!(
+        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
+        "working-set idle must stay teal even without a yellow twin: {joined}"
+    );
+    assert!(!calls.contains("pane read"), "{calls}");
+    assert!(!codex_log.exists(), "codex stub must stay idle");
 }
 
 #[test]
@@ -1320,6 +2053,8 @@ fn focus_on_an_opencode_pane_does_not_refresh_collectors() {
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
         .env_remove("GROK_AUTH_FILE")
         .env_remove("OPENCODE_API_KEY")
+        .env_remove("HERDR_PLUGIN_EVENT_JSON")
+        .env_remove("HERDR_PANE_ID")
         .output()
         .unwrap();
     assert!(
@@ -1683,6 +2418,15 @@ impl AgentHomes {
         command
             .arg("configure")
             .args(args)
+            .env("HOME", self.state.parent().unwrap())
+            .env(
+                "XDG_CONFIG_HOME",
+                self.state.parent().unwrap().join(".config"),
+            )
+            .env(
+                "XDG_DATA_HOME",
+                self.state.parent().unwrap().join(".local/share"),
+            )
             .env("HERDR_PLUGIN_STATE_DIR", &self.state)
             .env("HERDR_CONFIG_FILE", &self.herdr_config)
             .env("CLAUDE_SETTINGS_FILE", &self.claude_settings)
@@ -2245,6 +2989,14 @@ fn an_installer_can_select_gauges_layout_through_the_plugin_config_dir() {
 fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
     let root = tempdir().unwrap();
     let homes = AgentHomes::new(root.path());
+    let terminal_config = root.path().join(".config/ghostty/config");
+    fs::create_dir_all(terminal_config.parent().unwrap()).unwrap();
+    fs::write(&terminal_config, "# my terminal\n").unwrap();
+    let font_dir = if cfg!(target_os = "macos") {
+        root.path().join("Library/Fonts")
+    } else {
+        root.path().join(".local/share/fonts")
+    };
     let original = concat!(
         "# hand-written\n",
         "[ui]\nagent_panel_sort = \"spaces\"\n\n",
@@ -2260,9 +3012,18 @@ fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
         .status
         .success());
     assert!(sidebar_is_gauges(&homes.sidebar()), "{}", homes.sidebar());
+    assert!(fs::read_to_string(&terminal_config)
+        .unwrap()
+        .contains("# BEGIN herdr-agent-quota font"));
+    assert!(fs::read_dir(&font_dir).unwrap().next().is_some());
 
     assert!(homes.configure(&["--uninstall"]).status.success());
     assert_eq!(homes.sidebar(), original);
+    assert_eq!(
+        fs::read_to_string(&terminal_config).unwrap(),
+        "# my terminal\n"
+    );
+    assert!(fs::read_dir(&font_dir).unwrap().next().is_none());
 }
 
 fn sidebar_is_gauges(sidebar: &str) -> bool {
@@ -2896,4 +3657,22 @@ fn a_manual_refresh_reads_no_pane_at_all() {
         !calls.contains("recent"),
         "manual refresh used a repainting source: {calls}"
     );
+}
+
+#[test]
+fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
+    let state = tempdir().unwrap();
+    let inventory = r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_status":"idle","tokens":{}}]}}"#;
+    let (herdr, herdr_log, _, _) = install_logged_herdr_and_codex(state.path(), inventory, None);
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .args(["refresh", "--provider", "claude"])
+        .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let calls = fs::read_to_string(herdr_log).unwrap_or_default();
+    assert!(calls.contains("pane report-metadata w1:p1"), "{calls}");
+    assert!(calls.contains("--token quota_icon="), "{calls}");
+    assert!(!calls.contains("pane read"), "{calls}");
 }

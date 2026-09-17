@@ -110,8 +110,8 @@ pub enum Command {
         /// context, 5h, 7d. The error token is always shown.
         #[arg(long, value_parser = parse_field_set)]
         fields: Option<FieldSet>,
-        /// Whether provider and model carry each agent's brand hue. Severity
-        /// colours are unaffected.
+        /// Deprecated compatibility setting. Identity text now follows the
+        /// sidebar theme; status colour lives on the brand icon.
         #[arg(long, value_enum)]
         brand_colors: Option<BrandColors>,
         /// Blank rows between agent panes. `1` (default) separates them;
@@ -459,11 +459,8 @@ fn parse_field_set(value: &str) -> Result<FieldSet, String> {
     })
 }
 
-/// Whether provider and model carry each agent's brand hue.
-///
-/// Herdr owns the sidebar theme; this is the only colour the plugin writes of
-/// its own, so it is the only colour it can offer to turn off. Severity
-/// colours stay in both settings: they are information, not decoration.
+/// Legacy preference retained so older managed rows can be recognised and
+/// removed during an upgrade or uninstall. It no longer changes new rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum BrandColors {
     #[default]
@@ -473,17 +470,6 @@ pub enum BrandColors {
 
 impl BrandColors {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_BRAND_COLORS";
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
-
-    pub fn is_on(self) -> bool {
-        self == Self::On
-    }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {

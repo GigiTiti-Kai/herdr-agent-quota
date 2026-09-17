@@ -11,7 +11,7 @@ agent 状态。
 <img src="docs/screenshots/sidebar-gauges.png" alt="按 Space 分组的 gauges 侧栏" width="320">
 
 Agent 按所属 Space 分组。每一行只用本插件的品牌图标，不再画 Herdr 原生状态圈；
-图标颜色跟随 agent——工作中为黄、完成（聚焦前）为青绿、空闲为墨白。
+图标颜色跟随 agent——工作中为黄、完成后为青绿；聚焦该 pane，或焦点从它移走后变为墨白。其他未读的绿色 pane 不受影响。
 Provider／模型保持墨白色；进度条上的严重程度色仍表示剩余额度。
 
 默认布局是 `gauges`：在每个额度数字旁加一条进度条。进度条长度始终对应旁边打印的数字；

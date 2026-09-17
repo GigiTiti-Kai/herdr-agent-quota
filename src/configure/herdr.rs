@@ -105,8 +105,8 @@ fn severity_palette(layout: SidebarLayout) -> [&'static str; 3] {
         SidebarLayout::Packed | SidebarLayout::Stacked => SEVERITY_PALETTE,
     }
 }
-/// Provider row keys only. Identity is always ink-white; status is Herdr's
-/// `state_icon`, not vendor brand hues.
+/// Provider row keys only. Provider and model text inherit the sidebar theme;
+/// status colour lives on the vendor icon's three mutually exclusive tokens.
 const PROVIDER_STYLES: [(Harness, &str); 10] = [
     (Harness::Claude, "claude"),
     (Harness::Codex, "codex"),
@@ -927,8 +927,8 @@ fn has_provider_style_marker(value: &Value) -> bool {
 /// empty metadata never removes workspace/tab identity.
 ///
 /// The native `agent` row is omitted on purpose: `$quota_provider_model`
-/// already names the harness in brand color, and keeping both shows `grok`
-/// above `Grok/grok-4.6`. Uninstall puts `agent` back.
+/// already names the harness, and keeping both shows `grok` above
+/// `Grok/grok-4.6`. Uninstall puts `agent` back.
 fn official_agent_rows() -> Array {
     let mut rows = Array::new();
     rows.push(Value::Array(OFFICIAL_IDENTITY_TOKENS.into_iter().collect()));
@@ -996,8 +996,8 @@ fn append_identity_row(rows: &mut Array) {
 /// Brand icon in three mutually exclusive colours, then the name.
 ///
 /// Herdr collapses empty tokens, so only the published status twin shows. No
-/// `state_icon`: two circles on one row is what this replaces. Click-to-seen
-/// is Herdr's own `agent_status` (`done` → `idle` on focus); we only mirror it.
+/// `state_icon`: two circles on one row is what this replaces. Focus changes
+/// acknowledge only the old and new panes; unrelated green icons stay green.
 fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
     let mut row = Array::new();
     row.push(styled_token(
@@ -1372,7 +1372,7 @@ fn skipped_provider_label(provider: &str) -> &str {
 }
 
 fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, _brand: BrandColors) {
-    println!("  keep Herdr's official machine, workspace, and tab rows");
+    println!("  use the Space group header instead of repeating machine, workspace, and tab rows");
     match layout {
         SidebarLayout::Packed => {
             println!("  show the user prompt, context, and one compact severity-colored 5h/7d row");

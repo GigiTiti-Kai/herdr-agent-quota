@@ -170,9 +170,10 @@ impl AgentSession {
 
 /// Herdr's effective pane status from `agent_status`.
 ///
-/// Idle + unseen is reported as `done` until the user focuses the pane; there
-/// is no separate `seen` field on the list. The brand icon colour mirrors this
-/// enum — never a second `state_icon` ring.
+/// The CLI list maps idle+unseen to `done`, but same-tab completions are
+/// often already `idle` on the server while the TUI ring is still teal.
+/// Brand-icon colour therefore uses this enum after `refresh` has applied
+/// the plugin's own unseen set — never a second `state_icon` ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentStatus {
     #[default]
@@ -219,8 +220,8 @@ pub struct AgentPane {
     pub tokens: BTreeMap<String, String>,
     /// From Herdr `agent_status`. Drives brand-icon colour and the watch pulse.
     pub status: AgentStatus,
-    /// Herdr `focused`. Done + focused must paint idle: focus marks seen, and
-    /// the inventory can briefly still say `done` when our focus hook runs.
+    /// Herdr `focused` describes the current pane, not whether a completion
+    /// was acknowledged by a later focus event.
     pub focused: bool,
 }
 
@@ -229,13 +230,28 @@ impl AgentPane {
         self.status.is_working()
     }
 
-    /// Status the brand icon should mirror. Focus clears done immediately.
+    /// Status the brand icon should mirror.
+    ///
+    /// Working is yellow, unseen completion is teal, acknowledged is white.
+    /// Callers fold the plugin unseen-set into `status` before publish. Do
+    /// not treat a leftover `$quota_icon_done` token as unseen: a concurrent
+    /// inventory read after mark-seen still carries that token and would
+    /// paint teal back on.
     pub fn icon_status(&self) -> AgentStatus {
-        if self.focused && self.status == AgentStatus::Done {
-            AgentStatus::Idle
-        } else {
-            self.status
+        if self.status.is_working() {
+            return AgentStatus::Working;
         }
+        if self.status == AgentStatus::Done {
+            return AgentStatus::Done;
+        }
+        self.status
+    }
+
+    pub fn icon_needs_update(&self) -> bool {
+        let active = self.icon_status().icon_token();
+        ICON_TOKEN_NAMES
+            .into_iter()
+            .any(|name| self.tokens.contains_key(name) != (name == active))
     }
 }
 
@@ -411,6 +427,18 @@ pub fn find_agent_pane(pane_id: &str) -> Result<Option<AgentPane>> {
     Ok(Some(pane))
 }
 
+/// Return only the named agents from one inventory read. A focus change must
+/// never acknowledge an unrelated green pane in the same tab.
+pub fn find_agent_icon_panes(pane_ids: &[&str]) -> Result<Vec<AgentPane>> {
+    let value = list_agent_value()?;
+    let mut panes = Vec::new();
+    collect_agent_panes(&value, &mut panes);
+    panes.retain(|pane| pane_ids.contains(&pane.pane_id.as_str()));
+    panes.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
+    panes.dedup_by(|left, right| left.pane_id == right.pane_id);
+    Ok(panes)
+}
+
 /// Herdr has no Muse session integration, so a Muse pane arrives without a
 /// session. Resolve it from Muse's own session lock; a session Herdr does
 /// report is always kept as-is.
@@ -481,6 +509,63 @@ pub fn current_focused_pane() -> Result<Option<(String, Harness)>> {
         .and_then(Value::as_str)
         .and_then(Harness::from_agent_name)
         .map(|harness| (pane_id.to_string(), harness)))
+}
+
+/// Resolve a workspace/tab focus event to that tab's focused pane. Ignore a
+/// delayed event once the session has focused somewhere else.
+pub fn focused_pane_in_snapshot(
+    workspace_id: Option<&str>,
+    tab_id: Option<&str>,
+) -> Result<Option<String>> {
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let output = Command::new(executable)
+        .args(["api", "snapshot"])
+        .output()
+        .context("read Herdr focus snapshot")?;
+    if !output.status.success() {
+        anyhow::bail!("Herdr api snapshot failed with {}", output.status);
+    }
+    let value: Value =
+        serde_json::from_slice(&output.stdout).context("parse Herdr focus snapshot")?;
+    let snapshot = value.pointer("/result/snapshot").unwrap_or(&value);
+    if workspace_id
+        .is_some_and(|id| snapshot.get("focused_workspace_id").and_then(Value::as_str) != Some(id))
+        || tab_id
+            .is_some_and(|id| snapshot.get("focused_tab_id").and_then(Value::as_str) != Some(id))
+    {
+        return Ok(None);
+    }
+    if workspace_id.is_none() && tab_id.is_none() {
+        return Ok(snapshot
+            .get("focused_pane_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned));
+    }
+    let tab_id = tab_id.or_else(|| {
+        snapshot
+            .get("workspaces")?
+            .as_array()?
+            .iter()
+            .find(|workspace| {
+                workspace.get("workspace_id").and_then(Value::as_str) == workspace_id
+            })?
+            .get("active_tab_id")?
+            .as_str()
+    });
+    let Some(tab_id) = tab_id else {
+        return Ok(None);
+    };
+    Ok(snapshot
+        .get("layouts")
+        .and_then(Value::as_array)
+        .and_then(|layouts| {
+            layouts
+                .iter()
+                .find(|layout| layout.get("tab_id").and_then(Value::as_str) == Some(tab_id))
+        })
+        .and_then(|layout| layout.get("focused_pane_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 // Reading a pane makes Herdr repaint it, which visibly scrolls the agent's
@@ -653,6 +738,74 @@ pub fn publish_pane_tokens(
     sequence: u64,
     row: RowStyle,
 ) -> Result<()> {
+    publish_pane_tokens_inner(panes, tokens, sequence, row, false)
+}
+
+/// Watcher refreshes may need to clear a stale icon while its pane is scrolled.
+/// The inner publisher still sends only the icon twins in that case; quota and
+/// topic writes remain deferred until the pane is visible.
+pub fn publish_pane_tokens_with_scrolled_icons(
+    panes: &[AgentPane],
+    tokens: &[PaneTokens],
+    sequence: u64,
+    row: RowStyle,
+) -> Result<()> {
+    publish_pane_tokens_inner(panes, tokens, sequence, row, true)
+}
+
+/// Sidebar icon colour must update on focus even if the terminal is scrolled —
+/// the scroll guard exists to protect reading scrollback during quota refreshes,
+/// not to leave a stale teal glyph after mark-seen.
+pub fn publish_status_icons(
+    panes: &[AgentPane],
+    tokens: &[PaneTokens],
+    sequence: u64,
+    row: RowStyle,
+) -> Result<()> {
+    publish_pane_tokens_inner(panes, tokens, sequence, row, true)
+}
+
+/// Focus and watcher reconciliation change only the three icon colour tokens.
+/// They must not turn an icon acknowledgement into a quota or group refresh.
+pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
+    if panes.is_empty() {
+        return Ok(());
+    }
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let inventory = match list_agent_panes() {
+        Ok(all) if !all.is_empty() => all,
+        _ => panes.to_vec(),
+    };
+    let group_heads = group_head_pane_ids(&inventory, panes, &[]);
+    let mut reported = 0;
+    let mut failed = Vec::new();
+    for pane in panes {
+        let mut desired = pane.tokens.clone();
+        apply_group_and_icon(&mut desired, pane, &group_heads, &BTreeMap::new());
+        if icon_tokens_match(&pane.tokens, &desired) {
+            continue;
+        }
+        reported += 1;
+        if !report_icon_metadata(&executable, pane, &desired, sequence)? {
+            failed.push(pane.pane_id.clone());
+        }
+    }
+    if reported > 0 && failed.len() == reported {
+        anyhow::bail!(
+            "Herdr icon report failed for every pane: {}",
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn publish_pane_tokens_inner(
+    panes: &[AgentPane],
+    tokens: &[PaneTokens],
+    sequence: u64,
+    row: RowStyle,
+    allow_while_scrolled: bool,
+) -> Result<()> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     let workspace_labels = list_workspace_labels().unwrap_or_default();
     // Event/focus publish one pane. Head selection and sibling clears need the
@@ -690,7 +843,15 @@ pub fn publish_pane_tokens(
         // Herdr versions that repaint metadata can snap a terminal viewport
         // back to the bottom. Never mutate pane metadata while the user is
         // reading scrollback; the next refresh after they return catches up.
+        // Icon-only sync may proceed while scrolled — see publish_status_icons.
         if pane_is_scrolled(&executable, &pane.pane_id) {
+            if !allow_while_scrolled || icon_tokens_match(&pane.tokens, &desired) {
+                continue;
+            }
+            reported += 1;
+            if !report_icon_metadata(&executable, pane, &desired, sequence)? {
+                failed.push(pane.pane_id.clone());
+            }
             continue;
         }
         reported += 1;
@@ -717,6 +878,42 @@ pub fn publish_pane_tokens(
         );
     }
     Ok(())
+}
+
+fn icon_tokens_match(
+    current: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> bool {
+    ICON_TOKEN_NAMES
+        .into_iter()
+        .all(|name| current.get(name) == desired.get(name))
+}
+
+fn report_icon_metadata(
+    executable: &std::ffi::OsStr,
+    pane: &AgentPane,
+    desired: &BTreeMap<String, String>,
+    sequence: u64,
+) -> Result<bool> {
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "pane",
+            "report-metadata",
+            &pane.pane_id,
+            "--source",
+            "herdr-agent-quota",
+        ])
+        .args(["--seq", &sequence.to_string(), "--ttl-ms", METADATA_TTL_MS]);
+    for name in ICON_TOKEN_NAMES {
+        if let Some(value) = desired.get(name) {
+            command.args(["--token", &format!("{name}={value}")]);
+        } else {
+            command.args(["--clear-token", name]);
+        }
+    }
+    let output = command.output().context("report icon metadata to Herdr")?;
+    Ok(output.status.success())
 }
 
 fn report_pane_metadata(
@@ -1631,6 +1828,47 @@ mod tests {
         assert!(done_desired.contains_key("quota_icon_done"));
         assert!(!done_desired.contains_key("quota_icon"));
         assert!(!done_desired.contains_key("quota_icon_working"));
+
+        // Merely being focused when a turn finishes does not acknowledge it.
+        let mut seen = done.clone();
+        seen.focused = true;
+        let mut seen_desired = BTreeMap::new();
+        apply_group_and_icon(&mut seen_desired, &seen, &heads, &labels);
+        assert!(
+            seen_desired.contains_key("quota_icon_done"),
+            "focused completion stays teal until the focus hook acknowledges it"
+        );
+        assert!(!seen_desired.contains_key("quota_icon"));
+
+        // Unfocused sibling finishing must keep teal — not follow the focused
+        // pane's yellow→white shortcut.
+        let mut other = sibling.clone();
+        other.pane_id = "w1:p3".into();
+        other.status = AgentStatus::Done;
+        other.focused = false;
+        let mut other_desired = BTreeMap::new();
+        apply_group_and_icon(&mut other_desired, &other, &heads, &labels);
+        assert!(
+            other_desired.contains_key("quota_icon_done"),
+            "unfocused completion keeps teal until that pane is focused"
+        );
+        assert!(!other_desired.contains_key("quota_icon"));
+
+        // Same-tab: refresh folds unseen into status=Done before publish.
+        // A leftover done token on idle must not paint teal by itself —
+        // that is how a stale agent-list read restored teal after focus.
+        let mut stale_token = other.clone();
+        stale_token.status = AgentStatus::Idle;
+        stale_token
+            .tokens
+            .insert("quota_icon_done".to_string(), "teal".to_string());
+        let mut stale_desired = BTreeMap::new();
+        apply_group_and_icon(&mut stale_desired, &stale_token, &heads, &labels);
+        assert!(
+            stale_desired.contains_key("quota_icon"),
+            "idle + leftover done token must not restore teal"
+        );
+        assert!(!stale_desired.contains_key("quota_icon_done"));
     }
 
     #[test]

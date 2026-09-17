@@ -13,8 +13,8 @@
 
 use crate::cache::CacheStore;
 use crate::cli::{
-    AgentOrder, AgentSelection, BrandColors, FieldSet, LowQuotaAlert, PercentStyle, SidebarField,
-    SidebarLayout, SidebarRowGap,
+    AgentOrder, AgentSelection, FieldSet, LowQuotaAlert, PercentStyle, SidebarField, SidebarLayout,
+    SidebarRowGap,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -263,8 +263,6 @@ impl Settings {
             self.layout.as_str().to_string(),
             "--row-gap".to_string(),
             self.gap.to_string(),
-            "--brand-colors".to_string(),
-            BrandColors::Off.as_str().to_string(),
             "--fields".to_string(),
             self.fields.as_list(),
             "--agent-order".to_string(),
@@ -707,8 +705,6 @@ mod tests {
                 "gauges",
                 "--row-gap",
                 "1",
-                "--brand-colors",
-                "off",
                 "--fields",
                 "provider,model,cache,ttl,context,5h,7d,30d",
                 "--agent-order",

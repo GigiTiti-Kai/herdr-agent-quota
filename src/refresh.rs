@@ -1,9 +1,10 @@
 use crate::cache::CacheStore;
 use crate::cli::{AgentSelection, LowQuotaAlert};
 use crate::herdr::{
-    current_focused_pane, find_agent_pane, list_agent_panes, list_agent_state,
-    plugin_quota_present, publish_pane_tokens, refresh_pane_topic, AgentPane, AgentStatus,
-    PaneQuotaUpdate, PaneTokens,
+    current_focused_pane, find_agent_icon_panes, find_agent_pane, focused_pane_in_snapshot,
+    list_agent_panes, list_agent_state, plugin_quota_present, publish_icon_tokens,
+    publish_pane_tokens, publish_pane_tokens_with_scrolled_icons, publish_status_icons,
+    refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens,
 };
 use crate::model::{
     BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution,
@@ -17,7 +18,7 @@ use crate::route;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -182,12 +183,27 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             &mut settling,
             now,
         );
-        let _ = refresh_working_panes(&cache, &state.panes, &affected);
-        if active.is_empty() && settling.is_empty() {
+        // Fold plugin unseen-state into pane.status before any publish so a
+        // same-tab idle inventory cannot paint white over a completion the
+        // user has not focused yet.
+        apply_icon_attention(&mut state.panes, &cache, None, true, false)?;
+        let icon_dirty = state
+            .panes
+            .iter()
+            .filter(|pane| pane.icon_needs_update())
+            .map(|pane| pane.pane_id.clone())
+            .collect::<Vec<_>>();
+        let _ = refresh_working_panes(&cache, &state.panes, &affected, &icon_dirty);
+        let stale_icons = state.panes.iter().any(has_stale_done_icon);
+        if active.is_empty()
+            && settling.is_empty()
+            && !stale_icons
+            && cache.icon_attention().unseen.is_empty()
+        {
             break;
         }
         previous_active = active;
-        if started.elapsed() >= MAX_ACTIVE_TURN_WATCH {
+        if started.elapsed() >= MAX_ACTIVE_TURN_WATCH && cache.icon_attention().unseen.is_empty() {
             break;
         }
         wait_for_watch_tick(&cache, interval, started_at, started_millis);
@@ -283,8 +299,14 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
     if snapshot.displayed_quota_has_expired(session_id, now) {
         return true;
     }
-    let values =
-        MetadataTokens::from_snapshot_for_pane(&snapshot, now, session_id, row.percent, row.shape);
+    let values = MetadataTokens::from_snapshot_for_pane_with_fields(
+        &snapshot,
+        now,
+        session_id,
+        row.percent,
+        row.shape,
+        row.fields,
+    );
     crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape)
 }
 
@@ -306,9 +328,25 @@ fn wait_for_watch_tick(
         {
             break;
         }
+        poll_focus_once(cache);
         thread::sleep(
             Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())),
         );
+    }
+}
+
+/// Herdr 0.9 can change TUI focus without delivering a focus hook. Sample the
+/// metadata-only snapshot between quota polls, and repaint only on a change.
+fn poll_focus_once(cache: &CacheStore) {
+    let attention = cache.icon_attention();
+    if attention.working.is_empty() && attention.unseen.is_empty() {
+        return;
+    }
+    let Ok(Some(pane_id)) = focused_pane_in_snapshot(None, None) else {
+        return;
+    };
+    if attention.last_focused.as_deref() != Some(pane_id.as_str()) {
+        let _ = paint_focus_icons(cache, Some(&pane_id));
     }
 }
 
@@ -319,6 +357,7 @@ fn refresh_working_panes(
     cache: &CacheStore,
     panes: &[AgentPane],
     affected: &[String],
+    icon_dirty: &[String],
 ) -> Result<()> {
     let routes = panes.iter().map(route::resolve).collect::<Vec<_>>();
     let mut targets = Vec::new();
@@ -332,7 +371,9 @@ fn refresh_working_panes(
         }
     }
     let mut selected = panes.iter().zip(routes).filter(|(pane, resolution)| {
-        affected.contains(&pane.pane_id) || matches!(resolution, Resolution::Subscription(target) if targets.contains(target))
+        affected.contains(&pane.pane_id)
+            || icon_dirty.contains(&pane.pane_id)
+            || matches!(resolution, Resolution::Subscription(target) if targets.contains(target))
     }).map(|(pane, _)| pane.clone()).collect::<Vec<_>>();
     let mut providers = Vec::new();
     for provider in targets
@@ -344,7 +385,7 @@ fn refresh_working_panes(
         }
     }
     refresh_selected(cache, &providers, false, &selected)?;
-    publish_resolved(cache, &mut selected, None, false)
+    publish_resolved(cache, &mut selected, None, false, true)
 }
 
 fn run_internal(
@@ -379,7 +420,7 @@ fn run_internal(
     } else {
         panes_for_providers(session_panes, providers)
     };
-    publish_resolved(&cache, &mut publish_panes, topic_pane, force)?;
+    publish_resolved(&cache, &mut publish_panes, topic_pane, force, false)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&outcomes)?);
     }
@@ -417,6 +458,11 @@ pub fn event() -> Result<()> {
     if let Some(status) = status {
         pane.status = AgentStatus::parse(status);
     }
+    // Brand icon colour mirrors the TUI state_icon: working → yellow, unseen
+    // completion → teal, later focus event → white. Never call `herdr pane current`
+    // here: status hooks set HERDR_PANE_ID to the *event* pane, so pane
+    // current returns the finisher and would skip teal for every completion.
+    // `handle_named_pane` folds the working set into status before publish.
     // Pi's and omp's exact session files carry the routing evidence, and
     // Muse/Cursor transcripts record the prompt itself. Reading their panes
     // would add a visible repaint without improving attribution or the topic.
@@ -425,7 +471,12 @@ pub fn event() -> Result<()> {
         Harness::Pi | Harness::Omp | Harness::Muse | Harness::Cursor
     ))
     .then_some(pane_id);
-    let result = handle_named_pane(&cache, pane, topic_pane);
+    let result = handle_named_pane(
+        &cache,
+        pane,
+        topic_pane,
+        status.is_some_and(is_working_status),
+    );
     if status.is_some_and(is_working_status) {
         if let Err(error) = spawn_watch(true) {
             if result.is_ok() {
@@ -437,32 +488,156 @@ pub fn event() -> Result<()> {
 }
 
 pub fn focus() -> Result<()> {
-    let pane = if let Some(event) = event_json() {
-        let Some(pane_id) = find_pane_id(&event) else {
-            return Ok(());
-        };
-        // Focus may have moved again, or belong to another client. The event
-        // names our target; the inventory supplies its current harness.
-        find_agent_pane(pane_id)?
-    } else {
-        let Some((pane_id, harness)) = current_focused_pane()? else {
-            return Ok(());
-        };
-        named_pane(&pane_id, harness)?
+    // Focus is icon-only. Pane events name their target directly; workspace
+    // and tab events need the focused pane from that location's layout.
+    // Only a direct CLI invocation falls back to `pane current`.
+    let event = event_json();
+    let force_idle = match event.as_ref() {
+        Some(event) => {
+            if let Some(pane_id) = find_pane_id(event) {
+                Some(pane_id.to_owned())
+            } else {
+                let workspace_id = find_field(event, &["workspace_id", "workspaceId"]);
+                let tab_id = find_field(event, &["tab_id", "tabId"]);
+                if workspace_id.is_some() || tab_id.is_some() {
+                    focused_pane_in_snapshot(workspace_id, tab_id)?
+                } else {
+                    None
+                }
+            }
+        }
+        None => current_focused_pane().ok().flatten().map(|(id, _)| id),
     };
-    let Some(mut pane) = pane else {
+    let cache = CacheStore::from_env()?;
+    paint_focus_icons(&cache, force_idle.as_deref())
+}
+
+/// Fold plugin working/unseen state into each pane's status so icon colour
+/// matches the TUI ring, not server `agent_status`.
+///
+/// Herdr's CLI list marks same-tab completions `idle` (server seen). The TUI
+/// ring stays teal until that pane's surface is acknowledged. We persist the
+/// same unseen set across event/watch/focus so a watch pass cannot paint
+/// white over a completion the user has not focused.
+fn apply_icon_attention(
+    panes: &mut [AgentPane],
+    cache: &CacheStore,
+    force_seen: Option<&str>,
+    prune_to_live: bool,
+    working_event: bool,
+) -> Result<()> {
+    let _lock = cache.lock_icon_attention()?;
+    let hydrate = !cache.icon_attention_exists();
+    let mut attention = cache.icon_attention();
+    let previous_focused = attention.last_focused.clone();
+    if prune_to_live {
+        let live: BTreeSet<String> = panes.iter().map(|pane| pane.pane_id.clone()).collect();
+        attention.working.retain(|id| live.contains(id));
+        attention.unseen.retain(|id| live.contains(id));
+        attention.seen.retain(|id| live.contains(id));
+    }
+    if hydrate {
+        for pane in panes.iter() {
+            if !pane.focused && pane.tokens.contains_key("quota_icon_done") {
+                attention.unseen.insert(pane.pane_id.clone());
+            }
+        }
+    }
+    if force_seen.is_none() && attention.last_focused.is_none() {
+        attention.last_focused = panes
+            .iter()
+            .find(|pane| pane.focused)
+            .map(|pane| pane.pane_id.clone());
+    }
+    for pane in panes.iter_mut() {
+        if working_event && pane.focused {
+            attention.last_focused = Some(pane.pane_id.clone());
+        }
+        let acknowledge = force_seen.is_some_and(|target| {
+            pane.pane_id == target || previous_focused.as_deref() == Some(pane.pane_id.as_str())
+        });
+        if acknowledge {
+            let green_on_screen = attention.unseen.contains(&pane.pane_id)
+                || pane.tokens.contains_key("quota_icon_done");
+            if force_seen == Some(pane.pane_id.as_str()) {
+                pane.focused = true;
+            }
+            // A focus hook acknowledges the colour the user actually saw.
+            // Herdr's inventory can still report `working` after the pane
+            // completed; letting that stale status win would recreate an
+            // unseen completion on the next idle watch pass.
+            if green_on_screen {
+                attention.unseen.remove(&pane.pane_id);
+                attention.seen.insert(pane.pane_id.clone());
+                attention.working.remove(&pane.pane_id);
+                pane.status = AgentStatus::Idle;
+                continue;
+            }
+            if !pane.status.is_working() {
+                attention.unseen.remove(&pane.pane_id);
+                attention.seen.insert(pane.pane_id.clone());
+            }
+        }
+        if pane.status.is_working() {
+            // Inventory may continue saying `working` after a completed pane
+            // was acknowledged. Only a fresh working status event starts a
+            // new turn; polling the stale inventory must keep the icon white.
+            if attention.seen.contains(&pane.pane_id) && !working_event {
+                pane.status = AgentStatus::Idle;
+                continue;
+            }
+            attention.working.insert(pane.pane_id.clone());
+            attention.unseen.remove(&pane.pane_id);
+            attention.seen.remove(&pane.pane_id);
+            continue;
+        }
+        if !matches!(pane.status, AgentStatus::Idle | AgentStatus::Done) {
+            continue;
+        }
+        let was_working = attention.working.remove(&pane.pane_id)
+            || (!attention.seen.contains(&pane.pane_id)
+                && pane.tokens.contains_key("quota_icon_working"));
+        if was_working {
+            attention.seen.remove(&pane.pane_id);
+            attention.unseen.insert(pane.pane_id.clone());
+        } else if pane.status == AgentStatus::Done && !attention.seen.contains(&pane.pane_id) {
+            attention.unseen.insert(pane.pane_id.clone());
+        }
+        if acknowledge {
+            attention.unseen.remove(&pane.pane_id);
+            attention.seen.insert(pane.pane_id.clone());
+        }
+        pane.status = if attention.unseen.contains(&pane.pane_id) {
+            AgentStatus::Done
+        } else {
+            AgentStatus::Idle
+        };
+    }
+    if let Some(pane_id) = force_seen {
+        attention.last_focused = Some(pane_id.to_owned());
+    }
+    cache.set_icon_attention(&attention)
+}
+
+fn paint_focus_icons(cache: &CacheStore, force_idle_id: Option<&str>) -> Result<()> {
+    let Some(pane_id) = force_idle_id else {
         return Ok(());
     };
-    // We are the focus hook: Herdr has marked (or is marking) this pane seen.
-    // Inventory can still say `done` for a beat; force idle so the brand icon
-    // drops teal immediately instead of waiting for a later status event that
-    // may never come.
-    pane.focused = true;
-    if pane.status == AgentStatus::Done {
-        pane.status = AgentStatus::Idle;
+    let enabled = AgentSelection::from_args_or_env(&[]);
+    let previous = cache.icon_attention().last_focused;
+    let mut ids = vec![pane_id];
+    if let Some(previous) = previous.as_deref() {
+        ids.push(previous);
     }
-    let cache = CacheStore::from_env()?;
-    handle_named_pane(&cache, pane, None)
+    let mut panes = find_agent_icon_panes(&ids)?;
+    panes.retain(|pane| enabled.contains(&pane.harness));
+    apply_icon_attention(&mut panes, cache, Some(pane_id), false, false)?;
+    publish_icon_tokens(&panes, CacheStore::now_millis())
+}
+
+/// Teal left on a focused pane — needs a clear pass.
+fn has_stale_done_icon(pane: &AgentPane) -> bool {
+    pane.focused && pane.tokens.contains_key("quota_icon_done")
 }
 
 /// The single pane an entry point is allowed to act on.
@@ -474,12 +649,18 @@ fn named_pane(pane_id: &str, harness: Harness) -> Result<Option<AgentPane>> {
     Ok(find_agent_pane(pane_id)?.filter(|pane| pane.harness == harness))
 }
 
-fn handle_named_pane(cache: &CacheStore, pane: AgentPane, topic_pane: Option<&str>) -> Result<()> {
+fn handle_named_pane(
+    cache: &CacheStore,
+    pane: AgentPane,
+    topic_pane: Option<&str>,
+    working_event: bool,
+) -> Result<()> {
     if !AgentSelection::from_args_or_env(&[]).contains(&pane.harness) {
         return Ok(());
     }
     WatchHerdrEnvironment::current().save(cache)?;
     let mut panes = [pane];
+    apply_icon_attention(&mut panes, cache, None, false, working_event)?;
     if topic_pane == Some(panes[0].pane_id.as_str()) {
         refresh_pane_topic(&mut panes[0]);
     }
@@ -502,15 +683,22 @@ fn handle_named_pane(cache: &CacheStore, pane: AgentPane, topic_pane: Option<&st
         row,
         false,
     )?
-    .into_iter()
-    .collect::<Vec<_>>();
+    .unwrap_or(PaneTokens {
+        pane_id: panes[0].pane_id.clone(),
+        quota: PaneQuotaUpdate::Preserve,
+        identity: None,
+        context: None,
+    });
+    let tokens = vec![tokens];
     // Event and focus see one pane, not the whole inventory, which is exactly
     // what the alert needs: the entry is keyed by provider, and a provider
     // with no pane in the pass keeps whatever state it had. Warning here is
     // what makes the alert land at the end of the turn that spent the quota
     // rather than at the next poll.
     notify_low_quota(cache, &tokens);
-    publish_pane_tokens(&panes, &tokens, CacheStore::now_millis(), row)
+    // Completion colour must land even if this pane is scrolled: the scroll
+    // guard exists to protect reading transcript, not to leave a stale glyph.
+    publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row)
 }
 
 /// The layout the user chose and the meter size their sidebar affords,
@@ -1101,7 +1289,9 @@ fn publish_resolved(
     panes: &mut [AgentPane],
     topic_pane: Option<&str>,
     force: bool,
+    allow_icon_while_scrolled: bool,
 ) -> Result<()> {
+    apply_icon_attention(panes, cache, None, false, false)?;
     if let Some(pane) =
         topic_pane.and_then(|pane_id| panes.iter_mut().find(|pane| pane.pane_id == pane_id))
     {
@@ -1120,14 +1310,23 @@ fn publish_resolved(
         } else {
             false
         };
-        if let Some(pane_tokens) =
-            resolved_pane_tokens(cache, pane, resolved, now, row, force_target)?
-        {
-            tokens.push(pane_tokens);
-        }
+        tokens.push(
+            resolved_pane_tokens(cache, pane, resolved, now, row, force_target)?.unwrap_or(
+                PaneTokens {
+                    pane_id: pane.pane_id.clone(),
+                    quota: PaneQuotaUpdate::Preserve,
+                    identity: None,
+                    context: None,
+                },
+            ),
+        );
     }
     notify_low_quota(cache, &tokens);
-    publish_pane_tokens(panes, &tokens, CacheStore::now_millis(), row)
+    if allow_icon_while_scrolled {
+        publish_pane_tokens_with_scrolled_icons(panes, &tokens, CacheStore::now_millis(), row)
+    } else {
+        publish_pane_tokens(panes, &tokens, CacheStore::now_millis(), row)
+    }
 }
 
 /// The lowest headroom each provider is showing in this pass.
@@ -1329,12 +1528,13 @@ fn tokens_for_provider(
     row: RowStyle,
 ) -> Option<MetadataTokens> {
     snapshot.map(|snapshot| {
-        MetadataTokens::from_snapshot_for_pane(
+        MetadataTokens::from_snapshot_for_pane_with_fields(
             snapshot,
             now_unix,
             session_id,
             row.percent,
             row.shape,
+            row.fields,
         )
     })
 }
@@ -2415,5 +2615,357 @@ mod tests {
             serde_json::from_str(r#"{"data":{"agent":"codex","status":"idle"}}"#).unwrap();
         assert!(find_status(&working).is_some_and(is_working_status));
         assert_eq!(find_status(&idle), Some("idle"));
+    }
+
+    #[test]
+    fn workspace_focus_events_name_the_space_without_a_pane() {
+        let value: Value = serde_json::from_str(
+            r#"{"event":"workspace_focused","data":{"type":"workspace_focused","workspace_id":"w9"}}"#,
+        )
+        .unwrap();
+        assert_eq!(find_pane_id(&value), None);
+    }
+
+    #[test]
+    fn unfocused_idle_after_working_becomes_unseen_teal() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut pane = test_pane("w1:p2", Harness::Cursor);
+        pane.status = AgentStatus::Idle;
+        pane.focused = false;
+        pane.tokens
+            .insert("quota_icon_working".into(), "yellow".into());
+
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.status, AgentStatus::Done);
+        assert_eq!(pane.icon_status(), AgentStatus::Done);
+        assert!(cache.icon_attention().unseen.contains("w1:p2"));
+        assert!(!cache.icon_attention().working.contains("w1:p2"));
+    }
+
+    #[test]
+    fn working_set_survives_lost_working_icon() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut working = test_pane("w1:p2", Harness::Cursor);
+        working.status = AgentStatus::Working;
+        apply_icon_attention(
+            std::slice::from_mut(&mut working),
+            &cache,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(cache.icon_attention().working.contains("w1:p2"));
+
+        // Production trap: watch painted idle white and cleared the yellow
+        // twin before the completion event ran. The working set must still
+        // force teal.
+        let mut idle = test_pane("w1:p2", Harness::Cursor);
+        idle.status = AgentStatus::Idle;
+        idle.focused = false;
+        idle.tokens.insert("quota_icon".into(), "white".into());
+        apply_icon_attention(std::slice::from_mut(&mut idle), &cache, None, false, false).unwrap();
+        assert_eq!(idle.status, AgentStatus::Done);
+        assert_eq!(idle.icon_status(), AgentStatus::Done);
+        assert!(cache.icon_attention().unseen.contains("w1:p2"));
+    }
+
+    #[test]
+    fn focused_completion_waits_for_focus_event() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        pane.status = AgentStatus::Idle;
+        pane.focused = true;
+        pane.tokens
+            .insert("quota_icon_working".into(), "yellow".into());
+
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.status, AgentStatus::Done);
+        assert_eq!(pane.icon_status(), AgentStatus::Done);
+        assert!(cache.icon_attention().unseen.contains("w1:p1"));
+    }
+
+    #[test]
+    fn completion_stays_teal_until_a_later_focus_event() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        pane.status = AgentStatus::Working;
+        pane.focused = true;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Working);
+
+        // A turn can finish in the pane that is already focused. Completion
+        // is still unseen until a subsequent pane.focused acknowledgement.
+        pane.status = AgentStatus::Idle;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Done);
+
+        // Inventory refreshes must preserve that green state.
+        pane.status = AgentStatus::Idle;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, true, false).unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Done);
+
+        apply_icon_attention(
+            std::slice::from_mut(&mut pane),
+            &cache,
+            Some("w1:p1"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Idle);
+
+        // Herdr may briefly return its old done status after the focus hook.
+        pane.status = AgentStatus::Done;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Idle);
+
+        pane.status = AgentStatus::Idle;
+        pane.tokens
+            .insert("quota_icon_working".into(), "stale yellow".into());
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Idle);
+
+        // A later, explicit working event is a new turn and restores yellow.
+        pane.status = AgentStatus::Working;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Idle);
+        pane.status = AgentStatus::Working;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, true).unwrap();
+        assert_eq!(pane.icon_status(), AgentStatus::Working);
+    }
+
+    #[test]
+    fn plain_unfocused_idle_does_not_become_teal() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut pane = test_pane("w1:p3", Harness::Grok);
+        pane.status = AgentStatus::Idle;
+        pane.focused = false;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.status, AgentStatus::Idle);
+        assert_eq!(pane.icon_status(), AgentStatus::Idle);
+        assert!(cache.icon_attention().unseen.is_empty());
+    }
+
+    #[test]
+    fn single_pane_update_does_not_drop_sibling_unseen() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut other = test_pane("w1:p9", Harness::Grok);
+        other.status = AgentStatus::Idle;
+        other.focused = false;
+        other
+            .tokens
+            .insert("quota_icon_working".into(), "yellow".into());
+        apply_icon_attention(std::slice::from_mut(&mut other), &cache, None, false, false).unwrap();
+        assert!(cache.icon_attention().unseen.contains("w1:p9"));
+
+        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        pane.status = AgentStatus::Working;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert!(
+            cache.icon_attention().unseen.contains("w1:p9"),
+            "event for another pane must not drop sibling unseen"
+        );
+        assert!(cache.icon_attention().working.contains("w1:p1"));
+    }
+
+    #[test]
+    fn force_seen_clears_unseen_even_when_inventory_is_unfocused() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        pane.status = AgentStatus::Idle;
+        pane.focused = false;
+        pane.tokens.insert("quota_icon_done".into(), "teal".into());
+        let mut attention = cache.icon_attention();
+        attention.unseen.insert("w1:p1".into());
+        cache.set_icon_attention(&attention).unwrap();
+
+        apply_icon_attention(
+            std::slice::from_mut(&mut pane),
+            &cache,
+            Some("w1:p1"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(pane.focused);
+        assert_eq!(pane.status, AgentStatus::Idle);
+        assert_eq!(pane.icon_status(), AgentStatus::Idle);
+        assert!(!cache.icon_attention().unseen.contains("w1:p1"));
+    }
+
+    #[test]
+    fn focus_change_uses_last_focused_and_keeps_other_green_panes() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut previous = test_pane("w1:p1", Harness::Cursor);
+        previous.focused = true;
+        previous.status = AgentStatus::Working;
+        apply_icon_attention(
+            std::slice::from_mut(&mut previous),
+            &cache,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            cache.icon_attention().last_focused.as_deref(),
+            Some("w1:p1")
+        );
+        previous.status = AgentStatus::Idle;
+        previous
+            .tokens
+            .insert("quota_icon_working".into(), "yellow".into());
+        apply_icon_attention(
+            std::slice::from_mut(&mut previous),
+            &cache,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(previous.status, AgentStatus::Done);
+
+        previous.focused = false;
+        previous.tokens.remove("quota_icon_working");
+        previous
+            .tokens
+            .insert("quota_icon_done".into(), "green".into());
+        let mut next = test_pane("w2:p2", Harness::Grok);
+        next.focused = true;
+        let mut unrelated = test_pane("w1:p3", Harness::Codex);
+        unrelated.status = AgentStatus::Done;
+        unrelated
+            .tokens
+            .insert("quota_icon_done".into(), "green".into());
+        let mut panes = [previous, next, unrelated];
+        apply_icon_attention(&mut panes, &cache, Some("w2:p2"), false, false).unwrap();
+        assert_eq!(panes[0].status, AgentStatus::Idle);
+        assert_eq!(panes[2].status, AgentStatus::Done);
+        assert_eq!(
+            cache.icon_attention().last_focused.as_deref(),
+            Some("w2:p2")
+        );
+    }
+
+    #[test]
+    fn focused_working_event_records_the_pane_before_its_completion() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut attention = cache.icon_attention();
+        attention.last_focused = Some("w1:p1".into());
+        cache.set_icon_attention(&attention).unwrap();
+
+        let mut pane = test_pane("w1:p2", Harness::Cursor);
+        pane.focused = true;
+        pane.status = AgentStatus::Working;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, true).unwrap();
+        assert_eq!(
+            cache.icon_attention().last_focused.as_deref(),
+            Some("w1:p2")
+        );
+
+        pane.status = AgentStatus::Idle;
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.status, AgentStatus::Done);
+        assert!(cache.icon_attention().unseen.contains("w1:p2"));
+        assert_eq!(
+            cache.icon_attention().last_focused.as_deref(),
+            Some("w1:p2")
+        );
+    }
+
+    #[test]
+    fn unfocused_done_keeps_teal_icon_status() {
+        let mut pane = test_pane("w1:p2", Harness::Grok);
+        pane.status = AgentStatus::Done;
+        pane.focused = false;
+        assert_eq!(
+            pane.icon_status(),
+            AgentStatus::Done,
+            "unfocused completion must stay teal until focused"
+        );
+
+        pane.focused = true;
+        assert_eq!(
+            pane.icon_status(),
+            AgentStatus::Done,
+            "inventory focus alone does not acknowledge a completion"
+        );
+
+        pane.focused = false;
+        pane.status = AgentStatus::Idle;
+        pane.tokens.insert("quota_icon_done".into(), "teal".into());
+        assert_eq!(
+            pane.icon_status(),
+            AgentStatus::Idle,
+            "a leftover done token must not restore teal"
+        );
+    }
+
+    #[test]
+    fn hydrate_done_tokens_only_when_attention_file_is_missing() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut pane = test_pane("w1:p2", Harness::Cursor);
+        pane.status = AgentStatus::Idle;
+        pane.focused = false;
+        pane.tokens.insert("quota_icon_done".into(), "teal".into());
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(pane.status, AgentStatus::Done);
+        assert!(cache.icon_attention().unseen.contains("w1:p2"));
+
+        pane.status = AgentStatus::Idle;
+        apply_icon_attention(
+            std::slice::from_mut(&mut pane),
+            &cache,
+            Some("w1:p2"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pane.status, AgentStatus::Idle);
+        assert!(!cache.icon_attention().unseen.contains("w1:p2"));
+
+        pane.focused = false;
+        pane.status = AgentStatus::Idle;
+        pane.tokens.insert("quota_icon_done".into(), "stale".into());
+        apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
+        assert_eq!(
+            pane.status,
+            AgentStatus::Idle,
+            "after mark-seen, stale done token must not come back"
+        );
+        assert!(!cache.icon_attention().unseen.contains("w1:p2"));
+    }
+
+    #[test]
+    fn stale_done_icon_keeps_the_watcher_alive_until_cleared() {
+        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        pane.status = AgentStatus::Done;
+        pane.focused = false;
+        pane.tokens.insert("quota_icon_done".into(), "teal".into());
+        assert!(
+            !has_stale_done_icon(&pane),
+            "unfocused done is intentional teal, not stale"
+        );
+
+        pane.focused = true;
+        assert!(has_stale_done_icon(&pane), "focused done must be cleared");
+
+        pane.focused = false;
+        pane.status = AgentStatus::Idle;
+        assert!(
+            !has_stale_done_icon(&pane),
+            "unfocused idle+done_token stays until focus"
+        );
     }
 }

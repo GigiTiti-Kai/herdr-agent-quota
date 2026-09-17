@@ -55,7 +55,7 @@ Concretely, this means:
 | `startup` | Herdr's `[[startup]]` hook | No |
 | `refresh` | manual action, `startup` | No |
 | `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON`, and never a Pi, omp, Muse, or Cursor pane — their transcripts carry the evidence |
-| `focus` | `pane.focused` | No |
+| `focus` | `pane.focused`, `workspace.focused`, `tab.focused` | No |
 | `watch` | detached from a working status event | No (agent metadata only) |
 
 `startup` exists because Herdr drops plugin-owned Agent views when the server
@@ -75,8 +75,12 @@ OpenCode, Muse, and Cursor. Event-spawned watchers defer their first poll. They 
 billing targets, refresh active/settling targets, and publish to siblings with
 the same target without reading terminal output. A finishing target stays in
 the pass until the 60-second debounce has elapsed. The interval defaults to
-60 seconds and is bounded to 30 seconds–1 hour. Local stop/connection checks
-interrupt sleeps without polling Herdr. Uninstall writes a stop marker.
+60 seconds and is bounded to 30 seconds–1 hour. While a pane is working or
+has an unseen completion, the watcher also checks the metadata-only Herdr
+snapshot once per second. Herdr 0.9 can miss TUI focus hooks; the snapshot
+reconciles those changes without reading pane output or writing unchanged
+metadata. The watcher stays alive for unseen completions until they are seen.
+Local stop/connection checks interrupt sleeps. Uninstall writes a stop marker.
 
 ## omp's quota does not come from a provider endpoint
 
@@ -240,8 +244,18 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    `workspace_order` ascending, then `quota_headroom` ascending — never a
    flat headroom list that scatters one project's panes across the panel.
    `$quota_group` names the Space on the tightest pane in that workspace;
-   `$quota_icon` is the vendor mark on every identity row (text glyphs, no
-   icon font).
+   `$quota_icon` / `_working` / `_done` is the vendor mark on every identity
+   row (bundled icon font; Muse uses a text glyph). Colour replaces Herdr's `state_icon`
+   ring: yellow while working, teal for an unseen completion, white after
+   focusing that pane or moving focus away from it. Do not trust CLI `agent_status` for the teal
+   step — same-tab siblings finish as server `idle` while the TUI ring is
+   still teal. Persist working/unseen pane ids in plugin state
+   (`icon-attention.json`) and never call `herdr pane current` from
+   `event`: status hooks set `HERDR_PANE_ID` to the finisher. Focus hooks
+   mark only the previous and newly focused panes seen. A workspace or Tab
+   switch may not emit `pane.focused`; resolve its pane from that location's
+   layout in `herdr api snapshot`. Ignore a delayed event whose workspace or
+   Tab is no longer focused.
 
 **`quota_headroom`** is the token that view sorts on: the remaining percent of
 the tightest of the pane's 5h, 7d, and 30d windows, zero-padded to three digits
@@ -289,8 +303,9 @@ enable`, invoke it with a marker variable set, and read the file.
 `HERDR_PLUGIN_EVENT_JSON` is nested and not uniform across events. `pane.focused`
 carries no `agent`: `focus` uses its pane ID and resolves the harness from one
 agent inventory read. Only a direct `focus` invocation without event JSON uses
-`herdr pane current`. This keeps delayed events and Herdr 0.9's independent
-clients from redirecting a refresh to another pane:
+`herdr pane current`. Workspace and Tab focus events carry no pane ID, so
+`focus` resolves the matching layout from `herdr api snapshot`. This keeps
+delayed events from redirecting a refresh to another pane:
 
 ```json
 {"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p9","workspace_id":"w1"}}

@@ -70,6 +70,7 @@ pub fn run(
         let brand = resolved_brand_colors(None, Some(&cache));
         herdr::uninstall(agents, full, fields, brand)?;
         if full {
+            font::uninstall(cache.root())?;
             // Herdr keeps this view until something clears it, so an uninstall
             // that skipped it would leave the panel sorted by a token this
             // plugin no longer publishes.
@@ -82,6 +83,7 @@ pub fn run(
             cache.clear_brand_colors()?;
             cache.clear_agent_order()?;
             cache.clear_low_quota_alert()?;
+            cache.clear_icon_attention()?;
             for name in prefs::ALL {
                 prefs::clear(name)?;
             }
@@ -122,8 +124,6 @@ pub fn run(
         cache.set_fields(fields)?;
         prefs::write(prefs::FIELDS, &fields.as_list())?;
         let brand = resolved_brand_colors(options.brand_colors, Some(&cache));
-        cache.set_brand_colors(brand)?;
-        prefs::write(prefs::BRAND_COLORS, brand.as_str())?;
         let alert = resolved_low_quota_alert(options.low_quota_alert, Some(&cache));
         // A new threshold has never warned about anything yet. Without this,
         // lowering it would stay silent for a provider already warned about at
@@ -134,7 +134,7 @@ pub fn run(
         cache.set_low_quota_alert(alert)?;
         prefs::write(prefs::LOW_QUOTA_ALERT, &alert.to_string())?;
         herdr::apply(agents, layout, gap, fields, brand)?;
-        for note in font::install()? {
+        for note in font::install(cache.root())? {
             println!("{note}");
         }
         // Not gated on a full run, unlike the watcher: the Agent panel order
