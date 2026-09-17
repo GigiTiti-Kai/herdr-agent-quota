@@ -44,7 +44,6 @@ enum Choice {
     Layout,
     RowGap,
     Interval,
-    Brand,
     Order,
     Alert,
 }
@@ -56,7 +55,6 @@ impl Choice {
             Self::Layout => "Sidebar layout",
             Self::RowGap => "Row gap",
             Self::Interval => "Watch interval",
-            Self::Brand => "Brand colors",
             Self::Order => "Agent order",
             Self::Alert => "Low quota alert",
         }
@@ -70,7 +68,6 @@ fn rows() -> Vec<Row> {
         Row::Choice(Choice::Layout),
         Row::Choice(Choice::RowGap),
         Row::Choice(Choice::Interval),
-        Row::Choice(Choice::Brand),
         Row::Choice(Choice::Order),
         Row::Choice(Choice::Alert),
         Row::Header("Fields"),
@@ -88,7 +85,6 @@ pub struct Settings {
     layout: SidebarLayout,
     gap: SidebarRowGap,
     interval_seconds: u64,
-    brand: BrandColors,
     order: AgentOrder,
     alert: LowQuotaAlert,
     fields: FieldSet,
@@ -113,7 +109,6 @@ impl Settings {
             interval_seconds: cache
                 .map(CacheStore::watch_interval_seconds)
                 .unwrap_or(crate::cache::DEFAULT_WATCH_INTERVAL_SECONDS),
-            brand: crate::configure::resolved_brand_colors(None, cache),
             order: crate::configure::resolved_agent_order(None, cache),
             alert: crate::configure::resolved_low_quota_alert(None, cache),
             fields: crate::configure::resolved_fields(None, cache),
@@ -127,7 +122,6 @@ impl Settings {
             Choice::Layout => self.layout.as_str().to_string(),
             Choice::RowGap => self.gap.to_string(),
             Choice::Interval => format_interval(self.interval_seconds),
-            Choice::Brand => self.brand.as_str().to_string(),
             Choice::Order => self.order.as_str().to_string(),
             Choice::Alert => self.alert.to_string(),
         }
@@ -159,13 +153,9 @@ impl Settings {
                 _ => "one blank row between panes",
             },
             Choice::Interval => "polled while an agent is working",
-            Choice::Brand => match self.brand {
-                BrandColors::On => "provider and model in agent hues",
-                BrandColors::Off => "severity colors only",
-            },
             Choice::Order => match self.order {
-                AgentOrder::Default => "Herdr sorts the agent panel",
-                AgentOrder::Quota => "least quota left at the top",
+                AgentOrder::Default => "Herdr's own policy",
+                AgentOrder::Quota => "by Space, least quota left first",
             },
             Choice::Alert => match self.alert.is_off() {
                 true => "no notification",
@@ -218,12 +208,6 @@ impl Settings {
                 self.gap = match self.gap.as_u8() {
                     0 => SidebarRowGap::SEPARATED,
                     _ => SidebarRowGap::FLUSH,
-                }
-            }
-            Row::Choice(Choice::Brand) => {
-                self.brand = match self.brand {
-                    BrandColors::On => BrandColors::Off,
-                    BrandColors::Off => BrandColors::On,
                 }
             }
             Row::Choice(Choice::Order) => {
@@ -280,7 +264,7 @@ impl Settings {
             "--row-gap".to_string(),
             self.gap.to_string(),
             "--brand-colors".to_string(),
-            self.brand.as_str().to_string(),
+            BrandColors::Off.as_str().to_string(),
             "--fields".to_string(),
             self.fields.as_list(),
             "--agent-order".to_string(),
@@ -615,8 +599,7 @@ mod tests {
             layout: SidebarLayout::Gauges,
             gap: SidebarRowGap::SEPARATED,
             interval_seconds: 60,
-            brand: BrandColors::On,
-            order: AgentOrder::Default,
+            order: AgentOrder::Quota,
             alert: LowQuotaAlert::OFF,
             fields: FieldSet::all(),
             agents: [true; AgentSelection::SUPPORTED.len()],
@@ -645,8 +628,6 @@ mod tests {
         assert_eq!(draft.layout, SidebarLayout::Packed);
         draft.cycle(Row::Choice(Choice::RowGap), 1);
         assert_eq!(draft.gap, SidebarRowGap::FLUSH);
-        draft.cycle(Row::Choice(Choice::Brand), 1);
-        assert_eq!(draft.brand, BrandColors::Off);
     }
 
     #[test]
@@ -727,11 +708,11 @@ mod tests {
                 "--row-gap",
                 "1",
                 "--brand-colors",
-                "on",
+                "off",
                 "--fields",
                 "provider,model,cache,ttl,context,5h,7d,30d",
                 "--agent-order",
-                "default",
+                "quota",
                 "--low-quota-alert",
                 "off",
                 "--watch-interval-seconds",

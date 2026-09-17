@@ -32,8 +32,9 @@
 //! Herdr has no Muse session integration, so a pane's session is found through
 //! Muse's own session lock (see [`session_ids_for_panes`]). That session's
 //! `session.jsonl` tail gives the per-session model, context, cache, and the
-//! last prompt, the same way Grok's local session files do. A pane without
-//! that evidence keeps the account quota and nothing session-local.
+//! last prompt. Muse has no generated session title, so that last prompt is
+//! the topic. A pane without that evidence keeps the account quota and
+//! nothing session-local.
 
 use crate::cache::CacheStore;
 use crate::model::{

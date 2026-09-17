@@ -2,7 +2,7 @@ use crate::model::{ContextUsage, Harness, Provider};
 use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 const METADATA_TTL_MS: &str = "86400000";
@@ -14,7 +14,10 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 29] = [
+const METADATA_TOKEN_NAMES: [&str; 32] = [
+    "quota_group",
+    "quota_pad",
+    "quota_icon",
     "quota_provider",
     "quota_model",
     "quota_provider_model",
@@ -80,8 +83,9 @@ const QUOTA_WINDOW_TOKEN_NAMES: [&str; 17] = [
 ];
 /// Names a pane may still carry from an older build of this plugin. They are
 /// never produced again, so a report clears them until the pane is clean.
-const OBSOLETE_METADATA_TOKEN_NAMES: [&str; 15] = [
-    "quota_icon",
+const OBSOLETE_METADATA_TOKEN_NAMES: [&str; 16] = [
+    "quota_icon_working",
+    "quota_icon_done",
     "quota_state",
     "quota_status",
     "quota_summary",
@@ -120,7 +124,9 @@ const CONTEXT_TOKEN_NAMES: [&str; 4] = [
 /// Values that must reach the pane in the *same* report that changed them,
 /// even when the budget is tight: the identity, the live diagnostics, and the
 /// inline week variants, whose styling flips as soon as a 5h window appears.
-const ROWS_THAT_MUST_NOT_LAG: [&str; 15] = [
+const ROWS_THAT_MUST_NOT_LAG: [&str; 17] = [
+    "quota_group",
+    "quota_icon",
     "quota_provider",
     "quota_model",
     "quota_provider_model",
@@ -165,11 +171,15 @@ impl AgentSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPane {
     pub pane_id: String,
+    pub workspace_id: String,
     pub harness: Harness,
     pub session: Option<AgentSession>,
     pub session_summary: String,
     pub topic: String,
     pub tokens: BTreeMap<String, String>,
+    /// Herdr `agent_status == working`. Used to spawn the watch pulse; status
+    /// colour itself comes from Herdr's `state_icon`, not a plugin token.
+    pub working: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -226,11 +236,17 @@ const AGENT_VIEW_SOURCE: &str = "plugin:herdr-agent-quota";
 /// sidebar sort is never worth blocking a turn for.
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Ask Herdr to order its Agent panel by the least quota left.
+/// Ask Herdr to order its Agent panel by space, then least quota left.
 ///
-/// Herdr keeps one Agent view and this replaces it, so it is only ever called
-/// for a user who chose `--agent-order quota`. The view does not survive a
-/// server restart, which is why the startup hook re-applies it.
+/// Herdr keeps one Agent view and this replaces it. The default agent order
+/// is `quota`, so configure and startup both call this unless the user
+/// chose `default`. The view does not survive a server restart, which is
+/// why the startup hook re-applies it.
+///
+/// `workspace_order` keeps each Space contiguous — the same grouping Herdr's
+/// own spaces sort uses — so quota ranking never scatters one project's
+/// agents across the panel. Inside a space, `quota_headroom` ranks tightest
+/// first.
 pub fn set_quota_agent_view() -> Result<()> {
     socket_request(&serde_json::json!({
         "id": "agent-quota:view-set",
@@ -238,7 +254,10 @@ pub fn set_quota_agent_view() -> Result<()> {
         "params": {
             "source": AGENT_VIEW_SOURCE,
             "label": crate::cli::AgentOrder::LABEL,
-            "sort": [{"field": {"token": HEADROOM_TOKEN}, "order": "asc"}],
+            "sort": [
+                {"field": "workspace_order", "order": "asc"},
+                {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
+            ],
         },
     }))
     .map(|_| ())
@@ -463,8 +482,23 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                                     }
                                 })
                             });
+                    let workspace_id = map
+                        .get("workspace_id")
+                        .or_else(|| map.get("workspaceId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| workspace_id_from_pane_id(pane_id))
+                        .unwrap_or_default();
+                    let working = map
+                        .get("agent_status")
+                        .or_else(|| map.get("agentStatus"))
+                        .or_else(|| map.get("status"))
+                        .or_else(|| map.get("state"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("working"));
                     panes.push(AgentPane {
                         pane_id: pane_id.to_string(),
+                        workspace_id,
                         harness,
                         session,
                         session_summary,
@@ -472,6 +506,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         // refreshes. Agent events refresh it from pane output.
                         topic,
                         tokens,
+                        working,
                     });
                 }
             }
@@ -559,6 +594,16 @@ pub fn publish_pane_tokens(
     row: RowStyle,
 ) -> Result<()> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let workspace_labels = list_workspace_labels().unwrap_or_default();
+    // Event/focus publish one pane. Head selection and sibling clears need the
+    // full Space membership — otherwise a lone pane preserves a stale
+    // `$quota_group` and the Space name prints twice (radar writes `group:null`
+    // on every non-head every frame).
+    let inventory = match list_agent_panes() {
+        Ok(all) if !all.is_empty() => all,
+        _ => panes.to_vec(),
+    };
+    let group_heads = group_head_pane_ids(&inventory, panes, tokens);
     let mut reported = 0usize;
     let mut failed = Vec::new();
     for pane in panes {
@@ -572,12 +617,13 @@ pub fn publish_pane_tokens(
             PaneQuotaUpdate::Preserve => pane.tokens.clone(),
         };
         if let Some(identity) = &pane_tokens.identity {
-            apply_identity(&mut desired, identity);
+            apply_identity(&mut desired, identity, row.shape.content_width);
         }
         if let Some(context) = &pane_tokens.context {
             apply_context(&mut desired, context, sequence / 1_000, row);
         }
         fold_cache_row(&mut desired, row);
+        apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels);
         if metadata_matches(&pane.tokens, &desired) {
             continue;
         }
@@ -588,29 +634,19 @@ pub fn publish_pane_tokens(
             continue;
         }
         reported += 1;
-        let mut command = Command::new(&executable);
-        command
-            .args([
-                "pane",
-                "report-metadata",
-                &pane.pane_id,
-                "--source",
-                "herdr-agent-quota",
-            ])
-            .args(["--seq", &sequence.to_string()])
-            .args(["--ttl-ms", METADATA_TTL_MS]);
-        for name in metadata_report_names(pane, &desired) {
-            if let Some(value) = desired.get(name) {
-                command.args(["--token", &format!("{name}={value}")]);
-            } else {
-                command.args(["--clear-token", name]);
-            }
-        }
-        let output = command.output().context("report quota metadata to Herdr")?;
-        if !output.status.success() {
+        if !report_pane_metadata(&executable, pane, &desired, sequence)? {
             failed.push(pane.pane_id.clone());
         }
     }
+    reported += sync_sibling_group_headers(
+        &executable,
+        &inventory,
+        panes,
+        &group_heads,
+        &workspace_labels,
+        sequence,
+        &mut failed,
+    )?;
     // A pane can exit between `agent list` and this report, and the exit event
     // itself triggers a publish. One stale pane id must not stop the panes
     // that are still alive from being updated.
@@ -621,6 +657,100 @@ pub fn publish_pane_tokens(
         );
     }
     Ok(())
+}
+
+fn report_pane_metadata(
+    executable: &std::ffi::OsStr,
+    pane: &AgentPane,
+    desired: &BTreeMap<String, String>,
+    sequence: u64,
+) -> Result<bool> {
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "pane",
+            "report-metadata",
+            &pane.pane_id,
+            "--source",
+            "herdr-agent-quota",
+        ])
+        .args(["--seq", &sequence.to_string()])
+        .args(["--ttl-ms", METADATA_TTL_MS]);
+    for name in metadata_report_names(pane, desired) {
+        if let Some(value) = desired.get(name) {
+            command.args(["--token", &format!("{name}={value}")]);
+        } else {
+            command.args(["--clear-token", name]);
+        }
+    }
+    let output = command.output().context("report quota metadata to Herdr")?;
+    Ok(output.status.success())
+}
+
+/// Clear or set `$quota_group` on siblings in the same Space that this pass
+/// did not otherwise touch. Without this, a one-pane event leaves the old
+/// head's header in place after headroom moves the title to another pane.
+fn sync_sibling_group_headers(
+    executable: &std::ffi::OsStr,
+    inventory: &[AgentPane],
+    published: &[AgentPane],
+    group_heads: &BTreeMap<String, String>,
+    workspace_labels: &BTreeMap<String, String>,
+    sequence: u64,
+    failed: &mut Vec<String>,
+) -> Result<usize> {
+    let published_ids = published
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let touched = published
+        .iter()
+        .map(|pane| pane.workspace_id.as_str())
+        .filter(|workspace| !workspace.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut reported = 0usize;
+    for sibling in inventory {
+        if published_ids.contains(sibling.pane_id.as_str()) {
+            continue;
+        }
+        if !touched.contains(sibling.workspace_id.as_str()) {
+            continue;
+        }
+        let want = group_label_for(sibling, group_heads, workspace_labels);
+        let have = sibling
+            .tokens
+            .get("quota_group")
+            .filter(|value| !value.is_empty())
+            .cloned();
+        if want == have {
+            continue;
+        }
+        if pane_is_scrolled(executable, &sibling.pane_id) {
+            continue;
+        }
+        reported += 1;
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "pane",
+                "report-metadata",
+                &sibling.pane_id,
+                "--source",
+                "herdr-agent-quota",
+            ])
+            .args(["--seq", &sequence.to_string()])
+            .args(["--ttl-ms", METADATA_TTL_MS]);
+        if let Some(label) = &want {
+            command.args(["--token", &format!("quota_group={label}")]);
+        } else {
+            command.args(["--clear-token", "quota_group"]);
+        }
+        let output = command.output().context("report group header to Herdr")?;
+        if !output.status.success() {
+            failed.push(sibling.pane_id.clone());
+        }
+    }
+    Ok(reported)
 }
 
 fn pane_is_scrolled(executable: &std::ffi::OsStr, pane_id: &str) -> bool {
@@ -643,18 +773,205 @@ fn pane_is_scrolled(executable: &std::ffi::OsStr, pane_id: &str) -> bool {
         .is_some_and(|offset| offset > 0)
 }
 
+/// `w1:p9` → `w1`. Used when an older inventory omits `workspace_id`.
+fn workspace_id_from_pane_id(pane_id: &str) -> Option<String> {
+    let (workspace, _) = pane_id.split_once(':')?;
+    (!workspace.is_empty()).then(|| workspace.to_string())
+}
+
+/// Workspace id → label from one `herdr workspace list` call.
+fn list_workspace_labels() -> Result<BTreeMap<String, String>> {
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let output = Command::new(&executable)
+        .args(["workspace", "list"])
+        .output()
+        .context("list Herdr workspaces")?;
+    if !output.status.success() {
+        anyhow::bail!("Herdr workspace list failed with {}", output.status);
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).context("parse workspace list")?;
+    let mut labels = BTreeMap::new();
+    collect_workspace_labels(&value, &mut labels);
+    Ok(labels)
+}
+
+fn collect_workspace_labels(value: &Value, labels: &mut BTreeMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            let id = map
+                .get("workspace_id")
+                .or_else(|| map.get("workspaceId"))
+                .and_then(Value::as_str);
+            let label = map.get("label").and_then(Value::as_str);
+            if let (Some(id), Some(label)) = (id, label) {
+                labels.insert(id.to_string(), label.to_string());
+            }
+            for child in map.values() {
+                collect_workspace_labels(child, labels);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_workspace_labels(child, labels);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Which pane carries the group header for each workspace.
+///
+/// Under quota order the view sorts by `workspace_order` then headroom, so the
+/// tightest pane sits at the top of its Space — that is where the header must
+/// land. `inventory` is the full agent list; `publishing` / `tokens` overlay
+/// headroom for panes this pass is about to write so a forced refresh that
+/// moves the title does not leave the old head labelled.
+fn group_head_pane_ids(
+    inventory: &[AgentPane],
+    publishing: &[AgentPane],
+    tokens: &[PaneTokens],
+) -> BTreeMap<String, String> {
+    let publishing_ids = publishing
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut heads: BTreeMap<String, (u8, &str)> = BTreeMap::new();
+    for pane in inventory {
+        if pane.workspace_id.is_empty() {
+            continue;
+        }
+        let headroom = if publishing_ids.contains(pane.pane_id.as_str()) {
+            published_headroom(pane, tokens)
+        } else {
+            pane.tokens
+                .get(HEADROOM_TOKEN)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(u8::MAX)
+        };
+        let candidate = (headroom, pane.pane_id.as_str());
+        match heads.get(&pane.workspace_id) {
+            Some(current) if *current <= candidate => {}
+            _ => {
+                heads.insert(pane.workspace_id.clone(), candidate);
+            }
+        }
+    }
+    // A pane present only in this pass (inventory read failed) still needs a
+    // head entry so its Space is not left without a label.
+    for pane in publishing {
+        if pane.workspace_id.is_empty() || heads.contains_key(&pane.workspace_id) {
+            continue;
+        }
+        heads.insert(
+            pane.workspace_id.clone(),
+            (published_headroom(pane, tokens), pane.pane_id.as_str()),
+        );
+    }
+    heads
+        .into_iter()
+        .map(|(workspace, (_, pane_id))| (workspace, pane_id.to_string()))
+        .collect()
+}
+
+fn published_headroom(pane: &AgentPane, tokens: &[PaneTokens]) -> u8 {
+    tokens
+        .iter()
+        .find(|tokens| tokens.pane_id == pane.pane_id)
+        .and_then(|tokens| match &tokens.quota {
+            PaneQuotaUpdate::Replace(values) => values.quota_headroom,
+            _ => None,
+        })
+        .or_else(|| {
+            pane.tokens
+                .get(HEADROOM_TOKEN)
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(u8::MAX)
+}
+
+fn group_label_for(
+    pane: &AgentPane,
+    group_heads: &BTreeMap<String, String>,
+    workspace_labels: &BTreeMap<String, String>,
+) -> Option<String> {
+    if pane.workspace_id.is_empty() {
+        return None;
+    }
+    if group_heads
+        .get(&pane.workspace_id)
+        .is_none_or(|head| head != &pane.pane_id)
+    {
+        return None;
+    }
+    workspace_labels
+        .get(&pane.workspace_id)
+        .cloned()
+        .filter(|label| !label.is_empty())
+        .or_else(|| {
+            let id = pane.workspace_id.clone();
+            (!id.is_empty()).then_some(id)
+        })
+}
+
+/// Herdr hang-indents a head pane's rows under `$quota_group`. Member panes
+/// collapse an empty group, so their identity is row 1 and needs the same
+/// offset baked into the first plugin cell — same as herdr-radar
+/// `group_indent = 2`. That cell is the white logo: Herdr's `state_icon`
+/// (status ring) sits before it and stays under Herdr's own seen/done logic.
+///
+/// The indent must ride on the logo token, not a stand-alone `$quota_pad`:
+/// Herdr inserts ` · ` between adjacent non-empty tokens, so a pad cell drew
+/// a leading middle-dot before the logo. ZWSP + spaces survive trim only when
+/// a non-whitespace glyph follows in the same value.
+const GROUP_MEMBER_INDENT: &str = "\u{200b}  ";
+
+/// Vendor mark always; group header only on the Space head pane.
+///
+/// Members prefix the logo with [`GROUP_MEMBER_INDENT`]. Heads publish the
+/// bare glyph — Herdr already hang-indents their continuation rows. Stale
+/// `$quota_pad` / `$quota_icon_working` / `$quota_icon_done` from older builds
+/// are cleared so a twin glyph cannot return.
+fn apply_group_and_icon(
+    desired: &mut BTreeMap<String, String>,
+    pane: &AgentPane,
+    group_heads: &BTreeMap<String, String>,
+    workspace_labels: &BTreeMap<String, String>,
+) {
+    let glyph = crate::icons::for_harness(pane.harness);
+    let member = !pane.workspace_id.is_empty()
+        && group_heads
+            .get(&pane.workspace_id)
+            .is_some_and(|head| head != &pane.pane_id);
+    let mark = if member {
+        format!("{GROUP_MEMBER_INDENT}{glyph}")
+    } else {
+        glyph.to_string()
+    };
+    // Status colour is Herdr's `state_icon`. The logo stays ink-white.
+    desired.insert("quota_icon".to_string(), mark);
+    desired.remove("quota_icon_working");
+    desired.remove("quota_icon_done");
+    desired.remove("quota_pad");
+    // Never preserve a previous header: non-heads must omit the token so the
+    // report clears it. Blind preserve is what left `ifs` on two panes.
+    if let Some(label) = group_label_for(pane, group_heads, workspace_labels) {
+        desired.insert("quota_group".to_string(), label);
+    } else {
+        desired.remove("quota_group");
+    }
+}
+
 fn desired_tokens(
     values: &MetadataTokens,
     topic: &str,
     shape: SidebarShape,
 ) -> BTreeMap<String, String> {
-    let mut tokens = BTreeMap::from([
-        ("quota_provider".to_string(), values.quota_provider.clone()),
-        (
-            "quota_provider_model".to_string(),
-            values.quota_provider_model.clone(),
-        ),
-    ]);
+    let mut tokens = BTreeMap::new();
+    insert_optional_token(&mut tokens, "quota_provider", &values.quota_provider);
+    tokens.insert(
+        "quota_provider_model".to_string(),
+        values.quota_provider_model.clone(),
+    );
     insert_optional_token(&mut tokens, "quota_model", &values.quota_model);
     insert_context_token(
         &mut tokens,
@@ -720,16 +1037,29 @@ fn desired_cleared_quota(pane: &AgentPane) -> BTreeMap<String, String> {
     tokens
 }
 
-fn apply_identity(tokens: &mut BTreeMap<String, String>, identity: &PaneIdentity) {
-    tokens.insert("quota_provider".to_string(), identity.provider.clone());
+fn apply_identity(
+    tokens: &mut BTreeMap<String, String>,
+    identity: &PaneIdentity,
+    content_width: usize,
+) {
+    let narrow = content_width > 0 && content_width < 22;
     if identity.model.is_empty() {
         tokens.remove("quota_model");
+        tokens.insert("quota_provider".to_string(), identity.provider.clone());
         tokens.insert(
             "quota_provider_model".to_string(),
             identity.provider.clone(),
         );
+        return;
+    }
+    tokens.insert("quota_model".to_string(), identity.model.clone());
+    if narrow {
+        // Logo already says who; keep the model only and collapse a stacked
+        // provider row so it does not re-introduce the prefix.
+        tokens.remove("quota_provider");
+        tokens.insert("quota_provider_model".to_string(), identity.model.clone());
     } else {
-        tokens.insert("quota_model".to_string(), identity.model.clone());
+        tokens.insert("quota_provider".to_string(), identity.provider.clone());
         tokens.insert(
             "quota_provider_model".to_string(),
             format!("{}/{}", identity.provider, identity.model),
@@ -1052,6 +1382,7 @@ mod tests {
     fn muse_sessions_fill_only_session_less_muse_panes() {
         let pane = |id: &str, harness: Harness, session: Option<&str>| AgentPane {
             pane_id: id.to_string(),
+            workspace_id: "w1".to_string(),
             harness,
             session: session.map(|value| AgentSession {
                 kind: Some("id".to_string()),
@@ -1060,6 +1391,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            working: false,
         };
         let mut panes = vec![
             pane("w1:p1", Harness::Muse, None),
@@ -1121,6 +1453,98 @@ mod tests {
         assert!(!OBSOLETE_METADATA_TOKEN_NAMES.contains(&HEADROOM_TOKEN));
     }
 
+    /// A one-pane publish still knows the Space head from inventory, and the
+    /// non-head drops `$quota_group` instead of preserving a stale label.
+    #[test]
+    fn group_header_lands_on_the_tightest_pane_and_clears_siblings() {
+        let head = AgentPane {
+            pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
+            harness: Harness::Codex,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::from([
+                (HEADROOM_TOKEN.to_string(), "000".to_string()),
+                ("quota_group".to_string(), "ifs".to_string()),
+            ]),
+            working: false,
+        };
+        let sibling = AgentPane {
+            pane_id: "w1:p2".to_string(),
+            workspace_id: "w1".to_string(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::from([
+                (HEADROOM_TOKEN.to_string(), "016".to_string()),
+                ("quota_group".to_string(), "ifs".to_string()),
+            ]),
+            working: false,
+        };
+        let inventory = vec![head.clone(), sibling.clone()];
+        let heads = group_head_pane_ids(&inventory, std::slice::from_ref(&sibling), &[]);
+        assert_eq!(heads.get("w1").map(String::as_str), Some("w1:p1"));
+
+        let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
+        let mut head_desired = BTreeMap::new();
+        apply_group_and_icon(&mut head_desired, &head, &heads, &labels);
+        assert_eq!(
+            head_desired.get("quota_group").map(String::as_str),
+            Some("ifs")
+        );
+
+        let mut sibling_desired = sibling.tokens.clone();
+        apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &labels);
+        assert!(!sibling_desired.contains_key("quota_group"));
+        assert!(
+            sibling_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.starts_with(GROUP_MEMBER_INDENT)),
+            "member logo must carry the hang-indent: {:?}",
+            sibling_desired.get("quota_icon")
+        );
+        assert!(
+            !sibling_desired.contains_key("quota_pad"),
+            "stand-alone pad draws a leading · separator"
+        );
+        assert_eq!(
+            group_label_for(&sibling, &heads, &labels),
+            None,
+            "stale sibling header must clear"
+        );
+        assert!(
+            head_desired
+                .get("quota_icon")
+                .is_some_and(|icon| !icon.starts_with('\u{200b}')),
+            "head logo stays bare; Herdr hang-indents the row"
+        );
+        assert_eq!(
+            format!("{GROUP_MEMBER_INDENT}x").trim(),
+            format!("{GROUP_MEMBER_INDENT}x"),
+            "indent glued to a glyph must survive Unicode trim"
+        );
+
+        // Status colour is Herdr's `state_icon`; the logo token is always
+        // `quota_icon`. Stale working/done logo tokens are cleared.
+        let mut working = sibling.clone();
+        working.working = true;
+        let mut working_desired = BTreeMap::from([
+            ("quota_icon_working".to_string(), "stale".to_string()),
+            ("quota_icon_done".to_string(), "stale".to_string()),
+        ]);
+        apply_group_and_icon(&mut working_desired, &working, &heads, &labels);
+        assert!(
+            working_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.starts_with(GROUP_MEMBER_INDENT)),
+            "working panes still publish the shared white logo"
+        );
+        assert!(!working_desired.contains_key("quota_icon_working"));
+        assert!(!working_desired.contains_key("quota_icon_done"));
+    }
+
     #[test]
     fn discovers_canonical_agent_panes_from_nested_json() {
         let value = json!({"result": {"agents": [
@@ -1140,27 +1564,33 @@ mod tests {
             vec![
                 AgentPane {
                     pane_id: "w1:p1".to_string(),
+                    workspace_id: "w1".to_string(),
                     harness: Harness::Codex,
                     session: None,
                     session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
+                    working: false,
                 },
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
+                    workspace_id: "w1".to_string(),
                     harness: Harness::Claude,
                     session: None,
                     session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
+                    working: false,
                 },
                 AgentPane {
                     pane_id: "w1:p4".to_string(),
+                    workspace_id: "w1".to_string(),
                     harness: Harness::OpenCode,
                     session: None,
                     session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
+                    working: false,
                 },
             ]
         );
@@ -1360,11 +1790,13 @@ mod tests {
     fn legacy_metadata_tokens_force_one_bounded_cleanup_report() {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::from([(String::from("quota_badge"), String::from("[A]"))]),
+            working: false,
         };
         let desired = BTreeMap::from([(String::from("quota_state"), String::from("?"))]);
         assert!(!metadata_matches(&pane.tokens, &desired));
@@ -1406,11 +1838,13 @@ mod tests {
         );
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
             harness: Harness::Grok,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            working: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -1452,11 +1886,13 @@ mod tests {
         );
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            working: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -1713,11 +2149,13 @@ mod tests {
         assert!(desired.contains_key("quota_context_danger"));
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            working: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
@@ -1776,23 +2214,25 @@ mod tests {
             SidebarShape::default(),
         );
         let mut tokens = desired.clone();
-        tokens.insert("quota_icon".to_string(), "✦Cl".to_string());
+        tokens.insert("quota_summary".to_string(), "old".to_string());
         tokens.insert("quota_status".to_string(), "OK".to_string());
         tokens.insert("quota_badge".to_string(), "[C]".to_string());
         tokens.insert("quota_session".to_string(), "old".to_string());
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens,
+            working: false,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
         assert!(names.contains(&"quota_cache"));
         assert!(names.contains(&"quota_cache_ttl"));
-        assert!(names.contains(&"quota_icon"));
+        assert!(names.contains(&"quota_summary"));
         assert!(names.contains(&"quota_status"));
         assert!(names.contains(&"quota_badge"));
         assert!(names.contains(&"quota_session"));
@@ -1966,11 +2406,13 @@ mod tests {
         tokens.insert("quota_week_normal".to_string(), "7d 75% 5d0h".to_string());
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
             harness: Harness::Grok,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens,
+            working: false,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);
@@ -2009,11 +2451,13 @@ mod tests {
         tokens.insert("quota_week_inline_normal".to_string(), "7d 99%".to_string());
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
+            workspace_id: "w1".to_string(),
             harness: Harness::Codex,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens,
+            working: false,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);

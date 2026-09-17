@@ -7,10 +7,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 47] = [
+const QUOTA_ROW_MARKERS: [&str; 51] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
+    "$quota_icon_working",
+    "$quota_icon_done",
+    "$quota_group",
+    "$quota_pad",
     "$quota_provider",
     "$quota_model",
     "$quota_provider_model",
@@ -58,7 +62,8 @@ const QUOTA_ROW_MARKERS: [&str; 47] = [
 ];
 const ROW_GAP_MARKER: &str = "herdr-agent-quota";
 const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
-
+/// Marks `ui.agent_panel_sort` when this plugin wrote Space grouping.
+const AGENT_PANEL_SORT_MARKER: &str = "herdr-agent-quota";
 const PROVIDER_STYLE_MARKER: &str = "herdr-agent-quota-provider";
 const REFRESH_KEY: &str = "prefix+shift+r";
 const REFRESH_ACTION: &str = "herdr-agent-quota.refresh";
@@ -71,6 +76,8 @@ const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
 // (0.8.2 added them); intended selected fill is #42474f when those keys exist.
 const QUOTA_SAFE_COLOR: &str = "#82d978";
 const QUOTA_WARNING_COLOR: &str = "#e4b957";
+/// Idle logo ink. Status (working / done / idle) is Herdr's `state_icon`.
+const IDLE_ICON_COLOR: &str = "#e9e9f0";
 const QUOTA_DANGER_COLOR: &str = "#f16f7e";
 // The same three bands, muted, for the meter rows only. `packed` and
 // `stacked` tint one short token, where a full-strength hue is legible; a
@@ -94,33 +101,30 @@ fn severity_palette(layout: SidebarLayout) -> [&'static str; 3] {
         SidebarLayout::Packed | SidebarLayout::Stacked => SEVERITY_PALETTE,
     }
 }
-const PROVIDER_STYLES: [(Harness, &str, Option<&str>, Option<&str>); 10] = [
-    (Harness::Claude, "claude", Some("#e88461"), Some("#f0a080")),
-    (Harness::Codex, "codex", Some("#c4d7f5"), Some("#aab9d0")),
-    (Harness::Grok, "grok", Some("#d5d5d8"), Some("#acb0b7")),
-    (Harness::Agy, "agy", Some("#8ab4f8"), Some("#a7c7fa")),
-    // omp takes the previous OpenCode violet; OpenCode now uses the neutral
-    // color omp inherited before it had a plugin-owned row.
-    (Harness::OpenCode, "opencode", None, None),
-    (Harness::Pi, "pi", Some("#d4a0c8"), None),
-    (Harness::Omp, "omp", Some("#bba3e8"), None),
-    (Harness::Devin, "devin", Some("#6c5ce7"), None),
-    (Harness::Muse, "muse", Some("#0082fb"), None),
-    // Same hue as Grok: Cursor's picker ships Grok models on the same account.
-    (Harness::Cursor, "cursor", Some("#d5d5d8"), Some("#acb0b7")),
+/// Provider row keys only. Identity is always ink-white; status is Herdr's
+/// `state_icon`, not vendor brand hues.
+const PROVIDER_STYLES: [(Harness, &str); 10] = [
+    (Harness::Claude, "claude"),
+    (Harness::Codex, "codex"),
+    (Harness::Grok, "grok"),
+    (Harness::Agy, "agy"),
+    (Harness::OpenCode, "opencode"),
+    (Harness::Pi, "pi"),
+    (Harness::Omp, "omp"),
+    (Harness::Devin, "devin"),
+    (Harness::Muse, "muse"),
+    (Harness::Cursor, "cursor"),
 ];
 const THEME_SELECTION_KEYS: [&str; 2] = ["selection_bg", "active_row_bg"];
 const OFFICIAL_IDENTITY_TOKENS: [&str; 4] = ["state_icon", "machine", "workspace", "tab"];
 
 /// Sidebar rows for the selected agents only, so `--agent grok` never writes
 /// or removes another agent's row.
-fn selected_styles(
-    agents: &[Harness],
-) -> impl Iterator<Item = (&'static str, Option<&'static str>, Option<&'static str>)> + '_ {
+fn selected_providers(agents: &[Harness]) -> impl Iterator<Item = &'static str> + '_ {
     PROVIDER_STYLES
         .into_iter()
-        .filter(move |(harness, _, _, _)| agents.contains(harness))
-        .map(|(_, provider, brand, dim)| (provider, brand, dim))
+        .filter(move |(harness, _)| agents.contains(harness))
+        .map(|(_, provider)| provider)
 }
 
 pub fn check(
@@ -455,7 +459,7 @@ fn rewrite_quota_sidebar(
     layout: SidebarLayout,
     row_gap: SidebarRowGap,
     fields: FieldSet,
-    brand: BrandColors,
+    _brand: BrandColors,
 ) -> Result<(String, Vec<&'static str>)> {
     let mut document = if input.trim().is_empty() {
         DocumentMut::new()
@@ -476,6 +480,7 @@ fn rewrite_quota_sidebar(
         SETTINGS_ACTION,
         "open agent quota settings",
     )?;
+    ensure_spaces_panel_sort(&mut document)?;
     let table = ensure_table(&mut document, &["ui", "sidebar", "agents"])?;
     let managed_row_gap = table
         .get("row_gap")
@@ -504,11 +509,12 @@ fn rewrite_quota_sidebar(
             RowRewrite::Preserve
         },
     )?;
-    let skipped = if !rows_safe || brand.is_on() {
-        add_provider_rows(table, &managed_rows, agents, brand.is_on())?
+    // Identity is ink-white for every harness; status is Herdr's `state_icon`.
+    // Per-agent brand copies are redundant and were the dual-hue source of
+    // "two icons" when a width flip dropped a clear.
+    let skipped = if !rows_safe {
+        add_provider_rows(table, &managed_rows, agents)?
     } else {
-        // Shared rows already carry quota. Per-agent copies would be identical
-        // without brand hues, so the plugin removes its own entries.
         remove_managed_provider_rows(table, agents);
         Vec::new()
     };
@@ -535,24 +541,55 @@ fn build_managed_rows(
     fields: FieldSet,
     rewrite: RowRewrite,
 ) -> Result<Array> {
-    let mut updated_rows = match rewrite {
+    let preserved = match rewrite {
+        // Group headers replace the per-pane workspace/tab identity row:
+        // starting from Herdr's stock machine/workspace/tab list would print
+        // the Space name twice — once natively, once as `$quota_group`.
         RowRewrite::Takeover if original.is_none_or(|rows| is_default_layout(rows, true)) => {
-            official_agent_rows()
+            Array::new()
         }
         _ => {
             let mut rows = Array::new();
             if let Some(original) = original {
                 for row in original {
                     let cleaned = strip_quota_tokens(row);
-                    if !cleaned.is_empty() {
-                        rows.push(Value::Array(cleaned));
+                    if cleaned.is_empty() {
+                        continue;
                     }
+                    // Drop the stock identity row when we are about to publish
+                    // `$quota_group`; keeping both is the double-header the
+                    // screenshot showed. Styled machine/workspace/tab counts
+                    // too — a hue on the Space name is still a Space name.
+                    if is_official_identity_row(&cleaned) || is_navigation_identity_row(&cleaned) {
+                        continue;
+                    }
+                    rows.push(Value::Array(cleaned));
                 }
             }
             rows
         }
     };
+    let user_count = preserved.len();
+    let mut updated_rows = preserved;
     append_quota_rows(&mut updated_rows, layout);
+    // Keep `$quota_group` first so Space aggregation stays the head row;
+    // user-owned extras (pane/git/other plugins) sit directly under it.
+    if user_count > 0 {
+        let mut reordered = Array::new();
+        reordered.push(
+            updated_rows
+                .get(user_count)
+                .expect("group header follows preserved rows")
+                .clone(),
+        );
+        for index in 0..user_count {
+            reordered.push(updated_rows.get(index).expect("preserved row").clone());
+        }
+        for index in (user_count + 1)..updated_rows.len() {
+            reordered.push(updated_rows.get(index).expect("quota row").clone());
+        }
+        updated_rows = reordered;
+    }
     retain_selected_fields(&mut updated_rows, fields);
     Ok(updated_rows)
 }
@@ -617,6 +654,21 @@ fn is_default_state_equivalent(row: &Array) -> bool {
     has_state_icon
 }
 
+/// Stock navigation identity, including user-styled machine/workspace/tab.
+/// Dropped when publishing `$quota_group` so a restyled Space name cannot
+/// reprint under the group header.
+fn is_navigation_identity_row(row: &Array) -> bool {
+    let mut has_state_icon = false;
+    for item in row.iter() {
+        match configured_token_name(item) {
+            Some("state_icon") => has_state_icon = true,
+            Some("agent" | "tab" | "machine" | "workspace") => {}
+            _ => return false,
+        }
+    }
+    has_state_icon
+}
+
 /// Full-installation form, used by callers that remove every agent.
 pub fn remove_quota_row(input: &str) -> Result<String> {
     remove_quota_row_for(input, &AgentSelection::SUPPORTED, true)
@@ -656,6 +708,9 @@ pub fn remove_quota_row_for(input: &str, agents: &[Harness], full: bool) -> Resu
         .and_then(|sidebar| sidebar.get_mut("agents"))
         .and_then(Item::as_table_mut)
     else {
+        if full {
+            remove_managed_panel_sort(&mut document);
+        }
         return Ok(document.to_string());
     };
     remove_managed_provider_rows(table, agents);
@@ -673,17 +728,32 @@ pub fn remove_quota_row_for(input: &str, agents: &[Harness], full: bool) -> Resu
                 retained.push(Value::Array(cleaned));
             }
         }
-        // While installed, the branded provider/model line is the identity.
-        // Herdr's native `agent` row goes back so uninstall looks like 0.9.
-        if retained.len() == 1
-            && retained
-                .get(0)
-                .and_then(Value::as_array)
-                .is_some_and(is_official_identity_row)
+        // Managed installs drop machine/workspace/tab in favour of
+        // `$quota_group`. After stripping quota tokens only `state_icon`
+        // remains — put Herdr's stock identity + `agent` rows back.
+        if retained.is_empty()
+            || retained.iter().all(|row| {
+                row.as_array().is_some_and(|items| {
+                    is_official_identity_row(items)
+                        || (items.len() == 1
+                            && items.get(0).and_then(Value::as_str) == Some("state_icon"))
+                })
+            })
         {
-            retained.push(herdr_native_agent_row());
+            let mut restored = official_agent_rows();
+            restored.push(herdr_native_agent_row());
+            table["rows"] = Item::Value(Value::Array(restored));
+        } else {
+            if retained.len() == 1
+                && retained
+                    .get(0)
+                    .and_then(Value::as_array)
+                    .is_some_and(is_official_identity_row)
+            {
+                retained.push(herdr_native_agent_row());
+            }
+            table["rows"] = Item::Value(Value::Array(retained));
         }
-        table["rows"] = Item::Value(Value::Array(retained));
     }
     let managed_row_gap = table
         .get("row_gap")
@@ -695,6 +765,7 @@ pub fn remove_quota_row_for(input: &str, agents: &[Harness], full: bool) -> Resu
         table.remove("row_gap");
     }
     remove_managed_selection_theme(&mut document);
+    remove_managed_panel_sort(&mut document);
     Ok(document.to_string())
 }
 
@@ -797,7 +868,6 @@ fn add_provider_rows(
     table: &mut Table,
     rows: &Array,
     agents: &[Harness],
-    color: bool,
 ) -> Result<Vec<&'static str>> {
     let rows_by_agent = table
         .entry("rows_by_agent")
@@ -806,7 +876,7 @@ fn add_provider_rows(
         .context("Herdr ui.sidebar.agents.rows_by_agent must be a table")?;
 
     let mut skipped = Vec::new();
-    for (provider, brand, dim) in selected_styles(agents) {
+    for provider in selected_providers(agents) {
         let is_managed = rows_by_agent
             .get(provider)
             .and_then(Item::as_value)
@@ -815,8 +885,7 @@ fn add_provider_rows(
             skipped.push(provider);
             continue;
         }
-        let (brand, dim) = if color { (brand, dim) } else { (None, None) };
-        let mut value = Value::Array(provider_rows(rows, brand, dim));
+        let mut value = Value::Array(rows.clone());
         value
             .decor_mut()
             .set_suffix(format!(" # {PROVIDER_STYLE_MARKER}"));
@@ -825,46 +894,11 @@ fn add_provider_rows(
     Ok(skipped)
 }
 
-fn provider_rows(rows: &Array, brand: Option<&str>, dim: Option<&str>) -> Array {
-    // Brand on provider, dim on model. 5h vs folded 7d is a publish-time
-    // choice from the 5h token, not a per-agent color choice.
-    let mut themed = Array::new();
-    for row in rows.iter() {
-        let Some(items) = row.as_array() else {
-            continue;
-        };
-        let mut themed_row = Array::new();
-        append_themed_provider_row(&mut themed_row, items, brand, dim);
-        themed.push(Value::Array(themed_row));
-    }
-    themed
-}
-
-fn append_themed_provider_row(
-    row: &mut Array,
-    items: &Array,
-    brand: Option<&str>,
-    dim: Option<&str>,
-) {
-    let model_color = dim.or(brand);
-    for item in items {
-        match configured_token_name(item) {
-            Some(token @ "$quota_provider_model") | Some(token @ "$quota_provider") => {
-                row.push(styled_token(token, brand, Some(true), Some(false)));
-            }
-            Some(token @ "$quota_model") => {
-                row.push(styled_token(token, model_color, Some(false), Some(false)));
-            }
-            _ => row.push(item.clone()),
-        }
-    }
-}
-
 fn remove_managed_provider_rows(table: &mut Table, agents: &[Harness]) {
     let Some(rows_by_agent) = table.get_mut("rows_by_agent").and_then(Item::as_table_mut) else {
         return;
     };
-    for (provider, _, _) in selected_styles(agents) {
+    for provider in selected_providers(agents) {
         let is_managed = rows_by_agent
             .get(provider)
             .and_then(Item::as_value)
@@ -915,21 +949,27 @@ fn is_standalone_agent_row(row: &Array) -> bool {
 }
 
 fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
-    // Gauges shares packed's identity line and stacked's body: the identity is
-    // one name, not a quota gauge, so it stays compact, while a meter needs its
-    // own row per field. Both halves are shared rather than copied so they cannot drift.
+    // Group header first: empty on non-head panes so Herdr collapses the row.
+    // The stock machine/workspace/tab identity is omitted on purpose — the
+    // group header is the Space name, and repeating it on every pane is what
+    // made the list look ungrouped.
+    rows.push(Value::Array(styled_row(
+        "$quota_group",
+        None,
+        Some(true),
+        Some(false),
+    )));
     match layout {
         SidebarLayout::Packed | SidebarLayout::Gauges => append_identity_row(rows),
         SidebarLayout::Stacked => {
-            rows.push(Value::Array(styled_row(
+            rows.push(Value::Array(identity_cells(
+                "$quota_icon",
                 "$quota_provider",
-                None,
                 Some(true),
-                Some(false),
             )));
             rows.push(Value::Array(styled_row(
                 "$quota_model",
-                None,
+                Some(IDLE_ICON_COLOR),
                 Some(false),
                 Some(false),
             )));
@@ -941,7 +981,6 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
         Some(false),
         Some(false),
     )));
-    // Context folds the weekly quota when 5h is absent; empty rows collapse.
     match layout {
         SidebarLayout::Packed => append_packed_quota_rows(rows),
         SidebarLayout::Stacked | SidebarLayout::Gauges => append_stacked_quota_rows(rows, layout),
@@ -949,12 +988,35 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
 }
 
 fn append_identity_row(rows: &mut Array) {
-    rows.push(Value::Array(styled_row(
+    rows.push(Value::Array(identity_cells(
+        "$quota_icon",
         "$quota_provider_model",
-        None,
+        // Name stays bold for scan; icon bold is forced off inside
+        // `identity_cells` (single-weight PUA face).
         Some(true),
-        Some(false),
     )));
+}
+
+/// Herdr's status ring, then the ink-white logo and name.
+///
+/// `state_icon` owns working / done / idle (and click-to-seen). The logo is
+/// always white — it identifies the harness, it does not re-encode status.
+fn identity_cells(icon: &str, name: &str, name_bold: Option<bool>) -> Array {
+    let mut row = Array::new();
+    row.push(Value::from("state_icon"));
+    row.push(styled_token(
+        icon,
+        Some(IDLE_ICON_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    row.push(styled_token(
+        name,
+        Some(IDLE_ICON_COLOR),
+        name_bold,
+        Some(false),
+    ));
+    row
 }
 
 fn append_packed_quota_rows(rows: &mut Array) {
@@ -1206,6 +1268,45 @@ fn remove_managed_selection_theme(document: &mut DocumentMut) {
     }
 }
 
+/// Keep Herdr's Agent panel grouped by Space unless the user already set a
+/// different `agent_panel_sort` themselves. Quota order additionally ranks by
+/// headroom inside each space via the Agent view; this config key is what
+/// remains when that view is cleared.
+fn ensure_spaces_panel_sort(document: &mut DocumentMut) -> Result<()> {
+    let ui = ensure_table(document, &["ui"])?;
+    let managed = ui
+        .get("agent_panel_sort")
+        .and_then(Item::as_value)
+        .and_then(|value| value.decor().suffix())
+        .and_then(|suffix| suffix.as_str())
+        .is_some_and(|suffix| suffix.contains(AGENT_PANEL_SORT_MARKER));
+    if !ui.contains_key("agent_panel_sort") || managed {
+        let mut sort = Value::from("spaces");
+        sort.decor_mut()
+            .set_suffix(format!(" # {AGENT_PANEL_SORT_MARKER}"));
+        ui.insert("agent_panel_sort", Item::Value(sort));
+    }
+    Ok(())
+}
+
+fn remove_managed_panel_sort(document: &mut DocumentMut) {
+    let Some(ui) = document.get_mut("ui").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let managed = ui
+        .get("agent_panel_sort")
+        .and_then(Item::as_value)
+        .and_then(|value| value.decor().suffix())
+        .and_then(|suffix| suffix.as_str())
+        .is_some_and(|suffix| suffix.contains(AGENT_PANEL_SORT_MARKER));
+    if managed {
+        ui.remove("agent_panel_sort");
+    }
+    if ui.is_empty() {
+        document.remove("ui");
+    }
+}
+
 fn styled_row(token: &str, fg: Option<&str>, bold: Option<bool>, dim: Option<bool>) -> Array {
     let mut row = Array::new();
     row.push(styled_token(token, fg, bold, dim));
@@ -1262,7 +1363,7 @@ fn skipped_provider_label(provider: &str) -> &str {
     }
 }
 
-fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, brand: BrandColors) {
+fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, _brand: BrandColors) {
     println!("  keep Herdr's official machine, workspace, and tab rows");
     match layout {
         SidebarLayout::Packed => {
@@ -1295,9 +1396,7 @@ fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, brand: BrandColors) 
     if !hidden.is_empty() {
         println!("  leave out {}", hidden.join(", "));
     }
-    if !brand.is_on() {
-        println!("  write no brand colors; severity colors stay");
-    }
+    println!("  paint logo and name ink-white; Herdr's state_icon carries status");
 }
 
 #[cfg(test)]
@@ -1308,28 +1407,49 @@ mod tests {
     fn every_supported_harness_has_a_sidebar_style_in_supported_order() {
         let styles: Vec<Harness> = PROVIDER_STYLES
             .iter()
-            .map(|(harness, _, _, _)| *harness)
+            .map(|(harness, _)| *harness)
             .collect();
         assert_eq!(styles.as_slice(), AgentSelection::SUPPORTED.as_slice());
     }
 
     #[test]
-    fn extra_native_identity_rows_and_unmarked_legacy_styles_are_preserved() {
-        for original in [
-            "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"], [\"agent\"]] # herdr-agent-quota-row\n",
-            "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true, dim = false }]]\n",
-        ] {
-            let expected = original.parse::<DocumentMut>().unwrap();
-            let expected = expected["ui"]["sidebar"]["agents"]["rows"].as_array().unwrap();
-            let applied = add_quota_row(original).unwrap();
-            let parsed = applied.parse::<DocumentMut>().unwrap();
-            let rows = parsed["ui"]["sidebar"]["agents"]["rows"].as_array().unwrap();
-            for (actual, expected) in rows.iter().zip(expected.iter()) {
-                assert_eq!(actual.to_string().trim(), expected.to_string().trim());
-            }
-            assert!(rows.len() >= expected.len());
-            assert_eq!(add_quota_row(&applied).unwrap(), applied);
-        }
+    fn extra_agent_rows_and_unmarked_legacy_styles_are_preserved() {
+        // Two standalone agent rows on a marked layout: stock identity is
+        // dropped for grouping, but the extra agent row stays.
+        let marked = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"], [\"agent\"]] # herdr-agent-quota-row\n";
+        let applied = add_quota_row(marked).unwrap();
+        let parsed = applied.parse::<DocumentMut>().unwrap();
+        let rows = parsed["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.as_array().is_some_and(is_standalone_agent_row))
+                .count(),
+            2,
+            "both agent rows should survive: {applied}"
+        );
+        assert!(row_is_only_token(rows, "$quota_group"));
+        assert_eq!(add_quota_row(&applied).unwrap(), applied);
+
+        // Unmarked legacy tab styling is user-owned and kept above plugin rows.
+        let legacy = "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true, dim = false }]]\n";
+        let applied = add_quota_row(legacy).unwrap();
+        let parsed = applied.parse::<DocumentMut>().unwrap();
+        let rows = parsed["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        let first = rows.get(0).unwrap().as_array().unwrap();
+        assert_eq!(first.get(0).and_then(Value::as_str), Some("state_icon"));
+        assert_eq!(
+            first
+                .get(1)
+                .and_then(Value::as_inline_table)
+                .and_then(|table| table.get("token"))
+                .and_then(Value::as_str),
+            Some("tab")
+        );
+        assert_eq!(add_quota_row(&applied).unwrap(), applied);
     }
 
     #[test]
@@ -1377,13 +1497,9 @@ mod tests {
                     shared.get(1).unwrap().to_string().trim(),
                     custom.to_string()
                 );
-                if brand.is_on() {
-                    let provider = agents["rows_by_agent"]["claude"].as_array().unwrap();
-                    assert_eq!(
-                        provider.get(1).unwrap().to_string().trim(),
-                        custom.to_string()
-                    );
-                }
+                // Takeover installs shared rows only; brand-on no longer
+                // mirrors them into rows_by_agent.
+                assert!(agents.get("rows_by_agent").is_none(), "{repaired}");
                 assert_eq!(apply(&repaired), repaired);
                 let removed = remove_quota_row(&repaired).unwrap();
                 assert!(removed.contains("pane"));
@@ -1395,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn official_09_rows_stay_above_plugin_fields_on_install_and_migration() {
+    fn group_header_replaces_per_pane_workspace_identity() {
         for original in [
             "",
             "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
@@ -1404,20 +1520,57 @@ mod tests {
             for layout in SidebarLayout::CHOICES {
                 let updated = add_quota_row_for(original, &[Harness::Claude], layout).unwrap();
                 let document = updated.parse::<DocumentMut>().unwrap();
-                for rows in [
-                    document["ui"]["sidebar"]["agents"]["rows"].as_array().unwrap(),
-                    document["ui"]["sidebar"]["agents"]["rows_by_agent"]["claude"].as_array().unwrap(),
-                ] {
-                    let names = |index| rows.get(index).unwrap().as_array().unwrap()
-                        .iter().map(|item| item.as_str().unwrap()).collect::<Vec<_>>();
-                    assert_eq!(names(0), ["state_icon", "machine", "workspace", "tab"]);
-                    assert!(
-                        !has_standalone_agent_row(rows),
-                        "native agent row duplicates branded provider/model:\n{updated}"
-                    );
-                    assert!(rows.iter().skip(1).any(|row| row_contains_token(row, "$quota_topic")));
-                }
-                assert_eq!(add_quota_row_for(&updated, &[Harness::Claude], layout).unwrap(), updated);
+                let rows = document["ui"]["sidebar"]["agents"]["rows"]
+                    .as_array()
+                    .unwrap();
+                assert!(
+                    document["ui"]["sidebar"]["agents"]
+                        .get("rows_by_agent")
+                        .is_none(),
+                    "takeover must not write per-agent brand rows:\n{updated}"
+                );
+                assert!(row_is_only_token(rows, "$quota_group"), "{updated}");
+                assert!(
+                    !rows.iter().any(|row| {
+                        row.as_array().is_some_and(|items| {
+                            items.iter().any(|item| item.as_str() == Some("workspace"))
+                                || items.iter().any(|item| item.as_str() == Some("machine"))
+                                || items.iter().any(|item| item.as_str() == Some("tab"))
+                        })
+                    }),
+                    "per-pane workspace identity survived grouping:\n{updated}"
+                );
+                assert!(
+                    !has_standalone_agent_row(rows),
+                    "native agent row duplicates provider/model:\n{updated}"
+                );
+                assert!(rows.iter().any(|row| row_contains_token(row, "$quota_icon")));
+                assert!(rows.iter().any(|row| {
+                    row.as_array().is_some_and(|items| {
+                        items.iter().any(|item| item.as_str() == Some("state_icon"))
+                            && row_contains_token(row, "$quota_icon")
+                    })
+                }));
+                assert!(!rows
+                    .iter()
+                    .any(|row| row_contains_token(row, "$quota_icon_working")));
+                assert!(!rows
+                    .iter()
+                    .any(|row| row_contains_token(row, "$quota_icon_done")));
+                assert!(rows.iter().any(|row| row_contains_token(row, "$quota_topic")));
+                assert!(
+                    !rows.iter().any(|row| {
+                        row.as_array().is_some_and(|items| {
+                            items.iter().any(|item| item.as_str() == Some("state_icon"))
+                                && row_contains_token(row, "$quota_topic")
+                        })
+                    }),
+                    "status ring sits on the identity row, not on topic"
+                );
+                assert_eq!(
+                    add_quota_row_for(&updated, &[Harness::Claude], layout).unwrap(),
+                    updated
+                );
             }
         }
     }
@@ -1434,51 +1587,61 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row_contains_token(row, "$quota_provider_model")));
-        assert_eq!(remove_quota_row(&installed).unwrap(), original);
+        assert_eq!(
+            remove_quota_row(&installed).unwrap(),
+            "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
+        );
     }
 
     #[test]
     fn custom_styles_on_native_tokens_survive_repair() {
+        // Styled stock identity is not a plain default, so shared rows stay
+        // user-owned. Provider copies still drop that navigation row for
+        // `$quota_group`, or the Space name would print twice under brand.
         let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"workspace\", fg = \"#123456\" }, \"tab\"], [\"agent\"]]\n";
         let updated = add_quota_row(original).unwrap();
         let document = updated.parse::<DocumentMut>().unwrap();
-        for rows in [
-            document["ui"]["sidebar"]["agents"]["rows"]
-                .as_array()
-                .unwrap(),
-            document["ui"]["sidebar"]["agents"]["rows_by_agent"]["claude"]
-                .as_array()
-                .unwrap(),
-        ] {
-            let first = rows.get(0).unwrap().as_array().unwrap();
-            assert_eq!(first.len(), 3);
-            assert_eq!(
-                first
-                    .get(1)
-                    .unwrap()
-                    .as_inline_table()
-                    .unwrap()
-                    .get("fg")
-                    .and_then(Value::as_str),
-                Some("#123456")
-            );
-            assert_eq!(token_names(rows.get(1).unwrap()), ["agent"]);
-        }
+        let shared = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        let first = shared.get(0).unwrap().as_array().unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(
+            first
+                .get(1)
+                .unwrap()
+                .as_inline_table()
+                .unwrap()
+                .get("fg")
+                .and_then(Value::as_str),
+            Some("#123456")
+        );
+        assert_eq!(token_names(shared.get(1).unwrap()), ["agent"]);
+
+        let provider = document["ui"]["sidebar"]["agents"]["rows_by_agent"]["claude"]
+            .as_array()
+            .unwrap();
+        assert!(row_is_only_token(provider, "$quota_group"));
+        assert_eq!(token_names(provider.get(1).unwrap()), ["agent"]);
         assert_eq!(add_quota_row(&updated).unwrap(), updated);
     }
 
     #[test]
-    fn adds_quota_rows_without_replacing_official_rows() {
+    fn adds_quota_rows_with_group_header_and_vendor_icon() {
         let original = r#"[ui.sidebar.agents]
 rows = [["state_icon", "agent"]]
 "#;
         let updated = add_quota_row(original).unwrap();
         assert!(updated.contains("$quota_5h"));
         assert!(updated.contains("$quota_week"));
+        assert!(updated.contains("$quota_group"));
+        assert!(updated.contains("$quota_icon"));
         assert!(updated.contains("state_icon"));
-        assert!(updated.contains("machine"));
-        assert!(updated.contains("workspace"));
-        assert!(updated.contains("tab"));
+        assert!(!updated.contains("$quota_icon_working"));
+        assert!(!updated.contains("$quota_icon_done"));
+        assert!(!updated.contains("$quota_pad"));
+        assert!(!updated.contains("\"workspace\""));
+        assert!(!updated.contains("\"machine\""));
         assert!(updated.contains("$quota_topic"));
         assert!(updated.contains("$quota_5h_warning"));
         assert!(updated.contains("$quota_week_danger"));
@@ -1585,10 +1748,12 @@ rows = [["state_icon", "agent"]]
         let identity_index = rows
             .iter()
             .position(|row| {
-                row.as_array().is_some_and(|items| {
-                    items.iter().any(|item| item.as_str() == Some("state_icon"))
-                })
+                row_contains_token(row, "$quota_icon") && row_contains_token(row, "$quota_provider")
             })
+            .unwrap();
+        let group_index = rows
+            .iter()
+            .position(|row| row_contains_token(row, "$quota_group"))
             .unwrap();
         let provider_index = rows
             .iter()
@@ -1602,13 +1767,17 @@ rows = [["state_icon", "agent"]]
             .iter()
             .position(|row| row_contains_token(row, "$quota_topic"))
             .unwrap();
-        assert_eq!(identity_index + 1, provider_index);
+        assert_eq!(group_index + 1, identity_index);
+        assert_eq!(identity_index, provider_index);
         assert_eq!(provider_index + 1, model_index);
         assert_eq!(model_index + 1, topic_index);
         assert!(!rows
             .iter()
             .any(|row| row_contains_token(row, "$quota_provider_model")));
-        assert!(row_is_only_token(rows, "$quota_provider"));
+        assert!(rows.iter().any(|row| {
+            row_contains_token(row, "$quota_icon") && row_contains_token(row, "$quota_provider")
+        }));
+        assert!(row_is_only_token(rows, "$quota_group"));
         assert!(row_is_only_token(rows, "$quota_model"));
         assert!(row_is_only_token(rows, "$quota_cache"));
         assert!(row_is_only_token(rows, "$quota_cache_ttl"));
@@ -1649,46 +1818,50 @@ rows = [["state_icon", "agent"]]
         let updated =
             add_quota_row_for(original, &AgentSelection::SUPPORTED, SidebarLayout::Gauges).unwrap();
         let document = updated.parse::<DocumentMut>().unwrap();
-        for rows in [
-            document["ui"]["sidebar"]["agents"]["rows"]
-                .as_array()
-                .unwrap(),
-            document["ui"]["sidebar"]["agents"]["rows_by_agent"]["claude"]
-                .as_array()
-                .unwrap(),
-        ] {
-            assert!(row_is_only_token(rows, "$quota_provider_model"));
-            assert!(!rows
-                .iter()
-                .any(|row| row_contains_token(row, "$quota_provider")));
-            assert!(!rows
-                .iter()
-                .any(|row| row_contains_token(row, "$quota_model")));
-            assert!(rows.iter().any(|row| {
-                row_contains_token(row, "$quota_cache")
-                    && row_contains_token(row, "$quota_cache_state")
-                    && !row_contains_token(row, "$quota_cache_ttl")
-            }));
-            for token in ["$quota_cache_ttl", "$quota_error"] {
-                assert!(row_is_only_token(rows, token), "{token} shares a row");
-            }
-            // The context row is the severity family here, not the plain
-            // token, so it is a row of three names rather than one.
-            assert!(rows.iter().any(|row| {
-                row_contains_token(row, "$quota_context_normal")
-                    && !row_contains_token(row, "$quota_5h_normal")
-                    && !row_contains_token(row, "$quota_week_normal")
-            }));
-            assert!(rows.iter().any(|row| {
-                row_contains_token(row, "$quota_5h_normal")
-                    && !row_contains_token(row, "$quota_week_normal")
-            }));
-            assert!(rows.iter().any(|row| {
-                row_contains_token(row, "$quota_week_normal")
-                    && row_contains_token(row, "$quota_week_inline_normal")
-                    && !row_contains_token(row, "$quota_5h_normal")
-            }));
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        assert!(
+            document["ui"]["sidebar"]["agents"]
+                .get("rows_by_agent")
+                .is_none(),
+            "{updated}"
+        );
+        assert!(rows.iter().any(|row| {
+            row_contains_token(row, "$quota_icon")
+                && row_contains_token(row, "$quota_provider_model")
+        }));
+        assert!(row_is_only_token(rows, "$quota_group"));
+        assert!(!rows
+            .iter()
+            .any(|row| row_contains_token(row, "$quota_provider")));
+        assert!(!rows
+            .iter()
+            .any(|row| row_contains_token(row, "$quota_model")));
+        assert!(rows.iter().any(|row| {
+            row_contains_token(row, "$quota_cache")
+                && row_contains_token(row, "$quota_cache_state")
+                && !row_contains_token(row, "$quota_cache_ttl")
+        }));
+        for token in ["$quota_cache_ttl", "$quota_error"] {
+            assert!(row_is_only_token(rows, token), "{token} shares a row");
         }
+        // The context row is the severity family here, not the plain
+        // token, so it is a row of three names rather than one.
+        assert!(rows.iter().any(|row| {
+            row_contains_token(row, "$quota_context_normal")
+                && !row_contains_token(row, "$quota_5h_normal")
+                && !row_contains_token(row, "$quota_week_normal")
+        }));
+        assert!(rows.iter().any(|row| {
+            row_contains_token(row, "$quota_5h_normal")
+                && !row_contains_token(row, "$quota_week_normal")
+        }));
+        assert!(rows.iter().any(|row| {
+            row_contains_token(row, "$quota_week_normal")
+                && row_contains_token(row, "$quota_week_inline_normal")
+                && !row_contains_token(row, "$quota_5h_normal")
+        }));
         assert_eq!(
             remove_quota_row(
                 &add_quota_row_for("", &AgentSelection::SUPPORTED, SidebarLayout::Gauges).unwrap()
@@ -1835,22 +2008,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "15589616248e8842468c95231ba4871004e17db28cf3995a9786164fe3ff4f1b",
-                    "bc1ddbe70f342154b39de41f105fb7a727cffc3ee09688406b3b25949e9b9d26",
+                    "05802a842a43e5c2f7f2d5596314b34598cc0f2cdac101723fa4740199473e79",
+                    "2d94cf3276a7b2a51d5652c550972a831c2828ef4346033a6995ce26890c0fe8",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "6681965ba5d2375f7cc231a75c857d8cd845646face9c9c85ba65185520ea66a",
-                    "dd4c8830b1e54f5e092a7aab190a14c02a8bd4512062a25e340d9e6b3c7d6806",
+                    "70e781f51f47671cfb9cc8133ab02e52ce9a964a6e610f2fd0ee4802b606f807",
+                    "ef5334401128b005d52ad5d22a1bc94d9a2cbd1de6c6675b16571a3a2294f683",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "6681965ba5d2375f7cc231a75c857d8cd845646face9c9c85ba65185520ea66a",
-                    "dd4c8830b1e54f5e092a7aab190a14c02a8bd4512062a25e340d9e6b3c7d6806",
+                    "70e781f51f47671cfb9cc8133ab02e52ce9a964a6e610f2fd0ee4802b606f807",
+                    "ef5334401128b005d52ad5d22a1bc94d9a2cbd1de6c6675b16571a3a2294f683",
                 ],
             ),
         ] {
@@ -1956,14 +2129,14 @@ rows = [["state_icon", "agent"]]
         }
     }
 
-    /// `rows_by_agent` is a themed copy of `rows`, so a palette that only
-    /// reached the shared rows would leave every per-provider row saturated.
+    /// Shared rows carry the gauges palette; takeover no longer mirrors them
+    /// into per-provider copies.
     #[test]
-    fn the_gauges_palette_reaches_the_per_provider_rows() {
+    fn the_gauges_palette_reaches_the_shared_rows() {
         let updated =
             add_quota_row_for("", &AgentSelection::SUPPORTED, SidebarLayout::Gauges).unwrap();
         let document = updated.parse::<DocumentMut>().unwrap();
-        let rows = document["ui"]["sidebar"]["agents"]["rows_by_agent"]["claude"]
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
             .as_array()
             .unwrap();
         for token in ["$quota_5h_normal", "$quota_context_normal"] {
@@ -2004,7 +2177,7 @@ rows = [["state_icon", "agent"]]
     }
 
     #[test]
-    fn tab_labels_keep_herdr_default_styling() {
+    fn agent_identity_keeps_state_icon_and_white_logo() {
         let updated =
             add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"tab\", \"agent\"]]\n")
                 .unwrap();
@@ -2014,22 +2187,84 @@ rows = [["state_icon", "agent"]]
             .unwrap();
         let identity = rows
             .iter()
-            .find(|row| {
-                row.as_array().is_some_and(|items| {
-                    items.iter().any(|item| item.as_str() == Some("state_icon"))
-                })
-            })
+            .find(|row| row_contains_token(row, "$quota_icon"))
             .and_then(Value::as_array)
             .unwrap();
-        let tab = identity
+        assert_eq!(identity.get(0).and_then(Value::as_str), Some("state_icon"));
+        assert_eq!(
+            configured_token_name(identity.get(1).unwrap()),
+            Some("$quota_icon")
+        );
+        assert!(identity
             .iter()
-            .find(|item| configured_token_name(item) == Some("tab"))
+            .any(|item| configured_token_name(item) == Some("$quota_provider_model")));
+        assert!(!identity
+            .iter()
+            .any(|item| configured_token_name(item) == Some("$quota_icon_working")));
+        assert!(!identity
+            .iter()
+            .any(|item| configured_token_name(item) == Some("$quota_icon_done")));
+        let topic = rows
+            .iter()
+            .find(|row| row_contains_token(row, "$quota_topic"))
+            .and_then(Value::as_array)
             .unwrap();
-        assert_eq!(tab.as_str(), Some("tab"));
+        assert!(
+            !topic.iter().any(|item| item.as_str() == Some("state_icon")),
+            "topic row does not host the ring"
+        );
+        let icon = identity
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_icon"))
+            .and_then(Value::as_inline_table)
+            .unwrap();
+        assert_eq!(
+            icon.get("fg").and_then(Value::as_str),
+            Some(IDLE_ICON_COLOR)
+        );
     }
 
     #[test]
-    fn stacked_model_uses_brand_dim_and_leaves_provider_hue_alone() {
+    fn idle_identity_uses_ink_white_on_the_shared_logo() {
+        let updated = add_quota_row_for(
+            "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n",
+            &[Harness::Claude],
+            SidebarLayout::Packed,
+        )
+        .unwrap();
+        let document = updated.parse::<DocumentMut>().unwrap();
+        assert!(
+            document["ui"]["sidebar"]["agents"]
+                .get("rows_by_agent")
+                .is_none(),
+            "{updated}"
+        );
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        let identity = rows
+            .iter()
+            .find(|row| row_contains_token(row, "$quota_icon"))
+            .and_then(Value::as_array)
+            .unwrap();
+        let icon_fg = identity
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_icon"))
+            .and_then(Value::as_inline_table)
+            .and_then(|table| table.get("fg"))
+            .and_then(Value::as_str);
+        let name_fg = identity
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_provider_model"))
+            .and_then(Value::as_inline_table)
+            .and_then(|table| table.get("fg"))
+            .and_then(Value::as_str);
+        assert_eq!(icon_fg, Some(IDLE_ICON_COLOR));
+        assert_eq!(name_fg, Some(IDLE_ICON_COLOR));
+    }
+
+    #[test]
+    fn stacked_model_and_provider_share_idle_ink_white() {
         let updated = add_quota_row_for(
             "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n",
             &[Harness::Claude, Harness::Codex],
@@ -2037,39 +2272,39 @@ rows = [["state_icon", "agent"]]
         )
         .unwrap();
         let document = updated.parse::<DocumentMut>().unwrap();
-        let rows_by_agent = document["ui"]["sidebar"]["agents"]["rows_by_agent"]
-            .as_table()
+        assert!(
+            document["ui"]["sidebar"]["agents"]
+                .get("rows_by_agent")
+                .is_none(),
+            "{updated}"
+        );
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
             .unwrap();
-        for (provider, brand, dim) in [
-            ("claude", "#e88461", "#f0a080"),
-            ("codex", "#c4d7f5", "#aab9d0"),
-        ] {
-            let rows = rows_by_agent[provider].as_array().unwrap();
-            let provider_row = rows
-                .iter()
-                .find(|row| row_contains_token(row, "$quota_provider"))
-                .and_then(Value::as_array)
-                .unwrap();
-            let model_row = rows
-                .iter()
-                .find(|row| row_contains_token(row, "$quota_model"))
-                .and_then(Value::as_array)
-                .unwrap();
-            let provider_fg = provider_row
-                .iter()
-                .find(|item| configured_token_name(item) == Some("$quota_provider"))
-                .and_then(Value::as_inline_table)
-                .and_then(|table| table.get("fg"))
-                .and_then(Value::as_str);
-            let model_fg = model_row
-                .iter()
-                .find(|item| configured_token_name(item) == Some("$quota_model"))
-                .and_then(Value::as_inline_table)
-                .and_then(|table| table.get("fg"))
-                .and_then(Value::as_str);
-            assert_eq!(provider_fg, Some(brand), "{provider} brand");
-            assert_eq!(model_fg, Some(dim), "{provider} dim");
-        }
+        let provider_row = rows
+            .iter()
+            .find(|row| row_contains_token(row, "$quota_provider"))
+            .and_then(Value::as_array)
+            .unwrap();
+        let model_row = rows
+            .iter()
+            .find(|row| row_contains_token(row, "$quota_model"))
+            .and_then(Value::as_array)
+            .unwrap();
+        let provider_fg = provider_row
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_provider"))
+            .and_then(Value::as_inline_table)
+            .and_then(|table| table.get("fg"))
+            .and_then(Value::as_str);
+        let model_fg = model_row
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_model"))
+            .and_then(Value::as_inline_table)
+            .and_then(|table| table.get("fg"))
+            .and_then(Value::as_str);
+        assert_eq!(provider_fg, Some(IDLE_ICON_COLOR));
+        assert_eq!(model_fg, Some(IDLE_ICON_COLOR));
     }
 
     #[test]
@@ -2103,12 +2338,13 @@ rows = [["state_icon", "pane", "terminal_title_stripped"], ["agent", "$quota_ico
     }
 
     #[test]
-    fn migrates_old_quota_only_rows_and_restores_herdr_state_row() {
+    fn migrates_old_quota_only_rows_onto_the_group_layout() {
         let original = r#"[ui.sidebar.agents]
 rows = [["$quota_provider", "$quota_status"], ["$quota_summary"]]
 "#;
         let updated = add_quota_row(original).unwrap();
-        assert!(updated.contains("state_icon"));
+        assert!(updated.contains("$quota_group"));
+        assert!(updated.contains("$quota_icon"));
         assert!(updated.contains("$quota_provider"));
         assert!(updated.contains("$quota_5h"));
         assert!(updated.contains("$quota_week"));
@@ -2117,8 +2353,10 @@ rows = [["$quota_provider", "$quota_status"], ["$quota_summary"]]
 
     #[test]
     fn preserves_user_owned_provider_rows() {
+        // Unsafe shared rows force add_provider_rows; an unmarked claude
+        // entry must stay user-owned while managed copies land for the rest.
         let original = r#"[ui.sidebar.agents]
-rows = [["state_icon", "agent"]]
+rows = [["state_icon", "pane", "terminal_title_stripped"]]
 
 [ui.sidebar.agents.rows_by_agent]
 claude = [["state_icon", "agent"]]
@@ -2127,6 +2365,7 @@ claude = [["state_icon", "agent"]]
         assert!(updated.contains("claude = [[\"state_icon\", \"agent\"]]"));
         assert!(updated.contains("codex ="));
         assert!(updated.contains("opencode ="));
+        assert!(updated.contains("herdr-agent-quota-provider"));
         let skipped = rewrite_quota_sidebar(
             original,
             &AgentSelection::SUPPORTED,
@@ -2145,36 +2384,38 @@ claude = [["state_icon", "agent"]]
     }
 
     #[test]
-    fn applying_one_agent_writes_only_that_agents_row() {
+    fn applying_one_agent_installs_shared_rows_without_per_agent_brand() {
         let updated = add_quota_row_for(
             "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n",
             &[Harness::Grok],
             SidebarLayout::Packed,
         )
         .unwrap();
-        assert!(updated.contains("grok ="));
-        for other in ["claude =", "codex =", "agy =", "opencode ="] {
-            assert!(!updated.contains(other), "{other} was written: {updated}");
+        assert!(updated.contains("$quota_group"));
+        assert!(updated.contains("$quota_icon"));
+        assert!(updated.contains("herdr-agent-quota-row"));
+        assert!(!updated.contains("rows_by_agent"), "{updated}");
+        for agent_key in ["grok =", "claude =", "codex =", "agy =", "opencode ="] {
+            assert!(
+                !updated.contains(agent_key),
+                "{agent_key} was written: {updated}"
+            );
         }
     }
 
     #[test]
-    fn removing_one_agent_leaves_the_others_installed() {
+    fn removing_one_agent_leaves_shared_sidebar_installed() {
         let full =
             add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
+        assert!(!full.contains("rows_by_agent"), "{full}");
         let removed = remove_quota_row_for(&full, &[Harness::Grok], false).unwrap();
-        assert!(!removed.contains("grok ="), "grok survived: {removed}");
-        for harness in AgentSelection::SUPPORTED {
-            if harness == Harness::Grok {
-                continue;
-            }
-            let kept = format!("{} =", AgentSelection::harness_name(harness));
-            assert!(removed.contains(&kept), "{kept} was lost: {removed}");
-        }
-        // The shared parts belong to the installation, not to grok.
+        // Takeover installs no per-agent brand rows, so a partial uninstall
+        // has nothing agent-specific to drop — shared quota stays.
         assert!(removed.contains("rows = "));
+        assert!(removed.contains("$quota_icon"));
         assert!(removed.contains("row_gap"));
         assert!(removed.contains(REFRESH_ACTION));
+        assert!(!removed.contains("rows_by_agent"), "{removed}");
     }
 
     #[test]
@@ -2223,18 +2464,23 @@ opencode = [["state_icon", "agent"]]
     }
 
     #[test]
-    fn fresh_tree_gains_managed_opencode_rows() {
+    fn fresh_tree_installs_shared_rows_without_managed_opencode() {
         let updated =
             add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
-        assert!(updated.contains("opencode ="));
-        assert!(updated.contains("herdr-agent-quota-provider"));
+        assert!(updated.contains("$quota_group"));
+        assert!(updated.contains("herdr-agent-quota-row"));
+        assert!(!updated.contains("rows_by_agent"), "{updated}");
+        assert!(!updated.contains("opencode ="), "{updated}");
+        assert!(!updated.contains("herdr-agent-quota-provider"), "{updated}");
         let removed = remove_quota_row(&updated).unwrap();
         assert!(!removed.contains("opencode ="));
+        assert!(!removed.contains("$quota_"));
     }
 
     #[test]
     fn empty_sidebar_configuration_round_trips_to_empty() {
         let updated = add_quota_row("").unwrap();
+        assert!(updated.contains("agent_panel_sort = \"spaces\" # herdr-agent-quota"));
         assert_eq!(remove_quota_row(&updated).unwrap(), "");
         let stacked =
             add_quota_row_for("", &AgentSelection::SUPPORTED, SidebarLayout::Stacked).unwrap();
@@ -2250,6 +2496,21 @@ opencode = [["state_icon", "agent"]]
         .unwrap();
         assert!(flushed.contains("row_gap = 0 # herdr-agent-quota"));
         assert_eq!(remove_quota_row(&flushed).unwrap(), "");
+    }
+
+    #[test]
+    fn install_writes_spaces_panel_sort_unless_the_user_already_chose() {
+        let fresh = add_quota_row("").unwrap();
+        assert!(fresh.contains("agent_panel_sort = \"spaces\" # herdr-agent-quota"));
+        assert_eq!(add_quota_row(&fresh).unwrap(), fresh);
+
+        let user_priority = "[ui]\nagent_panel_sort = \"priority\"\n";
+        let kept = add_quota_row(user_priority).unwrap();
+        assert!(kept.contains("agent_panel_sort = \"priority\""));
+        assert!(!kept.contains("agent_panel_sort = \"spaces\""));
+
+        let removed = remove_quota_row(&fresh).unwrap();
+        assert!(!removed.contains("agent_panel_sort"));
     }
 
     #[test]
@@ -2480,7 +2741,7 @@ rows = [["lantern_status"], ["state_icon", "my_plugin_token"]]
         );
         let claude_fgs = provider_fg_colors(&updated, "claude");
         assert!(
-            !claude_fgs.iter().any(|fg| fg == "#e88461"),
+            !claude_fgs.iter().any(|fg| fg == "#d97757"),
             "brand hue survived brand-off: {claude_fgs:?}\n{updated}"
         );
     }
@@ -2704,20 +2965,27 @@ mod field_tests {
     }
 
     #[test]
-    fn hiding_every_field_keeps_only_the_official_row_and_the_error_token() {
+    fn hiding_every_field_keeps_group_icon_and_error_token() {
         let bare = applied(FieldSet::parse("none").unwrap(), BrandColors::On);
+        // Group furniture and the vendor mark are not optional: without them
+        // Space aggregation and logos disappear. The error token stays too —
+        // it is how a broken pane is reported.
+        assert!(bare.contains("$quota_group"), "{bare}");
+        assert!(bare.contains("$quota_icon"), "{bare}");
         assert!(bare.contains("state_icon"), "{bare}");
-        // The identity row is a field like any other: `none` means none of it.
-        assert!(!bare.contains("$quota_provider"), "{bare}");
-        // The error token is not optional: it is how a broken pane is reported.
+        assert!(!bare.contains("$quota_icon_working"), "{bare}");
+        assert!(!bare.contains("$quota_icon_done"), "{bare}");
+        assert!(!bare.contains("$quota_pad"), "{bare}");
         assert!(bare.contains("$quota_error"), "{bare}");
+        assert!(!bare.contains("$quota_provider"), "{bare}");
         for token in ["$quota_topic", "$quota_context", "$quota_5h", "$quota_week"] {
             assert!(!bare.contains(token), "{token} survived:\n{}", rows(&bare));
         }
     }
 
     /// Without brand hues, plugin-managed shared rows already carry quota, so
-    /// per-agent copies would be identical and are omitted.
+    /// per-agent copies would be identical and are omitted — brand-on and
+    /// brand-off both write shared rows only.
     #[test]
     fn brand_colours_off_writes_no_per_agent_rows() {
         let plain = applied(FieldSet::all(), BrandColors::Off);
@@ -2725,20 +2993,29 @@ mod field_tests {
         // Severity colours are information, not decoration: they stay.
         assert!(plain.contains(QUOTA_DANGER_COLOR), "{plain}");
         let branded = applied(FieldSet::all(), BrandColors::On);
-        assert!(branded.contains("rows_by_agent"), "{branded}");
+        assert!(!branded.contains("rows_by_agent"), "{branded}");
+        assert_eq!(plain, branded);
     }
 
     #[test]
-    fn omp_uses_the_previous_opencode_violet_and_opencode_is_neutral() {
-        let branded = applied(FieldSet::all(), BrandColors::On);
-        let omp = branded.split("omp =").nth(1).expect("omp row");
-        assert!(omp.lines().next().unwrap_or_default().contains("#bba3e8"));
-        let opencode = branded.split("opencode =").nth(1).expect("opencode row");
-        assert!(!opencode
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .contains("#bba3e8"));
+    fn idle_identity_uses_ink_white_on_shared_rows() {
+        let installed = applied(FieldSet::all(), BrandColors::On);
+        assert!(!installed.contains("rows_by_agent"), "{installed}");
+        let document = installed.parse::<DocumentMut>().unwrap();
+        let rows = document["ui"]["sidebar"]["agents"]["rows"]
+            .as_array()
+            .unwrap();
+        for token in ["$quota_icon", "$quota_provider_model"] {
+            let fg = rows
+                .iter()
+                .filter_map(Value::as_array)
+                .flat_map(Array::iter)
+                .find(|item| configured_token_name(item) == Some(token))
+                .and_then(Value::as_inline_table)
+                .and_then(|table| table.get("fg"))
+                .and_then(Value::as_str);
+            assert_eq!(fg, Some(IDLE_ICON_COLOR), "{token}");
+        }
     }
 
     /// Switching brand colours off and back on must land exactly where it

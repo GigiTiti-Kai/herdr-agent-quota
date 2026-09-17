@@ -10,7 +10,7 @@
 #   ./install.sh --quota-percent used
 #   ./install.sh --fields topic,model,context,5h,7d
 #   ./install.sh --brand-colors off
-#   ./install.sh --agent-order quota
+#   ./install.sh --agent-order default
 #   ./install.sh --low-quota-alert 10
 #
 # --agent installs only the agents you name (all, claude, codex, grok, agy,
@@ -27,16 +27,18 @@
 # --quota-percent remaining (default) shows how much quota is left; used shows
 # how much has been consumed. The colour always follows what is left.
 #
-# --fields picks the quota fields the sidebar shows: all (default), none, or a
-# comma-separated list of provider, topic, model, cache, ttl, context, 5h, 7d, 30d.
-# The error token is always shown.
+# --fields picks the quota fields the sidebar shows: all, none, or a
+# comma-separated list of provider, topic, model, cache, ttl, context, 5h, 7d,
+# 30d. Default is provider, topic, model, context, 5h, 7d, 30d (cache and TTL
+# off). The error token is always shown.
 #
 # --brand-colors on (default) tints provider and model with each agent's hue;
 # off leaves them in the sidebar's own text colour. Severity colours stay.
 #
-# --agent-order default (default) leaves Herdr's own agent panel ordering
-# alone. quota asks Herdr to put the agent with the least quota left at the
-# top; it replaces the panel's sort until it is set back to default.
+# --agent-order quota (default) keeps each Space contiguous and ranks by
+# least quota left inside the space; it replaces the panel's sort until it
+# is set back to default. default leaves Herdr's own agent panel ordering
+# alone (also Space-grouped unless the user set priority).
 #
 # --low-quota-alert off (default) never notifies. A percentage notifies once,
 # per provider, when its remaining quota falls to that number or below, and

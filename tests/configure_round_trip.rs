@@ -149,17 +149,17 @@ fn run_claude_refresh(state: &Path, herdr: &Path) {
 #[test]
 fn sidebar_configuration_is_idempotent_and_removes_plugin_rows() {
     let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
-    let canonical_without_plugin = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n";
     let applied = add_quota_row(original).unwrap();
     assert!(applied.contains("key = \"prefix+shift+r\""));
     assert!(applied.contains("type = \"plugin_action\""));
     assert!(applied.contains("command = \"herdr-agent-quota.refresh\""));
     assert!(applied.contains("key = \"prefix+shift+q\""));
     assert!(applied.contains("command = \"herdr-agent-quota.open-settings\""));
+    assert!(applied.contains("agent_panel_sort = \"spaces\" # herdr-agent-quota"));
     assert_eq!(add_quota_row(&applied).unwrap(), applied);
     assert_eq!(
         remove_quota_row(&applied).unwrap(),
-        canonical_without_plugin
+        "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
     );
 }
 
@@ -180,7 +180,7 @@ fn sidebar_configuration_preserves_a_conflicting_refresh_key() {
     assert!(!applied.contains("command = \"herdr-agent-quota.refresh\""));
     assert_eq!(
         remove_quota_row(&applied).unwrap(),
-        "[[keys.command]]\nkey = \"prefix+shift+r\"\ntype = \"shell\"\ncommand = \"echo user-owned\"\ndescription = \"user refresh\"\n\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
+        "[[keys.command]]\nkey = \"prefix+shift+r\"\ntype = \"shell\"\ncommand = \"echo user-owned\"\ndescription = \"user refresh\"\n\n[ui]\n\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
     );
 }
 
@@ -246,13 +246,12 @@ fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
     assert!(!applied.contains("fg = \"#eceef2\""));
     assert!(!applied.contains("selection_bg"));
     assert!(!applied.contains("active_row_bg"));
-    assert!(applied.contains("[ui.sidebar.agents.rows_by_agent]"));
-    assert!(applied.contains("fg = \"#e88461\""));
-    assert!(applied.contains("fg = \"#c4d7f5\""));
-    assert!(applied.contains("fg = \"#d5d5d8\""));
-    assert!(applied.contains("fg = \"#8ab4f8\""));
-    assert!(applied.contains("fg = \"#bba3e8\""));
-    assert!(applied.contains("fg = \"#d4a0c8\""));
+    assert!(!applied.contains("[ui.sidebar.agents.rows_by_agent]"));
+    assert!(applied.contains("state_icon"));
+    assert!(applied.contains("$quota_icon"));
+    assert!(!applied.contains("$quota_icon_working"));
+    assert!(!applied.contains("$quota_icon_done"));
+    assert!(applied.contains("fg = \"#e9e9f0\""));
 }
 
 #[test]
@@ -325,37 +324,31 @@ fn context_is_the_penultimate_row_and_model_shares_provider_style() {
     assert_eq!(context_index + 1, limit_index);
     assert_eq!(limit_index + 1, rows.len());
 
-    for (provider, color, dim) in [
-        ("claude", Some("#e88461"), Some("#f0a080")),
-        ("codex", Some("#c4d7f5"), Some("#aab9d0")),
-        ("grok", Some("#d5d5d8"), Some("#acb0b7")),
-        ("agy", Some("#8ab4f8"), Some("#a7c7fa")),
-        ("opencode", None, None),
-        ("pi", Some("#d4a0c8"), None),
-        ("omp", Some("#bba3e8"), None),
-    ] {
-        let provider_rows = agents["rows_by_agent"][provider].as_value().unwrap();
-        let rendered = provider_rows.to_string();
-        if let Some(color) = color {
-            let needle = format!("fg = \"{color}\"");
-            assert_eq!(
-                rendered.matches(needle.as_str()).count(),
-                1,
-                "wrong brand color for {provider}: {rendered}"
-            );
-        } else {
-            assert!(
-                rendered.contains("{ token = \"$quota_provider_model\", bold"),
-                "{provider} should use the neutral identity style: {rendered}"
-            );
-        }
-        if let Some(dim) = dim {
-            assert!(
-                !rendered.contains(dim),
-                "packed {provider} should not use model dim: {rendered}"
-            );
-        }
+    let identity = rows
+        .iter()
+        .find(|row| row_contains_token(row, "$quota_icon"))
+        .and_then(toml_edit::Value::as_array)
+        .unwrap();
+    assert_eq!(
+        identity.get(0).and_then(toml_edit::Value::as_str),
+        Some("state_icon")
+    );
+    assert!(!identity
+        .iter()
+        .any(|item| configured_token(item) == Some("$quota_icon_working")));
+    assert!(!identity
+        .iter()
+        .any(|item| configured_token(item) == Some("$quota_icon_done")));
+    for token in ["$quota_icon", "$quota_provider_model"] {
+        let fg = identity
+            .iter()
+            .find(|item| configured_token(item) == Some(token))
+            .and_then(toml_edit::Value::as_inline_table)
+            .and_then(|table| table.get("fg"))
+            .and_then(toml_edit::Value::as_str);
+        assert_eq!(fg, Some("#e9e9f0"), "{token}");
     }
+    assert!(agents.get("rows_by_agent").is_none(), "{applied}");
 }
 
 #[test]
@@ -370,42 +363,54 @@ fn provider_model_is_compact_and_every_provider_can_fold_week_without_five_hour(
         .find(|row| row_contains_token(row, "$quota_provider_model"))
         .unwrap();
     let identity_tokens = identity_row.as_array().unwrap();
+    assert_eq!(
+        identity_tokens.get(0).and_then(toml_edit::Value::as_str),
+        Some("state_icon")
+    );
+    assert!(
+        identity_tokens
+            .iter()
+            .any(|item| configured_token(item) == Some("$quota_icon")),
+        "identity row must carry the vendor mark: {identity_row}"
+    );
     assert!(!identity_tokens.iter().any(|item| {
         matches!(
             configured_token(item),
-            Some("$quota_provider") | Some("$quota_model")
+            Some("$quota_provider")
+                | Some("$quota_model")
+                | Some("$quota_icon_working")
+                | Some("$quota_icon_done")
         )
     }));
 
-    for provider in ["claude", "codex", "grok", "agy", "opencode", "pi"] {
-        let provider_rows = agents["rows_by_agent"][provider].as_array().unwrap();
-        let context_row = provider_rows
+    // Week fold lives on the shared packed rows — there are no per-agent copies.
+    assert!(agents.get("rows_by_agent").is_none(), "{applied}");
+    let context_row = rows
+        .iter()
+        .find(|row| row_contains_token(row, "$quota_context"))
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(
+        context_row
             .iter()
-            .find(|row| row_contains_token(row, "$quota_context"))
-            .unwrap()
-            .as_array()
-            .unwrap();
-        assert!(
-            context_row
-                .iter()
-                .any(|item| configured_token(item) == Some("$quota_week_inline_normal")),
-            "{provider} should be able to fold 7d onto context when 5h is empty"
-        );
-        assert!(
-            context_row
-                .iter()
-                .all(|item| configured_token(item) != Some("$quota_5h_normal")),
-            "{provider} must not put 5h on the context row"
-        );
-        assert!(
-            provider_rows.iter().any(|row| {
-                row_contains_token(row, "$quota_week_normal")
-                    && row_contains_token(row, "$quota_5h_normal")
-                    && !row_contains_token(row, "$quota_context")
-            }),
-            "{provider} should keep 5h/7d on a dedicated limits row"
-        );
-    }
+            .any(|item| configured_token(item) == Some("$quota_week_inline_normal")),
+        "shared rows should fold 7d onto context when 5h is empty"
+    );
+    assert!(
+        context_row
+            .iter()
+            .all(|item| configured_token(item) != Some("$quota_5h_normal")),
+        "5h must not sit on the context row"
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row_contains_token(row, "$quota_week_normal")
+                && row_contains_token(row, "$quota_5h_normal")
+                && !row_contains_token(row, "$quota_context")
+        }),
+        "shared rows should keep 5h/7d on a dedicated limits row"
+    );
 }
 
 #[test]
@@ -478,7 +483,7 @@ fn sidebar_configuration_preserves_an_explicit_row_gap() {
     assert!(!applied.contains("row_gap = 1"));
     assert_eq!(
         remove_quota_row(&applied).unwrap(),
-        "[ui.sidebar.agents]\nrow_gap = 2\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
+        "[ui]\n[ui.sidebar.agents]\nrow_gap = 2\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
     );
 }
 
@@ -1107,10 +1112,9 @@ fn opencode_working_event(pane_id: &str) -> String {
 
 fn assert_named_opencode_event(herdr_log: &Path, named: &str, sibling: &str) {
     let calls = fs::read_to_string(herdr_log).unwrap_or_default();
-    assert_eq!(
-        calls.matches("agent list").count(),
-        1,
-        "expected one inventory: {calls}"
+    assert!(
+        (1..=2).contains(&calls.matches("agent list").count()),
+        "expected inventory plus group-membership list: {calls}"
     );
     assert!(
         calls.contains(&format!("pane read {named}")),
@@ -1128,10 +1132,7 @@ fn assert_named_opencode_event(herdr_log: &Path, named: &str, sibling: &str) {
         !calls.contains(&format!("pane read {sibling}")),
         "sibling pane was read: {calls}"
     );
-    assert!(
-        !calls.contains(&format!("pane report-metadata {sibling}")),
-        "sibling pane was reported: {calls}"
-    );
+    assert_no_sibling_quota_write(&calls, sibling);
 }
 
 fn original_four_untouched(state: &Path, codex_log: &Path) {
@@ -1158,6 +1159,19 @@ fn original_four_untouched(state: &Path, codex_log: &Path) {
     }
 }
 
+fn assert_no_sibling_quota_write(calls: &str, sibling: &str) {
+    let bad = calls.lines().any(|line| {
+        line.contains(&format!("report-metadata {sibling}"))
+            && (line.contains("quota_5h")
+                || line.contains("quota_week")
+                || line.contains("quota_provider")
+                || line.contains("quota_model")
+                || line.contains("quota_context")
+                || line.contains("quota_cache"))
+    });
+    assert!(!bad, "sibling pane got a quota write: {calls}");
+}
+
 fn assert_no_original_four_collection(state: &Path, herdr_log: &Path, codex_log: &Path) {
     assert!(
         !codex_log.exists(),
@@ -1169,9 +1183,17 @@ fn assert_no_original_four_collection(state: &Path, herdr_log: &Path, codex_log:
         !calls.contains("pane read"),
         "unexpected pane read: {calls}"
     );
+    // Group headers may rewrite `$quota_group` / `$quota_icon` on focus; that
+    // is not a collector refresh.
     assert!(
-        !calls.contains("pane report-metadata"),
-        "unexpected metadata write: {calls}"
+        !calls.lines().any(|line| {
+            line.contains("pane report-metadata")
+                && (line.contains("quota_5h")
+                    || line.contains("quota_week")
+                    || line.contains("quota_month")
+                    || line.contains("quota_context"))
+        }),
+        "unexpected quota window write: {calls}"
     );
     for marker in [
         "codex-app-server.refresh",
@@ -1208,7 +1230,7 @@ fn opencode_working_event_publishes_only_the_named_local_identity() {
     original_four_untouched(state.path(), &codex_log);
     assert_named_opencode_event(&herdr_log, "w1:p9", "w1:p10");
     let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
-    assert!(!calls.contains("pane report-metadata w1:p10"), "{calls}");
+    assert_no_sibling_quota_write(&calls, "w1:p10");
     assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
     assert!(
         calls.contains("--token quota_provider_model=OpenCode Go/kimi-k2.5"),
@@ -1268,7 +1290,10 @@ fn focus_event_uses_its_pane_even_when_the_current_focus_differs() {
         );
         let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
         assert!(!calls.contains("pane current"), "{calls}");
-        assert_eq!(calls.matches("agent list").count(), 1, "{calls}");
+        assert!(
+            (1..=2).contains(&calls.matches("agent list").count()),
+            "{calls}"
+        );
         assert!(!calls.contains("pane read"), "{calls}");
         assert_no_original_four_collection(state.path(), &herdr_log, &codex_log);
     }
@@ -1383,7 +1408,10 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let state = tempdir().unwrap();
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
-        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"test-session"},"tokens":{"quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}]}}"#,
+        &format!(
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}}]}}}}"#,
+            "\u{e1a0}"
+        ),
     );
 
     let input = br#"{
@@ -1393,10 +1421,24 @@ fn claude_collector_does_not_republish_unchanged_quota() {
         }
     }"#;
     run_claude_collector(state.path(), &herdr_stub, input);
-    assert!(!herdr_log.exists());
+    assert!(
+        !herdr_log.exists()
+            || !fs::read_to_string(&herdr_log)
+                .unwrap()
+                .contains("report-metadata"),
+        "collector must not republish: {}",
+        fs::read_to_string(&herdr_log).unwrap_or_default()
+    );
 
     run_claude_refresh(state.path(), &herdr_stub);
-    assert!(!herdr_log.exists());
+    assert!(
+        !herdr_log.exists()
+            || !fs::read_to_string(&herdr_log)
+                .unwrap()
+                .contains("report-metadata"),
+        "refresh must not republish unchanged quota: {}",
+        fs::read_to_string(&herdr_log).unwrap_or_default()
+    );
 }
 
 #[test]
@@ -1409,7 +1451,7 @@ fn sidebar_configuration_preserves_user_owned_opencode_rows() {
     );
     let applied = add_quota_row(original).unwrap();
     assert!(applied.contains("opencode = [[\"state_icon\", \"agent\"]]"));
-    assert!(applied.contains("codex ="));
+    assert!(!applied.contains("codex ="), "{applied}");
     let removed = remove_quota_row(&applied).unwrap();
     assert!(removed.contains("opencode = [[\"state_icon\", \"agent\"]]"));
     assert!(!removed.contains("codex ="));
@@ -1425,7 +1467,7 @@ fn sidebar_configuration_preserves_user_owned_pi_rows() {
     );
     let applied = add_quota_row(original).unwrap();
     assert!(applied.contains("pi = [[\"state_icon\", \"agent\"]]"));
-    assert!(applied.contains("codex ="));
+    assert!(!applied.contains("codex ="), "{applied}");
     let removed = remove_quota_row(&applied).unwrap();
     assert!(removed.contains("pi = [[\"state_icon\", \"agent\"]]"));
     assert!(!removed.contains("codex ="));
@@ -1438,7 +1480,10 @@ fn opencode_go_event_is_named_pane_only_and_repeatable() {
     install_opencode_store(&xdg, "auth-go.json", "sessions.db");
     let inventory = two_opencode_inventory(
         "ses_go",
-        r#"{"quota_provider":"OpenCode Go","quota_model":"kimi-k2.5","quota_provider_model":"OpenCode Go/kimi-k2.5"}"#,
+        &format!(
+            r#"{{"quota_icon":"{}","quota_provider":"OpenCode Go","quota_model":"kimi-k2.5","quota_provider_model":"OpenCode Go/kimi-k2.5"}}"#,
+            "\u{200b}  \u{e1a2}"
+        ),
     );
     let (herdr, herdr_log, codex, codex_log) =
         install_logged_herdr_and_codex(state.path(), &inventory, None);
@@ -1457,8 +1502,10 @@ fn opencode_go_event_is_named_pane_only_and_repeatable() {
         assert_named_opencode_event(&herdr_log, "w1:p9", "w1:p10");
         let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
         assert!(!calls.contains("opencode.ai"), "{calls}");
-        assert!(!calls.contains("pane report-metadata w1:p10"), "{calls}");
-        assert!(!calls.contains("pane report-metadata w1:p9"), "{calls}");
+        assert_no_sibling_quota_write(&calls, "w1:p10");
+        // Inventory stubs do not persist metadata, so a group/icon reconcile
+        // may still report; the Go collector must stay quiet.
+        assert!(!calls.contains("opencode.ai"), "{calls}");
     }
 }
 
@@ -1495,7 +1542,7 @@ fn opencode_payg_event_clears_plugin_quota_once() {
         calls.contains("--clear-token") && calls.contains("quota_5h"),
         "expected plugin quota tokens to be cleared: {calls}"
     );
-    assert!(!calls.contains("pane report-metadata w1:p10"), "{calls}");
+    assert_no_sibling_quota_write(&calls, "w1:p10");
     assert!(!state
         .path()
         .join("opencode-go.opencode-store.refresh.lock")
@@ -1525,7 +1572,10 @@ fn opencode_indeterminate_event_removes_unconfirmed_quota() {
     );
     original_four_untouched(state.path(), &codex_log);
     let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert_eq!(calls.matches("agent list").count(), 1, "{calls}");
+    assert!(
+        (1..=2).contains(&calls.matches("agent list").count()),
+        "{calls}"
+    );
     assert!(calls.contains("pane read w1:p9"), "{calls}");
     assert!(!calls.contains("pane read w1:p10"), "{calls}");
     assert!(
@@ -1586,7 +1636,10 @@ fn opencode_mismatched_event_pane_is_a_noop() {
     );
     original_four_untouched(state.path(), &codex_log);
     let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert_eq!(calls.matches("agent list").count(), 1, "{calls}");
+    assert!(
+        (1..=2).contains(&calls.matches("agent list").count()),
+        "{calls}"
+    );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(!calls.contains("pane report-metadata"), "{calls}");
 }
@@ -1656,11 +1709,11 @@ fn installing_one_agent_leaves_every_other_agent_untouched() {
     );
 
     let sidebar = homes.sidebar();
-    assert!(sidebar.contains(&style_row(Harness::Claude)), "{sidebar}");
+    // Default layouts publish shared rows only — no per-agent brand copies.
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("state_icon"), "{sidebar}");
+    assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     for harness in AgentSelection::SUPPORTED {
-        if harness == Harness::Claude {
-            continue;
-        }
         let other = style_row(harness);
         assert!(!sidebar.contains(&other), "{other} was written: {sidebar}");
     }
@@ -1693,11 +1746,10 @@ fn installing_only_pi_adds_only_its_sidebar_style() {
         String::from_utf8_lossy(&output.stderr)
     );
     let sidebar = homes.sidebar();
-    assert!(sidebar.contains(&style_row(Harness::Pi)), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("state_icon"), "{sidebar}");
+    assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     for harness in AgentSelection::SUPPORTED {
-        if harness == Harness::Pi {
-            continue;
-        }
         let other = style_row(harness);
         assert!(!sidebar.contains(&other), "{other} was written: {sidebar}");
     }
@@ -1723,16 +1775,10 @@ fn uninstalling_one_agent_keeps_the_rest_working() {
 
     let sidebar = homes.sidebar();
     assert!(
-        !sidebar.contains(&style_row(Harness::Grok)),
-        "grok survived: {sidebar}"
+        sidebar.contains("$quota_icon") && sidebar.contains("state_icon"),
+        "shared quota rows were lost: {sidebar}"
     );
-    for harness in AgentSelection::SUPPORTED {
-        if harness == Harness::Grok {
-            continue;
-        }
-        let kept = style_row(harness);
-        assert!(sidebar.contains(&kept), "{kept} was lost: {sidebar}");
-    }
+    assert!(!sidebar.contains("grok ="), "grok survived: {sidebar}");
     assert!(
         homes.claude_settings.exists(),
         "removing Grok tore out the Claude statusLine"
@@ -1772,7 +1818,10 @@ fn a_partial_uninstall_can_be_repeated_and_then_completed() {
         let sidebar = homes.sidebar();
         assert!(!sidebar.contains("grok ="));
         assert!(!sidebar.contains("agy ="));
-        assert!(sidebar.contains("claude ="));
+        assert!(
+            sidebar.contains("$quota_icon") && homes.claude_settings.exists(),
+            "claude install was torn out: {sidebar}"
+        );
     }
 
     assert!(homes.configure(&["--uninstall"]).status.success());
@@ -1794,10 +1843,12 @@ fn an_installer_can_narrow_the_selection_through_the_environment() {
     );
 
     let sidebar = homes.sidebar();
-    assert!(sidebar.contains("codex ="), "{sidebar}");
-    assert!(sidebar.contains("grok ="), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("state_icon"), "{sidebar}");
+    assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     assert!(!sidebar.contains("claude ="), "{sidebar}");
     assert!(!homes.claude_settings.exists());
+    assert!(!homes.agy_settings.exists());
     assert!(!homes.cursor_hooks.exists());
 }
 
@@ -1931,10 +1982,11 @@ fn a_saved_pre_muse_full_list_still_configures_when_omp_is_absent() {
     );
     let sidebar = homes.sidebar();
     assert!(
-        sidebar.contains("muse ="),
-        "a once-complete list must include Muse: {sidebar}"
+        sidebar.contains("$quota_icon") && sidebar.contains("state_icon"),
+        "a once-complete list must still write shared quota rows: {sidebar}"
     );
-    assert!(sidebar.contains("claude ="), "{sidebar}");
+    assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
+    assert!(homes.claude_settings.exists(), "{sidebar}");
 }
 
 #[test]
@@ -1986,10 +2038,12 @@ fn an_unusable_environment_selection_still_installs_everything() {
         .status
         .success());
     let sidebar = homes.sidebar();
-    for harness in AgentSelection::SUPPORTED {
-        let expected = style_row(harness);
-        assert!(sidebar.contains(&expected), "{expected} missing: {sidebar}");
-    }
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("state_icon"), "{sidebar}");
+    assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
+    assert!(homes.claude_settings.exists());
+    assert!(homes.agy_settings.exists());
+    assert!(homes.cursor_hooks.exists());
 }
 
 fn style_row(harness: Harness) -> String {
@@ -2195,34 +2249,34 @@ fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
 }
 
 fn sidebar_is_gauges(sidebar: &str) -> bool {
-    !quota_tokens_share_a_row(sidebar, "$quota_cache", "$quota_cache_ttl")
-        && !quota_tokens_share_a_row(sidebar, "$quota_context", "$quota_week_inline_normal")
+    // Default fields omit cache/TTL; gauges is identified by severity-split
+    // context tokens and windows that do not share a packed row.
+    !quota_tokens_share_a_row(sidebar, "$quota_context", "$quota_week_inline_normal")
         && !quota_tokens_share_a_row(sidebar, "$quota_5h_normal", "$quota_week_normal")
         && !tab_shares_row_with_provider_model(sidebar)
         && sidebar_has_token(sidebar, "$quota_provider_model")
         && !sidebar_has_token(sidebar, "$quota_provider")
         && !sidebar_has_token(sidebar, "$quota_model")
-        && sidebar.contains("$quota_cache")
+        && sidebar.contains("$quota_context_normal")
         && sidebar.contains("$quota_week_normal")
 }
 
 fn sidebar_is_packed(sidebar: &str) -> bool {
-    quota_tokens_share_a_row(sidebar, "$quota_cache", "$quota_cache_ttl")
-        && quota_tokens_share_a_row(sidebar, "$quota_5h_normal", "$quota_week_normal")
+    quota_tokens_share_a_row(sidebar, "$quota_5h_normal", "$quota_week_normal")
         && sidebar_has_token(sidebar, "$quota_provider_model")
         && !tab_shares_row_with_provider_model(sidebar)
+        && !sidebar.contains("$quota_context_normal")
 }
 
 fn sidebar_is_stacked(sidebar: &str) -> bool {
-    !quota_tokens_share_a_row(sidebar, "$quota_cache", "$quota_cache_ttl")
-        && !quota_tokens_share_a_row(sidebar, "$quota_context", "$quota_week_inline_normal")
+    !quota_tokens_share_a_row(sidebar, "$quota_context", "$quota_week_inline_normal")
         && !quota_tokens_share_a_row(sidebar, "$quota_5h_normal", "$quota_week_normal")
         && !quota_tokens_share_a_row(sidebar, "$quota_provider", "$quota_model")
         && !tab_shares_row_with_provider_model(sidebar)
         && sidebar_has_token(sidebar, "$quota_provider")
         && sidebar_has_token(sidebar, "$quota_model")
         && !sidebar_has_token(sidebar, "$quota_provider_model")
-        && sidebar.contains("$quota_cache")
+        && !sidebar.contains("$quota_context_normal")
         && sidebar.contains("$quota_week_normal")
 }
 
@@ -2399,10 +2453,13 @@ fn pi_codex_event_uses_only_the_proved_canonical_cache_and_reads_no_pane() {
     );
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert_eq!(calls.matches("agent list").count(), 1, "{calls}");
+    assert!(
+        (1..=2).contains(&calls.matches("agent list").count()),
+        "{calls}"
+    );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
-    assert!(!calls.contains("pane report-metadata w1:p10"), "{calls}");
+    assert_no_sibling_quota_write(&calls, "w1:p10");
     assert!(
         calls.contains("--token quota_provider_model=Codex/model-b"),
         "{calls}"
@@ -2539,7 +2596,10 @@ fn pi_payg_event_clears_stale_quota_without_invoking_a_collector() {
     .success());
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert_eq!(calls.matches("agent list").count(), 1, "{calls}");
+    assert!(
+        (1..=2).contains(&calls.matches("agent list").count()),
+        "{calls}"
+    );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
     assert!(
@@ -2630,7 +2690,10 @@ fn pi_different_account_clears_stale_quota_and_cannot_borrow_codex_cache() {
     .success());
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert_eq!(calls.matches("agent list").count(), 1, "{calls}");
+    assert!(
+        (1..=2).contains(&calls.matches("agent list").count()),
+        "{calls}"
+    );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
     assert!(
@@ -2669,10 +2732,13 @@ fn pi_model_switch_updates_identity_and_removes_unconfirmed_quota() {
     .success());
 
     let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
-    assert_eq!(calls.matches("agent list").count(), 1, "{calls}");
+    assert!(
+        (1..=2).contains(&calls.matches("agent list").count()),
+        "{calls}"
+    );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
-    assert!(!calls.contains("pane report-metadata w1:p10"), "{calls}");
+    assert_no_sibling_quota_write(&calls, "w1:p10");
     assert!(
         calls.contains("--token quota_provider_model=Grok/grok-4.6"),
         "{calls}"

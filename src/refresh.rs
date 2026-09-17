@@ -519,12 +519,15 @@ fn publish_row(cache: &CacheStore) -> RowStyle {
     }
 }
 
-/// Muse/Cursor session summaries are the last submitted prompt, the same
+/// Muse last prompt and Cursor/Grok generated session titles are the same
 /// evidence other harnesses read off the screen, so they are also that pane's
-/// topic.
+/// topic. Codex keeps a screen topic and stores the thread preview separately.
 fn apply_session_summary(pane: &mut AgentPane, summary: &str) {
     pane.session_summary = summary.to_string();
-    if matches!(pane.harness, Harness::Muse | Harness::Cursor) {
+    if matches!(
+        pane.harness,
+        Harness::Muse | Harness::Cursor | Harness::Grok
+    ) {
         pane.topic = summary.to_string();
     }
 }
@@ -1359,16 +1362,18 @@ mod tests {
     fn test_pane(id: &str, harness: Harness) -> AgentPane {
         AgentPane {
             pane_id: id.to_string(),
+            workspace_id: "w1".to_string(),
             harness,
             session: None,
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            working: false,
         }
     }
 
     #[test]
-    fn muse_and_cursor_session_summaries_replace_the_topic() {
+    fn muse_cursor_and_grok_session_summaries_replace_the_topic() {
         let mut muse = test_pane("w1:p1", Harness::Muse);
         muse.topic = "old prompt".to_string();
         apply_session_summary(&mut muse, "new prompt");
@@ -1379,6 +1384,11 @@ mod tests {
         cursor.topic = "old prompt".to_string();
         apply_session_summary(&mut cursor, "hi");
         assert_eq!(cursor.topic, "hi");
+
+        let mut grok = test_pane("w1:p4", Harness::Grok);
+        grok.topic = "old prompt".to_string();
+        apply_session_summary(&mut grok, "Chat honesty: unsupported answers");
+        assert_eq!(grok.topic, "Chat honesty: unsupported answers");
 
         let mut codex = test_pane("w1:p2", Harness::Codex);
         codex.topic = "screen topic".to_string();

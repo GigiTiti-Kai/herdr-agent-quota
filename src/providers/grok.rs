@@ -16,6 +16,7 @@ use std::time::Duration;
 const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const GROK_SESSION_TAIL_BYTES: u64 = 128 * 1024;
 const MAX_LOCAL_SESSIONS: usize = 128;
+const MAX_SUMMARY_CHARS: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokCredentials {
@@ -224,7 +225,9 @@ pub fn parse_billing_response(
 /// Read the small, provider-owned session metadata files that Grok writes
 /// locally. Billing remains the quota source; these files only supplement the
 /// pane diagnostics that billing does not contain. The scan is bounded to the
-/// newest session directories and never reads Herdr panes or prompt text.
+/// newest session directories and never reads Herdr panes or chat history.
+/// `summary.json` `generated_title` (else `session_summary`) is the sidebar
+/// topic so a follow-up that has scrolled off the pane still has a name.
 fn enrich_local_sessions(snapshot: &mut ProviderSnapshot, session_ids: &[String]) {
     let Some(home) = grok_home().ok() else {
         return;
@@ -258,6 +261,11 @@ fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, sessio
             snapshot
                 .session_models
                 .insert(session_id.to_string(), model);
+        }
+        if let Some(summary) = observation.summary.clone() {
+            snapshot
+                .session_summaries
+                .insert(session_id.to_string(), summary);
         }
         let Some(context) = observation.context else {
             continue;
@@ -393,7 +401,8 @@ fn alias_missing_diagnostics_from_active_siblings(
     for requested in session_ids {
         let needs_context = !snapshot.session_contexts.contains_key(requested);
         let needs_model = !snapshot.session_models.contains_key(requested);
-        if !needs_context && !needs_model {
+        let needs_summary = !snapshot.session_summaries.contains_key(requested);
+        if !needs_context && !needs_model && !needs_summary {
             continue;
         }
         let Some(pid) = active
@@ -424,6 +433,17 @@ fn alias_missing_diagnostics_from_active_siblings(
                 .cloned()
             {
                 snapshot.session_models.insert(requested.clone(), model);
+            }
+        }
+        if needs_summary {
+            if let Some(summary) = donors
+                .iter()
+                .find_map(|id| snapshot.session_summaries.get(*id))
+                .cloned()
+            {
+                snapshot
+                    .session_summaries
+                    .insert(requested.clone(), summary);
             }
         }
     }
@@ -468,11 +488,13 @@ fn session_dir_mtime(session_dir: &Path) -> Option<u64> {
 struct LocalSessionObservation {
     model: Option<String>,
     context: Option<ContextUsage>,
+    summary: Option<String>,
 }
 
 fn observe_session_dir(session_dir: &Path, session_id: &str) -> Option<LocalSessionObservation> {
     let updates = read_jsonl_tail(&session_dir.join("updates.jsonl"));
     let usage = read_json(&session_dir.join("usage.json")).ok();
+    let summary_json = read_json(&session_dir.join("summary.json")).ok();
     let mut observation = read_json(&session_dir.join("signals.json"))
         .ok()
         .and_then(|signals| {
@@ -482,23 +504,36 @@ fn observe_session_dir(session_dir: &Path, session_id: &str) -> Option<LocalSess
         .as_ref()
         .is_none_or(|observation| observation.model.is_none())
     {
-        if let Some(model) = read_json(&session_dir.join("summary.json"))
-            .ok()
-            .as_ref()
-            .and_then(parse_summary_model)
-        {
+        if let Some(model) = summary_json.as_ref().and_then(parse_summary_model) {
             match &mut observation {
                 Some(observation) => observation.model = Some(model),
                 None => {
                     observation = Some(LocalSessionObservation {
                         model: Some(model),
                         context: None,
+                        summary: None,
                     });
                 }
             }
         }
     }
-    observation.filter(|observation| observation.model.is_some() || observation.context.is_some())
+    if let Some(summary) = summary_json.as_ref().and_then(parse_summary_title) {
+        match &mut observation {
+            Some(observation) => observation.summary = Some(summary),
+            None => {
+                observation = Some(LocalSessionObservation {
+                    model: None,
+                    context: None,
+                    summary: Some(summary),
+                });
+            }
+        }
+    }
+    observation.filter(|observation| {
+        observation.model.is_some()
+            || observation.context.is_some()
+            || observation.summary.is_some()
+    })
 }
 
 fn parse_summary_model(summary: &Value) -> Option<String> {
@@ -509,6 +544,19 @@ fn parse_summary_model(summary: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(str::to_string)
+}
+
+fn parse_summary_title(summary: &Value) -> Option<String> {
+    summary_text(summary.get("generated_title"))
+        .or_else(|| summary_text(summary.get("session_summary")))
+        .map(|title| title.chars().take(MAX_SUMMARY_CHARS).collect())
+}
+
+fn summary_text(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }
 
 fn parse_local_session(
@@ -553,7 +601,11 @@ fn parse_local_session(
     let context = used
         .and_then(|used| ContextUsage::new(used.clamp(0.0, 100.0)).ok())
         .map(|context| context.with_cache(cache));
-    (model.is_some() || context.is_some()).then_some(LocalSessionObservation { model, context })
+    (model.is_some() || context.is_some()).then_some(LocalSessionObservation {
+        model,
+        context,
+        summary: None,
+    })
 }
 
 /// Session-level cache totals from `usage.json`. Grok writes this file during
@@ -947,6 +999,54 @@ mod tests {
     }
 
     #[test]
+    fn generated_title_from_summary_json_is_the_session_topic() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions/cwd/session-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            r#"{"current_model_id":"grok-4.6","generated_title":"Chat honesty: unsupported answers","session_summary":"unused fallback","last_turn_summary":"not the topic"}"#,
+        )
+        .unwrap();
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        assert_eq!(
+            snapshot.session_summaries["session-1"],
+            "Chat honesty: unsupported answers"
+        );
+    }
+
+    #[test]
+    fn empty_generated_title_falls_back_to_session_summary_not_last_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions/cwd/session-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            r#"{"generated_title":"  ","session_summary":"Review PR 91","last_turn_summary":"merged"}"#,
+        )
+        .unwrap();
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        assert_eq!(snapshot.session_summaries["session-1"], "Review PR 91");
+    }
+
+    #[test]
+    fn blank_summary_json_does_not_publish_a_topic() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions/cwd/session-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            r#"{"current_model_id":"grok-4.6","generated_title":"","session_summary":""}"#,
+        )
+        .unwrap();
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        assert!(!snapshot.session_summaries.contains_key("session-1"));
+    }
+
+    #[test]
     fn same_pid_active_sibling_fills_missing_context_for_the_bound_stub() {
         let directory = tempfile::tempdir().unwrap();
         let stub = directory.path().join("sessions/cwd/stub");
@@ -981,6 +1081,37 @@ mod tests {
         let cache = context.cache.as_ref().unwrap();
         assert_eq!(cache.read_tokens, 800);
         assert_eq!(snapshot.session_models["stub"], "grok-4.6");
+    }
+
+    #[test]
+    fn same_pid_active_sibling_fills_missing_summary_for_the_bound_stub() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = directory.path().join("sessions/cwd/stub");
+        let real = directory.path().join("sessions/cwd/real");
+        fs::create_dir_all(&stub).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        fs::write(
+            stub.join("summary.json"),
+            r#"{"current_model_id":"grok-4.6"}"#,
+        )
+        .unwrap();
+        fs::write(
+            real.join("summary.json"),
+            r#"{"generated_title":"Chat honesty: unsupported answers"}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("active_sessions.json"),
+            r#"[{"session_id":"stub","pid":76526},{"session_id":"real","pid":76526}]"#,
+        )
+        .unwrap();
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["stub".to_string()]);
+        assert_eq!(
+            snapshot.session_summaries["stub"],
+            "Chat honesty: unsupported answers"
+        );
     }
 
     #[test]

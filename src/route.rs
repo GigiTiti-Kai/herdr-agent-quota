@@ -199,6 +199,7 @@ mod tests {
     fn pane(harness: Harness, session_id: Option<&str>) -> AgentPane {
         AgentPane {
             pane_id: "w1:p9".to_string(),
+            workspace_id: "w1".to_string(),
             harness,
             session: session_id.map(|value| crate::herdr::AgentSession {
                 kind: Some("id".to_string()),
@@ -207,6 +208,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
+            working: false,
         }
     }
 

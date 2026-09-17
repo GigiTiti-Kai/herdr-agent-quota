@@ -182,7 +182,9 @@ Cursor Agent CLI is a separate install from the desktop app. Herdr's kind and
 PATH command are `cursor` (alias `cursor-agent`). Never call a bare `agent` —
 that name is Grok's on machines that have both. Herdr has a session
 integration (`herdr integration install cursor`). Event does not read the
-pane: the last `<user_query>` in the session jsonl is the topic.
+pane: the generated session title (`meta.json` `title`, else `store.db`
+`name`) is the topic. Placeholder `New Agent` falls back to the last
+`<user_query>` in the session jsonl.
 
 Credentials, in order: `accessToken` in the CLI auth file (`$CURSOR_AUTH_FILE`,
 else `~/.cursor/auth.json` on macOS, else `$XDG_CONFIG_HOME/cursor/auth.json`),
@@ -216,7 +218,9 @@ no TTL. Cache identity is `sha256("cursor\0" || token)`.
 ## Herdr state this plugin owns outside a pane
 
 Two things reach past the pane metadata, and both are global to the Herdr
-session rather than scoped to a pane. Neither is on by default.
+session rather than scoped to a pane. Low-quota notifications stay off until
+the user sets a threshold. The Agent view is on by default (`--agent-order
+quota`): Space grouping plus least-headroom ranking inside each space.
 
 **The Agent view** (`agent.view.set`, `src/herdr.rs`). Herdr keeps exactly
 one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
@@ -232,6 +236,12 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    (`HERDR_SOCKET_PATH`), because `agent.view.*` has no CLI subcommand in
    Herdr 0.8. One request, one reply, one connection — nothing subscribes, so
    the `events.subscribe` replay and focus-storm problems do not apply.
+4. **Quota order keeps Spaces contiguous.** The sort is
+   `workspace_order` ascending, then `quota_headroom` ascending — never a
+   flat headroom list that scatters one project's panes across the panel.
+   `$quota_group` names the Space on the tightest pane in that workspace;
+   `$quota_icon` is the vendor mark on every identity row (text glyphs, no
+   icon font).
 
 **`quota_headroom`** is the token that view sorts on: the remaining percent of
 the tightest of the pane's 5h, 7d, and 30d windows, zero-padded to three digits

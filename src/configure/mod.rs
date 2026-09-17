@@ -1,6 +1,7 @@
 pub mod agy;
 pub mod claude;
 pub mod cursor;
+pub mod font;
 pub mod grok;
 pub mod herdr;
 mod integration;
@@ -133,6 +134,9 @@ pub fn run(
         cache.set_low_quota_alert(alert)?;
         prefs::write(prefs::LOW_QUOTA_ALERT, &alert.to_string())?;
         herdr::apply(agents, layout, gap, fields, brand)?;
+        for note in font::install()? {
+            println!("{note}");
+        }
         // Not gated on a full run, unlike the watcher: the Agent panel order
         // is a choice that arrives on this command line, and the settings pane
         // sends it alongside whatever agent selection the user happens to

@@ -239,6 +239,10 @@ impl MetadataTokens {
         let windows = live.as_slice();
         let quota_provider = snapshot.provider.display_name().to_string();
         let quota_model = model.unwrap_or_default().to_string();
+        let quota_provider_model =
+            provider_model_label(&quota_provider, &quota_model, shape.content_width);
+        let narrow_identity =
+            shape.content_width > 0 && shape.content_width < NARROW_IDENTITY_CONTENT_WIDTH;
         let omp_windows = snapshot.source.starts_with("omp.");
         let short_window = if omp_windows {
             window_in(windows, WindowKind::FiveHour)
@@ -255,8 +259,12 @@ impl MetadataTokens {
             five_hour_slot(windows, snapshot.provider, now_unix, style, shape)
         };
         Self {
-            quota_provider_model: provider_model_label(&quota_provider, &quota_model),
-            quota_provider,
+            quota_provider_model,
+            quota_provider: if narrow_identity && !quota_model.is_empty() {
+                String::new()
+            } else {
+                quota_provider
+            },
             quota_model,
             quota_5h_severity: short_window
                 .map(|window| Severity::for_window(window, now_unix))
@@ -371,12 +379,18 @@ fn headroom(windows: &[UsageWindow]) -> Option<u8> {
     .min()
 }
 
-fn provider_model_label(provider: &str, model: &str) -> String {
+/// Below this content width the logo already names the vendor, so the
+/// identity label keeps only the model (radar-style narrow reading).
+const NARROW_IDENTITY_CONTENT_WIDTH: usize = 22;
+
+fn provider_model_label(provider: &str, model: &str, content_width: usize) -> String {
     if model.is_empty() {
-        provider.to_string()
-    } else {
-        format!("{provider}/{model}")
+        return provider.to_string();
     }
+    if content_width > 0 && content_width < NARROW_IDENTITY_CONTENT_WIDTH {
+        return model.to_string();
+    }
+    format!("{provider}/{model}")
 }
 
 fn window_severity(windows: &[UsageWindow], kind: WindowKind, now_unix: u64) -> Option<Severity> {
@@ -1206,6 +1220,32 @@ mod tests {
         assert_eq!(values.quota_cache, "");
         assert_eq!(values.quota_cache_ttl, "");
         assert_eq!(values.quota_error, None);
+    }
+
+    #[test]
+    fn a_narrow_sidebar_keeps_only_the_model_beside_the_logo() {
+        let snapshot =
+            ProviderSnapshot::new(Provider::Grok, vec![], 0).with_model(Some("grok-4.6".into()));
+        let wide = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::new(SidebarLayout::Packed, 30),
+        );
+        assert_eq!(wide.quota_provider_model, "Grok/grok-4.6");
+        assert_eq!(wide.quota_provider, "Grok");
+        let narrow = MetadataTokens::from_snapshot_for_pane(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::default(),
+            SidebarShape::new(SidebarLayout::Packed, 22),
+        );
+        // content_width = 22 - 4 = 18 < 22 → model only
+        assert_eq!(narrow.quota_provider_model, "grok-4.6");
+        assert!(narrow.quota_provider.is_empty());
+        assert_eq!(narrow.quota_model, "grok-4.6");
     }
 
     #[test]
