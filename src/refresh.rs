@@ -688,7 +688,6 @@ fn handle_named_pane(
         quota: PaneQuotaUpdate::Preserve,
         identity: None,
         context: None,
-        show_account_quota: true,
     });
     let tokens = vec![tokens];
     // Event and focus see one pane, not the whole inventory, which is exactly
@@ -815,7 +814,6 @@ fn resolved_pane_tokens(
         quota,
         identity,
         context,
-        show_account_quota: true,
     }))
 }
 
@@ -1320,96 +1318,15 @@ fn publish_resolved(
                     quota: PaneQuotaUpdate::Preserve,
                     identity: None,
                     context: None,
-                    show_account_quota: true,
                 },
             ),
         );
     }
     notify_low_quota(cache, &tokens);
-    mark_one_quota_row_per_vendor(&mut tokens, panes);
     if allow_icon_while_scrolled {
         publish_pane_tokens_with_scrolled_icons(panes, &tokens, CacheStore::now_millis(), row)
     } else {
         publish_pane_tokens(panes, &tokens, CacheStore::now_millis(), row)
-    }
-}
-
-/// Keep 5h/7d/30d and the vendor name on one pane per login-scoped vendor.
-/// Session fields (model, context, cache, topic) stay on every pane.
-fn mark_one_quota_row_per_vendor(tokens: &mut [PaneTokens], panes: &[AgentPane]) {
-    for token in tokens.iter_mut() {
-        let Some(vendor) = vendor_key(token) else {
-            continue;
-        };
-        if !shares_account_quota(&vendor) {
-            continue;
-        }
-        let representative = representative_pane_id(&vendor, token, panes);
-        if token.pane_id != representative {
-            token.show_account_quota = false;
-            if let PaneQuotaUpdate::Replace(values) = &mut token.quota {
-                values.quota_headroom = None;
-            }
-        }
-    }
-}
-
-fn vendor_key(tokens: &PaneTokens) -> Option<String> {
-    if let Some(identity) = &tokens.identity {
-        if !identity.provider.is_empty() {
-            return Some(identity.provider.clone());
-        }
-    }
-    match &tokens.quota {
-        PaneQuotaUpdate::Replace(values) if !values.quota_provider.is_empty() => {
-            Some(values.quota_provider.clone())
-        }
-        _ => None,
-    }
-}
-
-fn shares_account_quota(vendor: &str) -> bool {
-    matches!(
-        vendor,
-        "Grok" | "Codex" | "Devin" | "OpenCode" | "OpenCode Go" | "Cursor"
-    )
-}
-
-fn representative_pane_id(vendor: &str, current: &PaneTokens, panes: &[AgentPane]) -> String {
-    let members: Vec<&AgentPane> = panes
-        .iter()
-        .filter(|pane| pane_vendor_name(pane).as_deref() == Some(vendor))
-        .collect();
-    if members.is_empty() {
-        return current.pane_id.clone();
-    }
-    if let Some(pane) = members.iter().find(|pane| pane.focused) {
-        return pane.pane_id.clone();
-    }
-    if let Some(pane) = members.iter().find(|pane| pane.working()) {
-        return pane.pane_id.clone();
-    }
-    members
-        .iter()
-        .map(|pane| pane.pane_id.as_str())
-        .min()
-        .unwrap_or(current.pane_id.as_str())
-        .to_string()
-}
-
-fn pane_vendor_name(pane: &AgentPane) -> Option<String> {
-    if let Some(name) = pane.tokens.get("quota_provider") {
-        if !name.is_empty() {
-            return Some(name.clone());
-        }
-    }
-    match pane.harness {
-        Harness::Grok => Some("Grok".to_string()),
-        Harness::Codex => Some("Codex".to_string()),
-        Harness::Devin => Some("Devin".to_string()),
-        Harness::OpenCode => Some("OpenCode".to_string()),
-        Harness::Cursor => Some("Cursor".to_string()),
-        _ => None,
     }
 }
 
@@ -2215,7 +2132,6 @@ mod tests {
                 quota: PaneQuotaUpdate::Replace(Box::new(values)),
                 identity: None,
                 context: None,
-                show_account_quota: true,
             }
         };
         let lowest = lowest_headroom_by_provider(&[
@@ -2224,80 +2140,6 @@ mod tests {
             tokens("Codex", None),
         ]);
         assert_eq!(lowest, low(&[("Claude", 12)]));
-    }
-
-    fn quota_tokens(pane_id: &str, provider: &str, headroom: Option<u8>) -> PaneTokens {
-        let mut values = MetadataTokens::unavailable(Provider::Claude, "test");
-        values.quota_provider = provider.to_string();
-        values.quota_headroom = headroom;
-        if headroom.is_some() {
-            values.quota_week = "7d 12%".to_string();
-        }
-        PaneTokens {
-            pane_id: pane_id.to_string(),
-            quota: PaneQuotaUpdate::Replace(Box::new(values)),
-            identity: None,
-            context: None,
-            show_account_quota: true,
-        }
-    }
-
-    #[test]
-    fn one_vendor_quota_row_stays_on_the_focused_pane() {
-        let mut tokens = vec![
-            quota_tokens("w1:p1", "Grok", Some(87)),
-            quota_tokens("w1:p2", "Grok", Some(87)),
-            quota_tokens("w1:p3", "Claude", Some(40)),
-        ];
-        let mut panes = vec![
-            test_pane("w1:p1", Harness::Grok),
-            test_pane("w1:p2", Harness::Grok),
-            test_pane("w1:p3", Harness::Claude),
-        ];
-        panes[1].focused = true;
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
-        assert!(!tokens[0].show_account_quota);
-        assert!(tokens[1].show_account_quota);
-        assert!(tokens[2].show_account_quota);
-    }
-
-    #[test]
-    fn without_focus_the_working_pane_keeps_the_vendor_row() {
-        let mut tokens = vec![
-            quota_tokens("w1:p1", "Grok", Some(87)),
-            quota_tokens("w1:p2", "Grok", Some(87)),
-        ];
-        let mut panes = vec![
-            test_pane("w1:p1", Harness::Grok),
-            test_pane("w1:p2", Harness::Grok),
-        ];
-        panes[1].status = AgentStatus::Working;
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
-        assert!(!tokens[0].show_account_quota);
-        assert!(tokens[1].show_account_quota);
-    }
-
-    #[test]
-    fn a_lone_vendor_pane_keeps_its_quota_row() {
-        let mut tokens = vec![quota_tokens("w1:p1", "Grok", Some(87))];
-        let panes = vec![test_pane("w1:p1", Harness::Grok)];
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
-        assert!(tokens[0].show_account_quota);
-    }
-
-    #[test]
-    fn claude_panes_keep_their_own_quota_rows() {
-        let mut tokens = vec![
-            quota_tokens("w1:p1", "Claude", Some(40)),
-            quota_tokens("w1:p2", "Claude", Some(12)),
-        ];
-        let panes = vec![
-            test_pane("w1:p1", Harness::Claude),
-            test_pane("w1:p2", Harness::Claude),
-        ];
-        mark_one_quota_row_per_vendor(&mut tokens, &panes);
-        assert!(tokens[0].show_account_quota);
-        assert!(tokens[1].show_account_quota);
     }
 
     #[test]

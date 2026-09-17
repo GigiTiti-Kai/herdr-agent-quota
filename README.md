@@ -22,10 +22,8 @@ Labels are three characters so those periods align; a provider-named window too
 long for that column keeps a plain row instead of a truncated bar. Meters size
 to the connected Herdr endpoint's sidebar — indent and scrollbar included.
 Empty fields collapse; percentages can show remaining or used quota. Cache and
-TTL are off by default (turn them on in settings if you want them). Login-scoped
-vendors (Grok, Codex, Devin, OpenCode, Cursor) show one Agent-sidebar row even
-when several tabs share the same subscription; Claude and Agy stay per-pane.
-Agent order defaults to Space grouping with least quota left first inside each space.
+TTL are off by default (turn them on in settings if you want them). Agent order
+defaults to Space grouping with least quota left first inside each space.
 Low-quota notifications stay off until you set a threshold. Switch layout,
 fields, and percentages from the settings pane (`prefix+shift+q`).
 
