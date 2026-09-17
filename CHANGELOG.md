@@ -6,15 +6,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-
-- Account quota windows (`5h` / `7d` / `30d`) and the vendor name now appear
-  on one pane per login-scoped vendor (Grok, Codex, Devin, OpenCode, Cursor).
-  Extra tabs of that vendor are hidden from the Agent sidebar. The focused
-  pane of that vendor wins, then a working pane, then the first pane id.
-  Claude and Agy stay per-pane. Session fields (model, context, cache, topic)
-  stay on every pane.
-
 ## [1.6.0] - 2026-09-17
 
 ### Changed
