@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-17
+
 ### Changed
 
 - Agent order defaults to `quota`: Space grouping with least headroom first
@@ -798,7 +800,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A popup dashboard pane, event-driven refresh, and a local snapshot cache that
   survives provider failures.
 
-[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.5...HEAD
+[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.5...v1.6.0
 [1.5.5]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.2...v1.5.3
