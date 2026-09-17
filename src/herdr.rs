@@ -61,6 +61,31 @@ const METADATA_TOKEN_NAMES: [&str; 34] = [
 /// costs no extra writes — the value only moves when a quota token beside it
 /// moves anyway.
 pub(crate) const HEADROOM_TOKEN: &str = "quota_headroom";
+/// Account-level quota names that repeat for every pane of the same login.
+/// Stripping them from the non-representative pane, then hiding that pane
+/// from the Agent view, is what collapses three Grok tabs to one row.
+const ACCOUNT_QUOTA_TOKEN_NAMES: [&str; 18] = [
+    "quota_provider",
+    "quota_5h_normal",
+    "quota_5h_warning",
+    "quota_5h_danger",
+    "quota_5h_unknown",
+    "quota_week_normal",
+    "quota_week_warning",
+    "quota_week_danger",
+    "quota_week_unknown",
+    "quota_week_inline_normal",
+    "quota_week_inline_warning",
+    "quota_week_inline_danger",
+    "quota_week_inline_unknown",
+    "quota_month_normal",
+    "quota_month_warning",
+    "quota_month_danger",
+    "quota_month_unknown",
+    HEADROOM_TOKEN,
+];
+/// Login-scoped harnesses that share one subscription across tabs.
+const SHARED_ACCOUNT_AGENTS: [&str; 5] = ["grok", "codex", "devin", "opencode", "cursor"];
 /// The subset of [`METADATA_TOKEN_NAMES`] whose value comes from the cached
 /// quota windows and nothing else. [`quota_rows_have_drifted`] compares these,
 /// so a name added here must be one a snapshot alone can render.
@@ -281,6 +306,11 @@ pub struct PaneTokens {
     pub quota: PaneQuotaUpdate,
     pub identity: Option<PaneIdentity>,
     pub context: Option<ContextUsage>,
+    /// Account-level quota (vendor name, 5h, 7d, 30d, headroom) is shared
+    /// across panes of one vendor. Only one pane in that group publishes
+    /// those rows; the others keep session-local fields and are hidden from
+    /// the Agent sidebar.
+    pub show_account_quota: bool,
 }
 
 /// Show one Herdr notification.
@@ -327,6 +357,7 @@ pub fn set_quota_agent_view() -> Result<()> {
         "params": {
             "source": AGENT_VIEW_SOURCE,
             "label": crate::cli::AgentOrder::LABEL,
+            "filter": vendor_dedup_filter(),
             "sort": [
                 {"field": "workspace_order", "order": "asc"},
                 {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
@@ -334,6 +365,25 @@ pub fn set_quota_agent_view() -> Result<()> {
         },
     }))
     .map(|_| ())
+}
+
+/// Show a pane if it is publishing the vendor row, or if it is not a
+/// login-scoped harness (Claude/Agy stay per-pane; unknown agents stay visible).
+pub(crate) fn vendor_dedup_filter() -> serde_json::Value {
+    serde_json::json!({
+        "op": "any",
+        "filters": [
+            { "op": "exists", "field": { "token": "quota_provider" } },
+            {
+                "op": "not",
+                "filter": {
+                    "op": "in",
+                    "field": "agent",
+                    "values": SHARED_ACCOUNT_AGENTS,
+                }
+            }
+        ]
+    })
 }
 
 /// Give the Agent panel back to Herdr's own ordering.
@@ -836,6 +886,9 @@ fn publish_pane_tokens_inner(
             apply_context(&mut desired, context, sequence / 1_000, row);
         }
         fold_cache_row(&mut desired, row);
+        if !pane_tokens.show_account_quota {
+            strip_account_quota_tokens(&mut desired);
+        }
         apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels);
         if metadata_matches(&pane.tokens, &desired) {
             continue;
@@ -1373,6 +1426,20 @@ fn apply_context(
 ///
 /// `no cached` is not folded here: it keeps `$quota_cache_state` so the amber
 /// warning colour survives. Gauges puts that token on the cache row.
+pub(crate) fn strip_account_quota_tokens(tokens: &mut BTreeMap<String, String>) {
+    let provider = tokens.get("quota_provider").cloned().unwrap_or_default();
+    let provider_model = tokens
+        .get("quota_provider_model")
+        .cloned()
+        .unwrap_or_default();
+    for name in ACCOUNT_QUOTA_TOKEN_NAMES {
+        tokens.remove(name);
+    }
+    if provider_model.is_empty() || provider_model == provider {
+        tokens.remove("quota_provider_model");
+    }
+}
+
 fn fold_cache_row(tokens: &mut BTreeMap<String, String>, row: RowStyle) {
     use crate::cli::{SidebarField, SidebarLayout};
     if row.shape.layout != SidebarLayout::Gauges
@@ -2802,6 +2869,62 @@ mod tests {
         assert!(names.contains(&"quota_week_inline_normal"));
         assert!(names.contains(&"quota_week_normal"));
         assert!(names.len() <= MAX_METADATA_TOKENS);
+    }
+
+    #[test]
+    fn vendor_dedup_filter_keeps_claude_and_hides_extra_grok_tabs() {
+        let filter = vendor_dedup_filter();
+        assert_eq!(filter["op"], "any");
+        let filters = filter["filters"].as_array().unwrap();
+        assert_eq!(filters[0]["op"], "exists");
+        assert_eq!(filters[0]["field"]["token"], "quota_provider");
+        let hidden = filters[1]["filter"]["values"].as_array().unwrap();
+        assert!(hidden.iter().any(|value| value == "grok"));
+        assert!(hidden.iter().any(|value| value == "cursor"));
+        assert!(!hidden.iter().any(|value| value == "claude"));
+        assert!(!hidden.iter().any(|value| value == "agy"));
+    }
+
+    #[test]
+    fn stripping_account_quota_keeps_session_fields() {
+        let mut tokens = BTreeMap::from([
+            ("quota_provider".to_string(), "Grok".to_string()),
+            (
+                "quota_provider_model".to_string(),
+                "Grok/grok-4.6".to_string(),
+            ),
+            ("quota_model".to_string(), "grok-4.6".to_string()),
+            ("quota_week_inline_normal".to_string(), "7d 87%".to_string()),
+            ("quota_context".to_string(), "cx 79%".to_string()),
+            (HEADROOM_TOKEN.to_string(), "087".to_string()),
+        ]);
+        strip_account_quota_tokens(&mut tokens);
+        assert!(!tokens.contains_key("quota_provider"));
+        assert!(!tokens.contains_key("quota_week_inline_normal"));
+        assert!(!tokens.contains_key(HEADROOM_TOKEN));
+        assert_eq!(
+            tokens.get("quota_model").map(String::as_str),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            tokens.get("quota_provider_model").map(String::as_str),
+            Some("Grok/grok-4.6")
+        );
+        assert_eq!(
+            tokens.get("quota_context").map(String::as_str),
+            Some("cx 79%")
+        );
+    }
+
+    #[test]
+    fn stripping_a_vendor_only_identity_clears_the_combined_label() {
+        let mut tokens = BTreeMap::from([
+            ("quota_provider".to_string(), "Grok".to_string()),
+            ("quota_provider_model".to_string(), "Grok".to_string()),
+            ("quota_week_inline_normal".to_string(), "7d 87%".to_string()),
+        ]);
+        strip_account_quota_tokens(&mut tokens);
+        assert!(tokens.is_empty(), "{tokens:?}");
     }
 
     #[test]
