@@ -61,7 +61,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
-            working: false,
+            status: AgentStatus::Idle,
         }
     }
 

@@ -11,10 +11,10 @@ Space, with brand icons that carry agent status.
 <img src="docs/screenshots/sidebar-gauges.png" alt="Space-grouped gauges sidebar" width="320">
 
 Agents are grouped under their Space. Each row leads with this plugin's brand
-icon in place of Herdr's stock status chrome; the status colour beside the logo
-tracks the agent — working, done (until clicked), or idle — so you can read
-busy vs finished at a glance. Provider and model stay ink-white; severity
-colours on the meters still mean remaining headroom.
+icon — not Herdr's status ring. The icon colour tracks the agent: yellow while
+working, teal while done (until you focus the pane), ink-white when idle.
+Provider and model stay ink-white; severity colours on the meters still mean
+remaining headroom.
 
 The default layout is `gauges`: a meter beside each quota number. Bars fill to
 the printed number, and `cx`, `5h`, `7d`, and `30d` all follow `quota-percent`.

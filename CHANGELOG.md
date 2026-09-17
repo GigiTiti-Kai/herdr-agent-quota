@@ -13,9 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when the user has not set a sort themselves.
 - Default sidebar fields omit cache and TTL (`provider,topic,model,context,5h,7d,30d`).
   Turn them on in settings when needed.
-- Sidebar identity uses Space group headers plus brand icons; Herdr's
-  `state_icon` carries working / done / idle colour beside the logo. README
-  screenshots show the wide gauges layout only.
+- Sidebar identity uses Space group headers plus brand icons whose colour
+  mirrors Herdr `agent_status` (working / done / idle) — no `state_icon` ring.
+  README screenshots show the wide gauges layout only.
 
 ### Added
 

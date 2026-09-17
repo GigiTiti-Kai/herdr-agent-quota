@@ -1356,6 +1356,7 @@ fn tokens_for_loaded_snapshot(
 mod tests {
     use super::*;
     use crate::cli::{PercentStyle, SidebarLayout};
+    use crate::herdr::AgentStatus;
     use crate::model::{ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
     use tempfile::tempdir;
 
@@ -1368,7 +1369,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
-            working: false,
+            status: AgentStatus::Idle,
         }
     }
 

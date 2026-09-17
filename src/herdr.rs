@@ -14,10 +14,12 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 32] = [
+const METADATA_TOKEN_NAMES: [&str; 34] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
+    "quota_icon_working",
+    "quota_icon_done",
     "quota_provider",
     "quota_model",
     "quota_provider_model",
@@ -83,9 +85,7 @@ const QUOTA_WINDOW_TOKEN_NAMES: [&str; 17] = [
 ];
 /// Names a pane may still carry from an older build of this plugin. They are
 /// never produced again, so a report clears them until the pane is clean.
-const OBSOLETE_METADATA_TOKEN_NAMES: [&str; 16] = [
-    "quota_icon_working",
-    "quota_icon_done",
+const OBSOLETE_METADATA_TOKEN_NAMES: [&str; 14] = [
     "quota_state",
     "quota_status",
     "quota_summary",
@@ -168,6 +168,46 @@ impl AgentSession {
     }
 }
 
+/// Herdr's effective pane status from `agent_status`.
+///
+/// Idle + unseen is reported as `done` until the user focuses the pane; there
+/// is no separate `seen` field on the list. The brand icon colour mirrors this
+/// enum — never a second `state_icon` ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentStatus {
+    #[default]
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Unknown,
+}
+
+impl AgentStatus {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "working" => Self::Working,
+            "done" => Self::Done,
+            "blocked" => Self::Blocked,
+            "unknown" => Self::Unknown,
+            _ => Self::Idle,
+        }
+    }
+
+    pub fn is_working(self) -> bool {
+        matches!(self, Self::Working)
+    }
+
+    /// Metadata token that carries the brand glyph for this status.
+    fn icon_token(self) -> &'static str {
+        match self {
+            Self::Working => "quota_icon_working",
+            Self::Done => "quota_icon_done",
+            Self::Idle | Self::Blocked | Self::Unknown => "quota_icon",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPane {
     pub pane_id: String,
@@ -177,9 +217,14 @@ pub struct AgentPane {
     pub session_summary: String,
     pub topic: String,
     pub tokens: BTreeMap<String, String>,
-    /// Herdr `agent_status == working`. Used to spawn the watch pulse; status
-    /// colour itself comes from Herdr's `state_icon`, not a plugin token.
-    pub working: bool,
+    /// From Herdr `agent_status`. Drives brand-icon colour and the watch pulse.
+    pub status: AgentStatus,
+}
+
+impl AgentPane {
+    pub fn working(&self) -> bool {
+        self.status.is_working()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -489,13 +534,14 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         .map(str::to_string)
                         .or_else(|| workspace_id_from_pane_id(pane_id))
                         .unwrap_or_default();
-                    let working = map
+                    let status = map
                         .get("agent_status")
                         .or_else(|| map.get("agentStatus"))
                         .or_else(|| map.get("status"))
                         .or_else(|| map.get("state"))
                         .and_then(Value::as_str)
-                        .is_some_and(|status| status.eq_ignore_ascii_case("working"));
+                        .map(AgentStatus::parse)
+                        .unwrap_or_default();
                     panes.push(AgentPane {
                         pane_id: pane_id.to_string(),
                         workspace_id,
@@ -506,7 +552,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         // refreshes. Agent events refresh it from pane output.
                         topic,
                         tokens,
-                        working,
+                        status,
                     });
                 }
             }
@@ -916,8 +962,7 @@ fn group_label_for(
 /// Herdr hang-indents a head pane's rows under `$quota_group`. Member panes
 /// collapse an empty group, so their identity is row 1 and needs the same
 /// offset baked into the first plugin cell — same as herdr-radar
-/// `group_indent = 2`. That cell is the white logo: Herdr's `state_icon`
-/// (status ring) sits before it and stays under Herdr's own seen/done logic.
+/// `group_indent = 2`.
 ///
 /// The indent must ride on the logo token, not a stand-alone `$quota_pad`:
 /// Herdr inserts ` · ` between adjacent non-empty tokens, so a pad cell drew
@@ -927,10 +972,11 @@ const GROUP_MEMBER_INDENT: &str = "\u{200b}  ";
 
 /// Vendor mark always; group header only on the Space head pane.
 ///
+/// Exactly one of `$quota_icon` / `_working` / `_done` is published so the
+/// brand glyph itself carries Herdr's status colour (no `state_icon` ring).
 /// Members prefix the logo with [`GROUP_MEMBER_INDENT`]. Heads publish the
 /// bare glyph — Herdr already hang-indents their continuation rows. Stale
-/// `$quota_pad` / `$quota_icon_working` / `$quota_icon_done` from older builds
-/// are cleared so a twin glyph cannot return.
+/// `$quota_pad` from older builds is cleared.
 fn apply_group_and_icon(
     desired: &mut BTreeMap<String, String>,
     pane: &AgentPane,
@@ -947,10 +993,14 @@ fn apply_group_and_icon(
     } else {
         glyph.to_string()
     };
-    // Status colour is Herdr's `state_icon`. The logo stays ink-white.
-    desired.insert("quota_icon".to_string(), mark);
-    desired.remove("quota_icon_working");
-    desired.remove("quota_icon_done");
+    let active = pane.status.icon_token();
+    for token in ["quota_icon", "quota_icon_working", "quota_icon_done"] {
+        if token == active {
+            desired.insert(token.to_string(), mark.clone());
+        } else {
+            desired.remove(token);
+        }
+    }
     desired.remove("quota_pad");
     // Never preserve a previous header: non-heads must omit the token so the
     // report clears it. Blind preserve is what left `ifs` on two panes.
@@ -1391,7 +1441,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
-            working: false,
+            status: AgentStatus::Idle,
         };
         let mut panes = vec![
             pane("w1:p1", Harness::Muse, None),
@@ -1468,7 +1518,7 @@ mod tests {
                 (HEADROOM_TOKEN.to_string(), "000".to_string()),
                 ("quota_group".to_string(), "ifs".to_string()),
             ]),
-            working: false,
+            status: AgentStatus::Idle,
         };
         let sibling = AgentPane {
             pane_id: "w1:p2".to_string(),
@@ -1481,7 +1531,7 @@ mod tests {
                 (HEADROOM_TOKEN.to_string(), "016".to_string()),
                 ("quota_group".to_string(), "ifs".to_string()),
             ]),
-            working: false,
+            status: AgentStatus::Idle,
         };
         let inventory = vec![head.clone(), sibling.clone()];
         let heads = group_head_pane_ids(&inventory, std::slice::from_ref(&sibling), &[]);
@@ -1526,23 +1576,31 @@ mod tests {
             "indent glued to a glyph must survive Unicode trim"
         );
 
-        // Status colour is Herdr's `state_icon`; the logo token is always
-        // `quota_icon`. Stale working/done logo tokens are cleared.
+        // Brand icon colour follows agent_status: working publishes the
+        // yellow twin and clears idle/done so only one glyph shows.
         let mut working = sibling.clone();
-        working.working = true;
+        working.status = AgentStatus::Working;
         let mut working_desired = BTreeMap::from([
-            ("quota_icon_working".to_string(), "stale".to_string()),
+            ("quota_icon".to_string(), "stale".to_string()),
             ("quota_icon_done".to_string(), "stale".to_string()),
         ]);
         apply_group_and_icon(&mut working_desired, &working, &heads, &labels);
         assert!(
             working_desired
-                .get("quota_icon")
+                .get("quota_icon_working")
                 .is_some_and(|icon| icon.starts_with(GROUP_MEMBER_INDENT)),
-            "working panes still publish the shared white logo"
+            "working panes publish the yellow brand icon"
         );
-        assert!(!working_desired.contains_key("quota_icon_working"));
+        assert!(!working_desired.contains_key("quota_icon"));
         assert!(!working_desired.contains_key("quota_icon_done"));
+
+        let mut done = sibling.clone();
+        done.status = AgentStatus::Done;
+        let mut done_desired = BTreeMap::new();
+        apply_group_and_icon(&mut done_desired, &done, &heads, &labels);
+        assert!(done_desired.contains_key("quota_icon_done"));
+        assert!(!done_desired.contains_key("quota_icon"));
+        assert!(!done_desired.contains_key("quota_icon_working"));
     }
 
     #[test]
@@ -1570,7 +1628,7 @@ mod tests {
                     session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
-                    working: false,
+                    status: AgentStatus::Idle,
                 },
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
@@ -1580,7 +1638,7 @@ mod tests {
                     session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
-                    working: false,
+                    status: AgentStatus::Idle,
                 },
                 AgentPane {
                     pane_id: "w1:p4".to_string(),
@@ -1590,7 +1648,7 @@ mod tests {
                     session_summary: String::new(),
                     topic: String::new(),
                     tokens: BTreeMap::new(),
-                    working: false,
+                    status: AgentStatus::Idle,
                 },
             ]
         );
@@ -1796,7 +1854,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::from([(String::from("quota_badge"), String::from("[A]"))]),
-            working: false,
+            status: AgentStatus::Idle,
         };
         let desired = BTreeMap::from([(String::from("quota_state"), String::from("?"))]);
         assert!(!metadata_matches(&pane.tokens, &desired));
@@ -1844,7 +1902,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
-            working: false,
+            status: AgentStatus::Idle,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -1892,7 +1950,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
-            working: false,
+            status: AgentStatus::Idle,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -2155,7 +2213,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens: BTreeMap::new(),
-            working: false,
+            status: AgentStatus::Idle,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
@@ -2226,7 +2284,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens,
-            working: false,
+            status: AgentStatus::Idle,
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -2412,7 +2470,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens,
-            working: false,
+            status: AgentStatus::Idle,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);
@@ -2457,7 +2515,7 @@ mod tests {
             session_summary: String::new(),
             topic: String::new(),
             tokens,
-            working: false,
+            status: AgentStatus::Idle,
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);

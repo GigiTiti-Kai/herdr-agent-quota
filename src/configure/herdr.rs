@@ -76,8 +76,12 @@ const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
 // (0.8.2 added them); intended selected fill is #42474f when those keys exist.
 const QUOTA_SAFE_COLOR: &str = "#82d978";
 const QUOTA_WARNING_COLOR: &str = "#e4b957";
-/// Idle logo ink. Status (working / done / idle) is Herdr's `state_icon`.
+/// Idle logo ink. Working / done colours match Herdr's default dark
+/// `state_icon` palette so the brand glyph replaces the ring without a second
+/// circle on the row.
 const IDLE_ICON_COLOR: &str = "#e9e9f0";
+const WORKING_ICON_COLOR: &str = "#f9e2af";
+const DONE_ICON_COLOR: &str = "#94e2d5";
 const QUOTA_DANGER_COLOR: &str = "#f16f7e";
 // The same three bands, muted, for the meter rows only. `packed` and
 // `stacked` tint one short token, where a full-strength hue is legible; a
@@ -509,9 +513,8 @@ fn rewrite_quota_sidebar(
             RowRewrite::Preserve
         },
     )?;
-    // Identity is ink-white for every harness; status is Herdr's `state_icon`.
-    // Per-agent brand copies are redundant and were the dual-hue source of
-    // "two icons" when a width flip dropped a clear.
+    // Identity is ink-white for every harness; status colour is the exclusive
+    // `$quota_icon` / `_working` / `_done` twin — never a second `state_icon`.
     let skipped = if !rows_safe {
         add_provider_rows(table, &managed_rows, agents)?
     } else {
@@ -962,11 +965,7 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     match layout {
         SidebarLayout::Packed | SidebarLayout::Gauges => append_identity_row(rows),
         SidebarLayout::Stacked => {
-            rows.push(Value::Array(identity_cells(
-                "$quota_icon",
-                "$quota_provider",
-                Some(true),
-            )));
+            rows.push(Value::Array(identity_cells("$quota_provider", Some(true))));
             rows.push(Value::Array(styled_row(
                 "$quota_model",
                 Some(IDLE_ICON_COLOR),
@@ -989,24 +988,33 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
 
 fn append_identity_row(rows: &mut Array) {
     rows.push(Value::Array(identity_cells(
-        "$quota_icon",
         "$quota_provider_model",
-        // Name stays bold for scan; icon bold is forced off inside
-        // `identity_cells` (single-weight PUA face).
         Some(true),
     )));
 }
 
-/// Herdr's status ring, then the ink-white logo and name.
+/// Brand icon in three mutually exclusive colours, then the name.
 ///
-/// `state_icon` owns working / done / idle (and click-to-seen). The logo is
-/// always white — it identifies the harness, it does not re-encode status.
-fn identity_cells(icon: &str, name: &str, name_bold: Option<bool>) -> Array {
+/// Herdr collapses empty tokens, so only the published status twin shows. No
+/// `state_icon`: two circles on one row is what this replaces. Click-to-seen
+/// is Herdr's own `agent_status` (`done` → `idle` on focus); we only mirror it.
+fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
     let mut row = Array::new();
-    row.push(Value::from("state_icon"));
     row.push(styled_token(
-        icon,
+        "$quota_icon",
         Some(IDLE_ICON_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    row.push(styled_token(
+        "$quota_icon_working",
+        Some(WORKING_ICON_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    row.push(styled_token(
+        "$quota_icon_done",
+        Some(DONE_ICON_COLOR),
         Some(false),
         Some(false),
     ));
@@ -1396,7 +1404,7 @@ fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, _brand: BrandColors)
     if !hidden.is_empty() {
         println!("  leave out {}", hidden.join(", "));
     }
-    println!("  paint logo and name ink-white; Herdr's state_icon carries status");
+    println!("  paint brand icon idle/working/done (no state_icon ring)");
 }
 
 #[cfg(test)]
@@ -1545,28 +1553,23 @@ mod tests {
                     "native agent row duplicates provider/model:\n{updated}"
                 );
                 assert!(rows.iter().any(|row| row_contains_token(row, "$quota_icon")));
-                assert!(rows.iter().any(|row| {
-                    row.as_array().is_some_and(|items| {
-                        items.iter().any(|item| item.as_str() == Some("state_icon"))
-                            && row_contains_token(row, "$quota_icon")
-                    })
-                }));
-                assert!(!rows
+                assert!(rows
                     .iter()
                     .any(|row| row_contains_token(row, "$quota_icon_working")));
-                assert!(!rows
+                assert!(rows
                     .iter()
                     .any(|row| row_contains_token(row, "$quota_icon_done")));
-                assert!(rows.iter().any(|row| row_contains_token(row, "$quota_topic")));
                 assert!(
                     !rows.iter().any(|row| {
                         row.as_array().is_some_and(|items| {
                             items.iter().any(|item| item.as_str() == Some("state_icon"))
-                                && row_contains_token(row, "$quota_topic")
+                                && (row_contains_token(row, "$quota_icon")
+                                    || row_contains_token(row, "$quota_topic"))
                         })
                     }),
-                    "status ring sits on the identity row, not on topic"
+                    "managed identity must not host state_icon beside the brand icon:\n{updated}"
                 );
+                assert!(rows.iter().any(|row| row_contains_token(row, "$quota_topic")));
                 assert_eq!(
                     add_quota_row_for(&updated, &[Harness::Claude], layout).unwrap(),
                     updated
@@ -1636,9 +1639,9 @@ rows = [["state_icon", "agent"]]
         assert!(updated.contains("$quota_week"));
         assert!(updated.contains("$quota_group"));
         assert!(updated.contains("$quota_icon"));
-        assert!(updated.contains("state_icon"));
-        assert!(!updated.contains("$quota_icon_working"));
-        assert!(!updated.contains("$quota_icon_done"));
+        assert!(updated.contains("$quota_icon_working"));
+        assert!(updated.contains("$quota_icon_done"));
+        assert!(!updated.contains("state_icon") || updated.contains("machine")); // stock may remain elsewhere only if preserve
         assert!(!updated.contains("$quota_pad"));
         assert!(!updated.contains("\"workspace\""));
         assert!(!updated.contains("\"machine\""));
@@ -1650,6 +1653,11 @@ rows = [["state_icon", "agent"]]
             .as_array()
             .unwrap();
         assert!(!has_standalone_agent_row(rows), "{updated}");
+        // Takeover drops state_icon from the managed identity.
+        assert!(!rows.iter().any(|row| {
+            row.as_array()
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("state_icon")))
+        }));
         assert_eq!(add_quota_row(&updated).unwrap(), updated);
     }
 
@@ -2008,22 +2016,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "05802a842a43e5c2f7f2d5596314b34598cc0f2cdac101723fa4740199473e79",
-                    "2d94cf3276a7b2a51d5652c550972a831c2828ef4346033a6995ce26890c0fe8",
+                    "a964acd82452de5c16495c47feff70dfbc970607b7f4d0f084795b141342a817",
+                    "9d13cdfc670b3a9330788e9244dffd9e0dba6980620b2df7c738763c27dfd625",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "70e781f51f47671cfb9cc8133ab02e52ce9a964a6e610f2fd0ee4802b606f807",
-                    "ef5334401128b005d52ad5d22a1bc94d9a2cbd1de6c6675b16571a3a2294f683",
+                    "0b59e8f4e537ace0b0a555f8cf908afb1b1f2d86cf19cb88b2a6edf786ca4967",
+                    "1aeb9b78813a222c7e7590a8c88afa88f48df16f9364b4298f4f966458f14ef3",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "70e781f51f47671cfb9cc8133ab02e52ce9a964a6e610f2fd0ee4802b606f807",
-                    "ef5334401128b005d52ad5d22a1bc94d9a2cbd1de6c6675b16571a3a2294f683",
+                    "0b59e8f4e537ace0b0a555f8cf908afb1b1f2d86cf19cb88b2a6edf786ca4967",
+                    "1aeb9b78813a222c7e7590a8c88afa88f48df16f9364b4298f4f966458f14ef3",
                 ],
             ),
         ] {
@@ -2177,7 +2185,7 @@ rows = [["state_icon", "agent"]]
     }
 
     #[test]
-    fn agent_identity_keeps_state_icon_and_white_logo() {
+    fn agent_identity_uses_status_coloured_brand_icons_without_state_icon() {
         let updated =
             add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"tab\", \"agent\"]]\n")
                 .unwrap();
@@ -2190,20 +2198,24 @@ rows = [["state_icon", "agent"]]
             .find(|row| row_contains_token(row, "$quota_icon"))
             .and_then(Value::as_array)
             .unwrap();
-        assert_eq!(identity.get(0).and_then(Value::as_str), Some("state_icon"));
+        assert!(!identity
+            .iter()
+            .any(|item| item.as_str() == Some("state_icon")));
+        assert_eq!(
+            configured_token_name(identity.get(0).unwrap()),
+            Some("$quota_icon")
+        );
         assert_eq!(
             configured_token_name(identity.get(1).unwrap()),
-            Some("$quota_icon")
+            Some("$quota_icon_working")
+        );
+        assert_eq!(
+            configured_token_name(identity.get(2).unwrap()),
+            Some("$quota_icon_done")
         );
         assert!(identity
             .iter()
             .any(|item| configured_token_name(item) == Some("$quota_provider_model")));
-        assert!(!identity
-            .iter()
-            .any(|item| configured_token_name(item) == Some("$quota_icon_working")));
-        assert!(!identity
-            .iter()
-            .any(|item| configured_token_name(item) == Some("$quota_icon_done")));
         let topic = rows
             .iter()
             .find(|row| row_contains_token(row, "$quota_topic"))
@@ -2211,16 +2223,34 @@ rows = [["state_icon", "agent"]]
             .unwrap();
         assert!(
             !topic.iter().any(|item| item.as_str() == Some("state_icon")),
-            "topic row does not host the ring"
+            "topic row does not host a status ring"
         );
-        let icon = identity
+        let idle = identity
             .iter()
             .find(|item| configured_token_name(item) == Some("$quota_icon"))
             .and_then(Value::as_inline_table)
             .unwrap();
         assert_eq!(
-            icon.get("fg").and_then(Value::as_str),
+            idle.get("fg").and_then(Value::as_str),
             Some(IDLE_ICON_COLOR)
+        );
+        let working = identity
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_icon_working"))
+            .and_then(Value::as_inline_table)
+            .unwrap();
+        assert_eq!(
+            working.get("fg").and_then(Value::as_str),
+            Some(WORKING_ICON_COLOR)
+        );
+        let done = identity
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_icon_done"))
+            .and_then(Value::as_inline_table)
+            .unwrap();
+        assert_eq!(
+            done.get("fg").and_then(Value::as_str),
+            Some(DONE_ICON_COLOR)
         );
     }
 
@@ -2972,9 +3002,9 @@ mod field_tests {
         // it is how a broken pane is reported.
         assert!(bare.contains("$quota_group"), "{bare}");
         assert!(bare.contains("$quota_icon"), "{bare}");
-        assert!(bare.contains("state_icon"), "{bare}");
-        assert!(!bare.contains("$quota_icon_working"), "{bare}");
-        assert!(!bare.contains("$quota_icon_done"), "{bare}");
+        assert!(bare.contains("$quota_icon_working"), "{bare}");
+        assert!(bare.contains("$quota_icon_done"), "{bare}");
+        assert!(!bare.contains("state_icon"), "{bare}");
         assert!(!bare.contains("$quota_pad"), "{bare}");
         assert!(bare.contains("$quota_error"), "{bare}");
         assert!(!bare.contains("$quota_provider"), "{bare}");
