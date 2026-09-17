@@ -983,6 +983,9 @@ fn group_label_for(
 /// a leading middle-dot before the logo. ZWSP + spaces survive trim only when
 /// a non-whitespace glyph follows in the same value.
 const GROUP_MEMBER_INDENT: &str = "\u{200b}  ";
+/// Always reported together so a lagging inventory cannot leave a stale
+/// colour twin on screen after working→done or done→idle.
+const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_icon_done"];
 
 /// Vendor mark always; group header only on the Space head pane.
 ///
@@ -1008,7 +1011,7 @@ fn apply_group_and_icon(
         glyph.to_string()
     };
     let active = pane.icon_status().icon_token();
-    for token in ["quota_icon", "quota_icon_working", "quota_icon_done"] {
+    for token in ICON_TOKEN_NAMES {
         if token == active {
             desired.insert(token.to_string(), mark.clone());
         } else {
@@ -1243,6 +1246,13 @@ fn metadata_report_names(
         .into_iter()
         .filter(|name| desired.contains_key(*name) || pane.tokens.contains_key(*name))
         .collect::<Vec<_>>();
+    // Icon twins must always be named so an inactive colour is cleared even
+    // when `agent list` omitted the stale token from `pane.tokens`.
+    for name in ICON_TOKEN_NAMES {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
     let cleanup_names = OBSOLETE_METADATA_TOKEN_NAMES
         .into_iter()
         .filter(|name| pane.tokens.contains_key(*name))
@@ -1265,8 +1275,11 @@ fn metadata_report_names(
         let Some(index) = names.iter().position(|name| {
             // Dropping a name the pane still carries but no longer wants would
             // leave that row on screen forever, so those are never given up.
+            // Icon twins are never dropped either — a stale colour is worse
+            // than a briefly lagged quota digit.
             let must_clear = pane.tokens.contains_key(*name) && !desired.contains_key(*name);
-            !must_clear && !ROWS_THAT_MUST_NOT_LAG.contains(name)
+            let is_icon = ICON_TOKEN_NAMES.contains(name);
+            !must_clear && !is_icon && !ROWS_THAT_MUST_NOT_LAG.contains(name)
         }) else {
             break;
         };

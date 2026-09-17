@@ -405,11 +405,18 @@ pub fn event() -> Result<()> {
     };
 
     let cache = CacheStore::from_env()?;
-    let Some(pane) = named_pane(pane_id, harness)? else {
+    let Some(mut pane) = named_pane(pane_id, harness)? else {
         return Ok(());
     };
 
     let status = find_status(event);
+    // The event names the transition that just fired. `agent list` can lag a
+    // beat behind (still `working` after completion), and trusting the list
+    // would republish the yellow icon and miss `done` entirely when no second
+    // event follows.
+    if let Some(status) = status {
+        pane.status = AgentStatus::parse(status);
+    }
     // Pi's and omp's exact session files carry the routing evidence, and
     // Muse/Cursor transcripts record the prompt itself. Reading their panes
     // would add a visible repaint without improving attribution or the topic.
