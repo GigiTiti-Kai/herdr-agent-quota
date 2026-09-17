@@ -265,21 +265,9 @@ impl MetadataTokens {
             provider_model_label(&quota_provider, &quota_model, shape.content_width);
         let narrow_identity =
             shape.content_width > 0 && shape.content_width < NARROW_IDENTITY_CONTENT_WIDTH;
-        let omp_windows = snapshot.source.starts_with("omp.");
-        let short_window = if omp_windows {
-            window_in(windows, WindowKind::FiveHour)
-        } else {
-            None
-        };
+        let five_hour = window_in(windows, WindowKind::FiveHour);
         let weekly = window_in(windows, WindowKind::Weekly);
         let monthly = window_in(windows, WindowKind::Monthly);
-        let quota_5h = if omp_windows {
-            short_window
-                .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
-                .unwrap_or_default()
-        } else {
-            five_hour_slot(windows, snapshot.provider, now_unix, style, shape)
-        };
         Self {
             quota_provider_model,
             quota_provider: if narrow_identity && !quota_model.is_empty() {
@@ -288,15 +276,10 @@ impl MetadataTokens {
                 quota_provider
             },
             quota_model,
-            quota_5h_severity: short_window
-                .map(|window| Severity::for_window(window, now_unix))
-                .or_else(|| window_severity(windows, WindowKind::FiveHour, now_unix))
-                .or_else(|| {
-                    (!omp_windows)
-                        .then(|| missing_five_hour_severity(snapshot.provider, &quota_5h))
-                        .flatten()
-                }),
-            quota_5h,
+            quota_5h_severity: five_hour.map(|window| Severity::for_window(window, now_unix)),
+            quota_5h: five_hour
+                .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
+                .unwrap_or_default(),
             quota_week: weekly
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
@@ -316,61 +299,20 @@ impl MetadataTokens {
     }
 
     /// The plugin has a snapshot it must not show — currently only a snapshot
-    /// belonging to a login the user has since switched away from. Quota reads
-    /// `N/A` rather than a stale number, and `quota_error` says why.
+    /// belonging to a login the user has since switched away from. Window rows
+    /// stay off rather than reading `N/A`, and `quota_error` says why.
     pub fn unavailable(provider: Provider, reason: impl Into<String>) -> Self {
-        Self::unavailable_slots(
-            provider,
-            reason,
-            missing_five_hour_label(provider),
-            Some("7d N/A"),
-            missing_month_label(provider),
-        )
-    }
-
-    /// Same as [`Self::unavailable`], but N/A only the windows that snapshot
-    /// actually carried. A monthly-only plan must not grow a 7d row, and a
-    /// weekly plan must not drop its 30d token to empty.
-    pub fn unavailable_for_windows(
-        provider: Provider,
-        reason: impl Into<String>,
-        windows: &[UsageWindow],
-    ) -> Self {
-        if windows.is_empty() {
-            return Self::unavailable(provider, reason);
-        }
-        let five_hour = if window_in(windows, WindowKind::FiveHour).is_some() {
-            Some("5h N/A")
-        } else {
-            missing_five_hour_label(provider)
-        };
-        Self::unavailable_slots(
-            provider,
-            reason,
-            five_hour,
-            window_in(windows, WindowKind::Weekly).map(|_| "7d N/A"),
-            window_in(windows, WindowKind::Monthly).map(|_| "30d N/A"),
-        )
-    }
-
-    fn unavailable_slots(
-        provider: Provider,
-        reason: impl Into<String>,
-        five_hour: Option<&'static str>,
-        week: Option<&'static str>,
-        month: Option<&'static str>,
-    ) -> Self {
         let quota_provider = provider.display_name().to_string();
         Self {
             quota_provider_model: quota_provider.clone(),
             quota_provider,
             quota_model: String::new(),
-            quota_5h: five_hour.unwrap_or_default().to_string(),
-            quota_5h_severity: five_hour.map(|_| Severity::Unknown),
-            quota_week: week.unwrap_or_default().to_string(),
-            quota_week_severity: week.map(|_| Severity::Unknown),
-            quota_month: month.unwrap_or_default().to_string(),
-            quota_month_severity: month.map(|_| Severity::Unknown),
+            quota_5h: String::new(),
+            quota_5h_severity: None,
+            quota_week: String::new(),
+            quota_week_severity: None,
+            quota_month: String::new(),
+            quota_month_severity: None,
             quota_context: String::new(),
             quota_context_severity: None,
             quota_cache: String::new(),
@@ -379,6 +321,16 @@ impl MetadataTokens {
             quota_error: Some(reason.into().chars().take(80).collect()),
             quota_headroom: None,
         }
+    }
+
+    /// Same as [`Self::unavailable`]. Window rows are omitted rather than
+    /// filled with `N/A`, whether or not the unusable snapshot carried them.
+    pub fn unavailable_for_windows(
+        provider: Provider,
+        reason: impl Into<String>,
+        _windows: &[UsageWindow],
+    ) -> Self {
+        Self::unavailable(provider, reason)
     }
 }
 
@@ -424,10 +376,6 @@ fn provider_model_label(provider: &str, model: &str, content_width: usize) -> St
     format!("{provider}/{model}")
 }
 
-fn window_severity(windows: &[UsageWindow], kind: WindowKind, now_unix: u64) -> Option<Severity> {
-    window_in(windows, kind).map(|window| Severity::for_window(window, now_unix))
-}
-
 /// Every window the collector reported, including a monthly one. The sidebar
 /// publishes 5h, 7d, and 30d as separate tokens; a 30d value must never be
 /// folded into a weekly one.
@@ -463,56 +411,6 @@ fn windows_summary(
         .map(|window| format_window(window, now_unix, include_suffix, style))
         .collect::<Vec<_>>()
         .join(" · ")
-}
-
-/// The 5h slot: the window when the provider reported one, otherwise the
-/// provider's placeholder (Claude/Agy keep a visible `5h N/A`; the rest omit
-/// the row so the long window can fold onto context).
-fn five_hour_slot(
-    windows: &[UsageWindow],
-    provider: Provider,
-    now_unix: u64,
-    style: PercentStyle,
-    shape: SidebarShape,
-) -> String {
-    match window_in(windows, WindowKind::FiveHour) {
-        Some(window) => compact_window_parts(window, now_unix, style, shape).rendered(),
-        None => missing_five_hour_label(provider)
-            .unwrap_or_default()
-            .to_string(),
-    }
-}
-
-fn missing_five_hour_label(provider: Provider) -> Option<&'static str> {
-    // Codex matches Grok: omit the 5h token so week can fold onto context.
-    // Claude/Agy keep a visible placeholder on their separate limits row.
-    match provider {
-        Provider::Claude | Provider::Agy => Some("5h N/A"),
-        Provider::Codex
-        | Provider::Grok
-        | Provider::OpenCodeGo
-        | Provider::Omp
-        | Provider::Devin
-        | Provider::Muse
-        | Provider::Cursor => None,
-    }
-}
-
-fn missing_month_label(provider: Provider) -> Option<&'static str> {
-    // Cursor's Included bar is 30d; Grok/Go/omp plans can be monthly. The
-    // others never publish a month token, so an account change must not
-    // invent a 30d N/A row they never showed.
-    match provider {
-        Provider::Cursor | Provider::Grok | Provider::OpenCodeGo | Provider::Omp => Some("30d N/A"),
-        Provider::Codex | Provider::Claude | Provider::Agy | Provider::Devin | Provider::Muse => {
-            None
-        }
-    }
-}
-
-fn missing_five_hour_severity(provider: Provider, quota_5h: &str) -> Option<Severity> {
-    (quota_5h == "5h N/A" && missing_five_hour_label(provider).is_some())
-        .then_some(Severity::Unknown)
 }
 
 /// The percentage the `gauges` context row prints under `style`.
@@ -873,6 +771,24 @@ mod tests {
     }
 
     #[test]
+    fn agy_third_party_pool_renders_as_api() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![
+                window(WindowKind::FiveHour, 15.0, 14_820),
+                window(WindowKind::Weekly, 37.0, 518_400),
+                window(WindowKind::Monthly, 0.0, 518_400).with_source_window("api", None),
+            ],
+            0,
+        );
+        let values = MetadataTokens::from_snapshot(&snapshot, 0);
+        assert!(values.quota_5h.starts_with("5h "), "{values:?}");
+        assert!(values.quota_week.starts_with("7d "), "{values:?}");
+        assert!(values.quota_month.starts_with("api "), "{values:?}");
+        assert!(!values.quota_month.contains("30d"), "{values:?}");
+    }
+
+    #[test]
     fn a_monthly_window_has_its_own_sidebar_token() {
         let snapshot = ProviderSnapshot::new(
             Provider::OpenCodeGo,
@@ -917,31 +833,39 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_fills_the_windows_that_provider_shows() {
+    fn unavailable_omits_window_rows_instead_of_printing_na() {
         let cursor = MetadataTokens::unavailable(Provider::Cursor, "signed-in account changed");
-        assert_eq!(cursor.quota_month, "30d N/A");
-        assert_eq!(cursor.quota_month_severity, Some(Severity::Unknown));
-        assert_eq!(cursor.quota_week, "7d N/A");
+        assert_eq!(cursor.quota_month, "");
+        assert_eq!(cursor.quota_month_severity, None);
+        assert_eq!(cursor.quota_week, "");
         assert_eq!(cursor.quota_5h, "");
+        assert_eq!(
+            cursor.quota_error.as_deref(),
+            Some("signed-in account changed")
+        );
 
         let claude = MetadataTokens::unavailable(Provider::Claude, "signed-in account changed");
-        assert_eq!(claude.quota_5h, "5h N/A");
-        assert_eq!(claude.quota_week, "7d N/A");
+        assert_eq!(claude.quota_5h, "");
+        assert_eq!(claude.quota_week, "");
         assert_eq!(claude.quota_month, "");
-        assert_eq!(claude.quota_month_severity, None);
+        assert_eq!(claude.quota_5h_severity, None);
     }
 
     #[test]
-    fn unavailable_for_windows_replaces_shown_slots_only() {
+    fn unavailable_for_windows_does_not_invent_na_rows() {
         let values = MetadataTokens::unavailable_for_windows(
             Provider::Grok,
             "signed-in account changed",
             &[window(WindowKind::Monthly, 30.0, 1_500_000)],
         );
-        assert_eq!(values.quota_month, "30d N/A");
-        assert_eq!(values.quota_month_severity, Some(Severity::Unknown));
+        assert_eq!(values.quota_month, "");
+        assert_eq!(values.quota_month_severity, None);
         assert_eq!(values.quota_week, "");
         assert_eq!(values.quota_5h, "");
+        assert_eq!(
+            values.quota_error.as_deref(),
+            Some("signed-in account changed")
+        );
     }
 
     /// Fallback only. A weekly window always wins the slot, because it is the
@@ -1435,15 +1359,20 @@ mod tests {
     }
 
     #[test]
-    fn claude_keeps_a_five_hour_placeholder_on_the_limits_row() {
-        let snapshot = ProviderSnapshot::new(
+    fn a_missing_five_hour_window_omits_the_row() {
+        for provider in [
             Provider::Claude,
-            vec![window(WindowKind::Weekly, 31.0, 518_400)],
-            0,
-        );
-        let values = MetadataTokens::from_snapshot(&snapshot, 0);
-        assert_eq!(values.quota_5h, "5h N/A");
-        assert_eq!(values.quota_5h_severity, Some(Severity::Unknown));
+            Provider::Agy,
+            Provider::Codex,
+            Provider::Grok,
+        ] {
+            let snapshot =
+                ProviderSnapshot::new(provider, vec![window(WindowKind::Weekly, 31.0, 518_400)], 0);
+            let values = MetadataTokens::from_snapshot(&snapshot, 0);
+            assert_eq!(values.quota_5h, "", "{provider:?}");
+            assert_eq!(values.quota_5h_severity, None, "{provider:?}");
+            assert_eq!(values.quota_week, "7d 69% 6d0h", "{provider:?}");
+        }
     }
 
     #[test]
@@ -1543,7 +1472,7 @@ mod tests {
             PercentStyle::default(),
             SidebarShape::default(),
         );
-        assert_eq!(unknown.quota_5h, "5h N/A");
+        assert_eq!(unknown.quota_5h, "");
         assert_eq!(unknown.quota_week, "");
     }
 
@@ -1690,8 +1619,8 @@ mod tests {
             0,
         );
         let tokens = MetadataTokens::from_snapshot(&snapshot, 1_001);
-        assert_eq!(tokens.quota_5h, "5h N/A");
-        assert_eq!(tokens.quota_5h_severity, Some(Severity::Unknown));
+        assert_eq!(tokens.quota_5h, "");
+        assert_eq!(tokens.quota_5h_severity, None);
         assert_eq!(tokens.quota_headroom, None);
         assert!(!tokens.quota_5h.contains("80%"), "{tokens:?}");
         assert_eq!(
@@ -1715,8 +1644,8 @@ mod tests {
             0,
         );
         let tokens = MetadataTokens::from_snapshot(&snapshot, 1_001);
-        assert_eq!(tokens.quota_5h, "5h N/A");
-        assert_eq!(tokens.quota_5h_severity, Some(Severity::Unknown));
+        assert_eq!(tokens.quota_5h, "");
+        assert_eq!(tokens.quota_5h_severity, None);
         assert!(tokens.quota_week.starts_with("7d 90%"), "{tokens:?}");
         assert_eq!(tokens.quota_headroom, Some(90));
         assert_eq!(tokens.quota_week_severity, Some(Severity::Normal));
@@ -2064,8 +1993,8 @@ mod tests {
         }
     }
 
-    /// Six cells. The weekly slot renders through `from_snapshot_parts`
-    /// rather than `five_hour_slot`, so it needs its own pin.
+    /// Six cells. The weekly slot renders through `from_snapshot_parts`, so
+    /// it needs its own pin.
     #[test]
     fn the_weekly_window_carries_a_meter_of_its_own() {
         let snapshot = ProviderSnapshot::new(
@@ -2175,10 +2104,8 @@ mod tests {
         assert!(!narrow.quota_week.contains('\u{2026}'));
     }
 
-    /// `missing_five_hour_severity` finds the placeholder by string equality,
-    /// so padding its label would silently drop the Unknown severity.
     #[test]
-    fn the_missing_five_hour_placeholder_is_byte_identical_under_every_layout() {
+    fn a_missing_five_hour_window_stays_omitted_under_every_layout() {
         let snapshot = ProviderSnapshot::new(
             Provider::Claude,
             vec![window(WindowKind::Weekly, 17.0, 424_800)],
@@ -2196,12 +2123,8 @@ mod tests {
                 PercentStyle::Remaining,
                 shape,
             );
-            assert_eq!(values.quota_5h, "5h N/A", "{shape:?}");
-            assert_eq!(
-                values.quota_5h_severity,
-                Some(Severity::Unknown),
-                "{shape:?}"
-            );
+            assert_eq!(values.quota_5h, "", "{shape:?}");
+            assert_eq!(values.quota_5h_severity, None, "{shape:?}");
         }
     }
 

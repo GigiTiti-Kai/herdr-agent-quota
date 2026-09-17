@@ -661,8 +661,9 @@ fn statusline_without_context_keeps_the_last_context_snapshot() {
     run_claude_refresh(state.path(), &herdr_stub);
     let report = fs::read_to_string(herdr_log).unwrap();
     assert!(report.contains("quota_context=context 24%"));
-    assert!(report.contains("quota_week_normal=7d 72%"));
+    assert!(report.contains("quota_week_inline_normal=7d 72%"));
     assert!(!report.contains("quota_week_label="));
+    assert!(!report.contains("quota_week_normal="));
 }
 
 #[test]
@@ -872,7 +873,11 @@ fn claude_new_session_without_rate_limits_cannot_borrow_profile_quota() {
         .find(|line| line.contains("w2:p1"))
         .expect("session B reported");
     assert!(session_a.contains("quota_5h_normal=5h 82%"), "{session_a}");
-    assert!(session_b.contains("quota_5h_unknown=5h N/A"), "{session_b}");
+    assert!(
+        !session_b.contains("quota_5h_unknown=5h N/A"),
+        "{session_b}"
+    );
+    assert!(!session_b.contains("5h 82%"), "{session_b}");
 }
 
 #[test]

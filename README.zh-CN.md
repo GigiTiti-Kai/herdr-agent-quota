@@ -77,9 +77,9 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Grok | CLI billing 接口；7d 或 30d | 当前 CLI 凭据 |
 | Devin | CLI usage 接口；1d 和 7d | 当前 CLI 凭据 |
 | Muse Code | CLI 订阅接口；5h 和 7d | 当前 CLI 账号登录；会话通过 Muse 的 session lock 识别（Linux） |
-| Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；cache 和 cx 来自 CLI hook |
+| Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；`cx` 来自 `store.db` `token_details`（CLI 底栏百分比）；cache 来自 CLI hook |
 | Claude Code | StatusLine；5h 和 7d | 精确会话的观测 |
-| Agy / Antigravity | StatusLine；5h 和 7d | 精确会话与可确认的模型额度池 |
+| Agy / Antigravity | StatusLine；5h、7d，以及 Gemini 会话上的 api（第三方池） | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
 | Pi | 规范 Codex collector 的额度 | 仅在记录的账号一致时复用 |
 | OMP | `omp usage --json --provider <id>` | usage 账号与会话 credential pin 一致 |
@@ -113,7 +113,7 @@ Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
 | Devin 缺少额度 | 检查 CLI 登录；使用自定义路径时检查 `DEVIN_CREDENTIALS_FILE` |
 | Muse 缺少额度 | 运行 `muse login`（API key 登录没有订阅额度）；使用自定义路径时检查 `MUSE_AUTH_PATH`。macOS 上 `storage: "keychain"` 登录还需一次性 Keychain 授权：运行 `herdr-agent-quota refresh --provider muse --keychain-approve`，并点击 **Always Allow** |
 | Cursor 缺少额度 | 运行 `cursor login`，或登录 Cursor 桌面端；使用自定义路径时检查 `CURSOR_AUTH_FILE` |
-| Cursor 缺少 cache/cx | 先重启该 Cursor pane 让它重新加载 `hooks.json`，再发一轮（headless `--print` 不会触发这些 hook） |
+| Cursor 缺少 cache/cx | `cx` 来自该会话的 `store.db`；cache 仍需重启 pane 以加载 `hooks.json` 后再发一轮（headless `--print` 不会触发这些 hook） |
 | 缺少侧栏行 | 运行下面的 configure action 修复插件配置 |
 | 侧栏太窄，`gauges` 不显示进度条 | 约 24 列以下是预期行为；调宽后刷新即可 |
 | 调整宽度后 `gauges` 仍是旧长度 | 用 `prefix+shift+r` 刷新；没有随拖动实时发布的路径 |

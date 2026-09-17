@@ -55,6 +55,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Sidebar quota rows that would have printed `N/A` are omitted instead, for
+  every provider. A missing or expired 5h/7d/30d window no longer occupies a
+  row; `quota_error` still explains an unusable snapshot.
+- Cursor `cx` now reads `store.db` `token_details` (`used_tokens` /
+  `max_tokens`), the same conversation accounting the CLI footer shows as
+  `Auto · 8.1%`. Hook mailboxes still supply cache, and remain the fallback
+  when a session store has no token details.
+- Agy Gemini sessions also publish the third-party (Claude/GPT) pool as `api`
+  on the monthly slot, so that quota is visible without replacing 5h/7d.
+
 - Cursor sidebar topic prefers the generated session title over the last
   `<user_query>`, so a follow-up like "look back at our todos" no longer
   replaces the session name. Placeholder `New Agent` still falls back to the

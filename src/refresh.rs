@@ -282,9 +282,9 @@ fn watch_pass_ids(
 ///   Claude's statusLine hook only writes the observation mailbox, so an idle
 ///   pane whose session gained a fresh window has no other way back in.
 ///
-/// A pane already showing `N/A` for an expired window is the case the second
-/// reading misses: the rendered rows agree, and only the first pulls it in for
-/// the fetch that replaces them.
+/// A pane whose expired window was already omitted is the case the second
+/// reading misses: the rendered rows agree with an empty cache, and only the
+/// first pulls it in for the fetch that replaces them.
 ///
 /// This decides membership only. It loads the one snapshot the pass would read
 /// anyway and publishes nothing.
@@ -909,8 +909,9 @@ enum OmpUsage {
 ///
 /// Process and parse failures remain silent and preserve the last good value.
 /// A successful CLI response that explicitly lists this OAuth account under
-/// `accountsWithoutUsage` is different: without an older snapshot it renders
-/// N/A so a failed upstream quota fetch is not mistaken for missing support.
+/// `accountsWithoutUsage` is different: without an older snapshot it publishes
+/// `quota_error` and omits window rows so a failed upstream quota fetch is
+/// not mistaken for missing support.
 fn refresh_omp_target(
     cache: &CacheStore,
     target: &BillingTarget,
@@ -1551,7 +1552,7 @@ fn tokens_for_loaded_snapshot(
     let usable = match (provider, usable) {
         (Provider::Cursor, Some(snapshot)) => {
             let mut snapshot = snapshot.clone();
-            cursor::overlay_hook_context(&mut snapshot, session_id);
+            cursor::overlay_live_context(&mut snapshot, session_id);
             Some(&*overlaid.insert(snapshot))
         }
         (_, usable) => usable,
@@ -1868,10 +1869,11 @@ mod tests {
         );
         cache.save(&snapshot).unwrap();
 
-        // Its own session had no stored window, so the pane published N/A.
+        // Its own session had no stored window, so the pane omitted 5h
+        // but still carries identity tokens from a previous publish.
         let mut idle = test_pane_with_session("claude-idle", Harness::Claude, "s1");
         idle.tokens
-            .insert("quota_5h_unknown".to_string(), "5h N/A".to_string());
+            .insert("quota_provider".to_string(), "Claude".to_string());
         let panes = [idle, test_pane("grok-working", Harness::Grok)];
         let grok = "grok-working".to_string();
         let mut settling = BTreeMap::new();
@@ -1973,11 +1975,11 @@ mod tests {
         let mut first = test_pane_with_session("claude-first", Harness::Claude, "s1");
         first
             .tokens
-            .insert("quota_5h_unknown".to_string(), "5h N/A".to_string());
+            .insert("quota_provider".to_string(), "Claude".to_string());
         let mut second = test_pane_with_session("claude-second", Harness::Claude, "s2");
         second
             .tokens
-            .insert("quota_5h_unknown".to_string(), "5h N/A".to_string());
+            .insert("quota_provider".to_string(), "Claude".to_string());
         let panes = [first, second, test_pane("grok-working", Harness::Grok)];
         let grok = "grok-working".to_string();
         let mut settling = BTreeMap::new();
@@ -2019,7 +2021,7 @@ mod tests {
             ("a", "7d 80%"),
             ("b", "7d 20%"),
             ("a", "7d 80%"),
-            ("unknown", "7d N/A"),
+            ("unknown", ""),
         ] {
             let evidence = OmpEvidence {
                 paths: crate::omp::OmpPaths {
@@ -2276,7 +2278,7 @@ mod tests {
         let PaneQuotaUpdate::Replace(values) = update else {
             panic!("expected replacement");
         };
-        assert_eq!(values.quota_week, "7d N/A");
+        assert_eq!(values.quota_week, "");
         assert_eq!(
             values.quota_error.as_deref(),
             Some("omp reported no quota data")
@@ -2419,11 +2421,8 @@ mod tests {
             RowStyle::default(),
         )
         .unwrap();
-        assert_eq!(values.quota_week, "7d N/A");
-        assert_eq!(
-            values.quota_week_severity,
-            Some(crate::model::Severity::Unknown)
-        );
+        assert_eq!(values.quota_week, "");
+        assert_eq!(values.quota_week_severity, None);
         assert_eq!(values.quota_month, "");
         assert_eq!(
             values.quota_error.as_deref(),
@@ -2434,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn a_monthly_snapshot_for_the_wrong_account_keeps_the_30d_slot() {
+    fn a_monthly_snapshot_for_the_wrong_account_omits_window_rows() {
         let snapshot = ProviderSnapshot::new(
             Provider::Cursor,
             vec![UsageWindow::new(WindowKind::Monthly, 7.0, None).unwrap()],
@@ -2450,11 +2449,8 @@ mod tests {
             RowStyle::default(),
         )
         .unwrap();
-        assert_eq!(values.quota_month, "30d N/A");
-        assert_eq!(
-            values.quota_month_severity,
-            Some(crate::model::Severity::Unknown)
-        );
+        assert_eq!(values.quota_month, "");
+        assert_eq!(values.quota_month_severity, None);
         assert_eq!(values.quota_week, "");
         assert_eq!(
             values.quota_error.as_deref(),

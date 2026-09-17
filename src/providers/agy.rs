@@ -17,6 +17,8 @@ const GEMINI_FIVE_HOUR_KEYS: [&str; 1] = ["gemini-5h"];
 const GEMINI_WEEKLY_KEYS: [&str; 1] = ["gemini-weekly"];
 const THIRD_PARTY_FIVE_HOUR_KEYS: [&str; 1] = ["3p-5h"];
 const THIRD_PARTY_WEEKLY_KEYS: [&str; 1] = ["3p-weekly"];
+/// Third-party (Claude/GPT) pool shown as `api` while Gemini is the active model.
+const THIRD_PARTY_API_KEYS: [&str; 2] = ["3p-5h", "3p-weekly"];
 
 /// The quota pool that the active model draws from.
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +105,19 @@ pub fn parse_statusline(
     ] {
         if let Some(window) = parse_window(quota, kind, keys, fetched_at_unix)? {
             windows.push(window);
+        }
+    }
+    // Gemini sessions still have a third-party API pool. Publish it on the
+    // spare monthly slot as `api` so it does not replace the Gemini 5h/7d
+    // rows. A Claude/GPT session already uses that pool for 5h/7d.
+    if matches!(pool, Some(Pool::Gemini)) {
+        if let Some(window) = parse_window(
+            quota,
+            WindowKind::Monthly,
+            &THIRD_PARTY_API_KEYS,
+            fetched_at_unix,
+        )? {
+            windows.push(window.with_source_window("api", None));
         }
     }
     if windows.is_empty() && (pool.is_some() || (!has_gemini && !has_third_party)) {
@@ -387,6 +402,55 @@ mod tests {
         );
         assert_remaining_pct(&snapshot, WindowKind::FiveHour, 75.0);
         assert_remaining_pct(&snapshot, WindowKind::Weekly, 90.0);
+        assert_remaining_pct(&snapshot, WindowKind::Monthly, 10.0);
+        assert_eq!(
+            snapshot
+                .window(WindowKind::Monthly)
+                .unwrap()
+                .display_label(),
+            "api"
+        );
+    }
+
+    #[test]
+    fn an_integer_third_party_remaining_fraction_still_renders_api() {
+        let value = json!({
+            "model": {"display_name": "Gemini 3.8 Flash (High)"},
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.8521118, "reset_in_seconds": 16917},
+                "gemini-weekly": {"remaining_fraction": 0.6342774, "reset_in_seconds": 490475},
+                "3p-5h": {"remaining_fraction": 1, "reset_in_seconds": 17908},
+                "3p-weekly": {"remaining_fraction": 1, "reset_in_seconds": 604708}
+            }
+        });
+        let snapshot = parse_statusline(&value, 0).unwrap();
+        assert_remaining_pct(&snapshot, WindowKind::FiveHour, 85.21118);
+        assert_remaining_pct(&snapshot, WindowKind::Weekly, 63.42774);
+        assert_remaining_pct(&snapshot, WindowKind::Monthly, 100.0);
+        assert_eq!(
+            snapshot
+                .window(WindowKind::Monthly)
+                .unwrap()
+                .display_label(),
+            "api"
+        );
+    }
+
+    #[test]
+    fn a_third_party_session_does_not_relabel_gemini_as_api() {
+        let value = json!({
+            "model": {"display_name": "Claude Sonnet 4.5"},
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.0, "reset_in_seconds": 1000},
+                "gemini-weekly": {"remaining_fraction": 0.8, "reset_in_seconds": 7200},
+                "3p-5h": {"remaining_fraction": 0.52, "reset_in_seconds": 5000},
+                "3p-weekly": {"remaining_fraction": 0.84, "reset_in_seconds": 90000}
+            }
+        });
+        let snapshot = parse_statusline(&value, 0).unwrap();
+        assert!(snapshot.window(WindowKind::Monthly).is_none());
+        assert_remaining_pct(&snapshot, WindowKind::FiveHour, 52.0);
+        assert_remaining_pct(&snapshot, WindowKind::Weekly, 84.0);
     }
 
     #[test]

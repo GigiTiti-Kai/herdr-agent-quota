@@ -994,8 +994,8 @@ fn merge_session_windows(
         if let Some(id) = session_id {
             // A statusLine tick that omits `five_hour` is not a report that the
             // window is gone, so restore this session's own last reading before
-            // it becomes the session's stored quota. Without this the sidebar
-            // falls back to `5h N/A` until Claude Code emits the window again.
+            // it becomes the session's stored quota. Without this the 5h row
+            // disappears until Claude Code emits the window again.
             if let Some(previous_windows) =
                 previous.and_then(|previous| previous_windows_for_merge(previous, id, None))
             {
@@ -2525,7 +2525,7 @@ mod tests {
 
     /// A session-local (`session_quota_only`) statusLine observation is the
     /// Claude path: a tick without `five_hour` must not strip the window from
-    /// the session's stored quota, or the sidebar renders `5h N/A`.
+    /// the session's stored quota, or the 5h row disappears.
     #[test]
     fn session_local_statusline_observation_preserves_an_omitted_five_hour_window() {
         let directory = tempdir().unwrap();
