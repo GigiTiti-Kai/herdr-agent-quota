@@ -75,7 +75,10 @@ is already richer than Claude's — it reports `gemini-5h`, `gemini-weekly`,
 
 ## Goals
 
-1. Claude's 5h and 7d figures refresh on the watcher interval while the pane is idle.
+1. Claude's 5h and 7d figures refresh on the watcher interval while the pane is
+   idle, for the session the newest statusLine observation names. "While idle"
+   means between turns with a watcher alive — the watch loop is turn-scoped and
+   exits when no pane is working, so this is not an indefinite background poll.
 2. The model-scoped weekly cap appears as its own sidebar row.
 3. The fork stays cheap to re-sync with upstream.
 
@@ -100,10 +103,27 @@ authoritative for, and neither is asked for the other's data.
 | 5h / 7d / model-scoped weekly | **new API collector** (account-wide, pollable) |
 | context %, cache %, TTL, model, topic | existing statusLine (per session) |
 
-This also fixes an existing limitation. Today's comment in `refresh.rs` notes
-that Claude observations are not shared across sessions because the statusLine
-reports no reliable serving account. The API result is keyed by the credential,
-so one fetch serves every Claude pane.
+The API result *is* keyed by the credential rather than the session, so in
+principle one fetch could serve every Claude pane. **This design does not deliver
+that**, and the paragraph that claimed it has been corrected here after the final
+review proved otherwise.
+
+The merged snapshot stays session-local. `ProviderSnapshot::usable_for_account`
+(`src/model.rs:838`) treats a Claude snapshot as unusable when it carries no
+account id and is not session-local, and nothing stamps Claude with an account id
+— `current_account_gate` has no Claude arm. Clearing the session-local flag to get
+account-wide sharing therefore makes every Claude pane render "signed-in account
+changed" instead of quota.
+
+Account-wide sharing needs three further changes, all out of scope here: a real
+Claude account gate stamped on both the API and the statusLine paths, a rewrite of
+`session_windows` on API success so a stale per-session list cannot outrank fresh
+top-level windows, and `WeeklyScoped` added to `merge_profile_quota_windows`.
+
+What ships: the fresh API windows land on the session named by the newest
+statusLine observation, which is the same reach Codex and Grok already have. Goal 1
+holds — an idle pane refreshes on the watcher interval — for that session. With
+several Claude panes, the most recently active one is the one kept current.
 
 ### New module: `src/providers/claude_api.rs`
 

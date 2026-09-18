@@ -1289,13 +1289,21 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
     })
 }
 
-/// Claude quota is account-wide and pollable; context, cache, model and topic
-/// are per session and only the statusLine has them. Take the windows from the
+/// Claude quota is pollable without a turn; context, cache, model and topic are
+/// per session and only the statusLine has them. Take the windows from the
 /// endpoint and keep everything else the session already reported.
 ///
-/// Either source alone is still publishable: with no statusLine observation the
-/// endpoint gives quota without context, and with no endpoint we degrade to
-/// exactly the behaviour that shipped before this collector existed.
+/// The merged reading stays session-local, exactly like the statusLine one it
+/// replaces: Claude has no account gate, and a snapshot that claims to be
+/// account-wide without an `account_id` is rejected by
+/// [`ProviderSnapshot::usable_for_account`]. The endpoint therefore refreshes
+/// the session the newest statusLine observation names, which is the same
+/// scope Codex and Grok already publish at.
+///
+/// With no endpoint we degrade to exactly the behaviour that shipped before
+/// this collector existed. With no statusLine observation there is no session
+/// to attach the windows to, so the fetch only keeps the cache warm until the
+/// hook first runs.
 fn overlay_claude_windows(
     api: Result<ProviderSnapshot>,
     statusline: Result<FetchedSnapshot>,
@@ -1303,7 +1311,6 @@ fn overlay_claude_windows(
     match (api, statusline) {
         (Ok(api), Ok(mut fetched)) => {
             fetched.snapshot.windows = api.windows;
-            fetched.snapshot.session_quota_only = false;
             Ok(fetched)
         }
         (Ok(api), Err(_)) => Ok(FetchedSnapshot::direct(api)),
@@ -3022,8 +3029,59 @@ mod tests {
         assert_eq!(merged.snapshot.model.as_deref(), Some("Opus 5"));
         assert_eq!(merged.session_id.as_deref(), Some("session-1"));
         assert!(merged.preserve_context);
-        // The reading is account-wide now, so panes may share it.
-        assert!(!merged.snapshot.session_quota_only);
+        assert!(merged.snapshot.session_quota_only);
+    }
+
+    /// The whole path a Claude pane actually walks: overlay, save, reload, and
+    /// render. A merged snapshot that is not session-local carries no
+    /// `account_id` either, which `usable_for_account` rejects outright, so
+    /// every row blanked behind "signed-in account changed" while the unit
+    /// tests either side of the seam stayed green.
+    #[test]
+    fn a_merged_claude_snapshot_still_renders_after_a_cache_round_trip() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let api = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                UsageWindow::new(
+                    WindowKind::Weekly,
+                    62.0,
+                    Some(ResetAt::from_unix_seconds(200_000)),
+                )
+                .unwrap(),
+                UsageWindow::new(
+                    WindowKind::WeeklyScoped,
+                    92.0,
+                    Some(ResetAt::from_unix_seconds(200_000)),
+                )
+                .unwrap()
+                .with_source_window("Fab", None),
+            ],
+            10,
+        );
+        let merged = overlay_claude_windows(Ok(api), Ok(statusline_fetched(10.0))).unwrap();
+        cache
+            .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
+            .unwrap();
+
+        let snapshot = cache.load(Provider::Claude).unwrap();
+        // Claude has no account gate: `current_account_gate` returns `(None, None)`.
+        let usable = snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.usable_for_account(None, None));
+        let tokens = tokens_for_loaded_snapshot(
+            Provider::Claude,
+            snapshot.as_ref(),
+            usable,
+            1_000,
+            Some("session-1"),
+            RowStyle::new(PercentStyle::default(), SidebarLayout::Packed.into()),
+        )
+        .expect("a cached Claude snapshot must render");
+        assert_eq!(tokens.quota_error, None, "{tokens:?}");
+        assert!(!tokens.quota_week.is_empty(), "{tokens:?}");
+        assert!(tokens.quota_week_scoped.contains("Fab"), "{tokens:?}");
     }
 
     #[test]

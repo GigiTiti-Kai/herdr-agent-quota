@@ -126,8 +126,10 @@ pub fn parse_usage(value: &Value, fetched_at_unix: u64) -> Result<ProviderSnapsh
             "no known quota window in limits".to_string(),
         ));
     }
-    // No `session_local()`: this reading is keyed by the credential, so every
-    // Claude pane on this login may share it.
+    // No `session_local()` here: this is the raw endpoint reading. The caller
+    // (`overlay_claude_windows`) marks the merged snapshot session-local before
+    // it is cached, because Claude snapshots have no account gate to be
+    // validated against.
     Ok(ProviderSnapshot::new(
         Provider::Claude,
         windows,
