@@ -706,7 +706,7 @@ mod tests {
                 "--row-gap",
                 "1",
                 "--fields",
-                "provider,model,cache,ttl,context,5h,7d,30d",
+                "provider,model,cache,ttl,context,5h,7d,week-scoped,30d",
                 "--agent-order",
                 "quota",
                 "--low-quota-alert",

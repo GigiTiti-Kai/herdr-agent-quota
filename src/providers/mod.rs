@@ -1,5 +1,6 @@
 pub mod agy;
 pub mod claude;
+pub mod claude_api;
 pub mod codex;
 pub mod cursor;
 pub mod devin;

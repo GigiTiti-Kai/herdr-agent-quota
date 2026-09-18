@@ -96,6 +96,14 @@ esac
             .env("HERDR_SOCKET_PATH", root.join("herdr.sock"))
             .env("XDG_STATE_HOME", root.join("xdg-state"))
             .env("CLAUDE_CONFIG_DIR", root.join("claude"))
+            // Absent on purpose: without it the Claude collector falls back to
+            // `$HOME/.claude/.credentials.json` and sends a real authenticated
+            // request to the usage endpoint, so the fixtures below lose to the
+            // developer's live account.
+            .env(
+                "CLAUDE_CREDENTIALS_FILE",
+                root.join("absent-claude-auth.json"),
+            )
             .env("HERDR_AGENT_QUOTA_AGENTS", "claude")
             .env("TEST_INVENTORY", root.join("inventory.json"))
             .env("TEST_CALLS", root.join("calls"))

@@ -274,6 +274,12 @@ pub enum WindowKind {
     /// Cached and rendered in the dashboard only. The sidebar has no monthly
     /// token, and a 30d value must never be published through a weekly one.
     Monthly,
+    /// A weekly cap that applies to one model rather than the whole account.
+    /// Deliberately not `Weekly` with a different label: the account-wide
+    /// weekly is a different number, and two rows both reading `7d` would be
+    /// the confusion this enum exists to prevent. The model name arrives as
+    /// the window's `source_label`.
+    WeeklyScoped,
 }
 
 impl WindowKind {
@@ -282,13 +288,18 @@ impl WindowKind {
             Self::FiveHour => "5h",
             Self::Weekly => "7d",
             Self::Monthly => "30d",
+            // Never shown: a scoped window always carries a `source_label`,
+            // which `display_label` prefers. This is the safety net.
+            Self::WeeklyScoped => "wks",
         }
     }
 
     pub fn duration_seconds(self) -> u64 {
         match self {
             Self::FiveHour => 5 * 60 * 60,
-            Self::Weekly => 7 * 24 * 60 * 60,
+            // Same period as the account-wide weekly: it is a weekly cap,
+            // just scoped to one model instead of the whole account.
+            Self::Weekly | Self::WeeklyScoped => 7 * 24 * 60 * 60,
             Self::Monthly => 30 * 24 * 60 * 60,
         }
     }

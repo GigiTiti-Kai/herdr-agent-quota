@@ -223,11 +223,12 @@ pub enum SidebarField {
     Context,
     FiveHour,
     Week,
+    WeekScoped,
     Month,
 }
 
 impl SidebarField {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Provider,
         Self::Topic,
         Self::Model,
@@ -236,6 +237,7 @@ impl SidebarField {
         Self::Context,
         Self::FiveHour,
         Self::Week,
+        Self::WeekScoped,
         Self::Month,
     ];
 
@@ -249,6 +251,7 @@ impl SidebarField {
             Self::Context => "context",
             Self::FiveHour => "5h",
             Self::Week => "7d",
+            Self::WeekScoped => "week-scoped",
             Self::Month => "30d",
         }
     }
@@ -276,9 +279,10 @@ impl SidebarField {
 
 /// Which quota fields the sidebar shows.
 ///
-/// Default is provider, topic, model, context, 5h, 7d, and 30d. Cache and TTL
-/// stay off until the user turns them on — most installs care about quota and
-/// context first, and those two rows add noise on a gauges layout.
+/// Default is provider, topic, model, context, 5h, 7d, the model-scoped 7d
+/// row, and 30d. Cache and TTL stay off until the user turns them on — most
+/// installs care about quota and context first, and those two rows add noise
+/// on a gauges layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSet(u16);
 
@@ -295,6 +299,10 @@ impl FieldSet {
     /// Marker for "everything except 30d". That selection is otherwise the
     /// list a pre-`30d` build stored for "everything on".
     const NO_MONTH: &'static str = "no-30d";
+    /// Marker for "everything except the scoped weekly row". That selection
+    /// is otherwise the list a pre-`week-scoped` build stored for "everything
+    /// on".
+    const NO_WEEK_SCOPED: &'static str = "no-week-scoped";
 
     pub fn all() -> Self {
         Self(
@@ -328,6 +336,12 @@ impl FieldSet {
         Self(Self::legacy_pre_provider_full().0 | SidebarField::Provider.bit())
     }
 
+    /// The field list a build without a scoped-weekly field wrote for
+    /// "everything on" — every field up to and including 30d.
+    fn legacy_pre_scoped_full() -> Self {
+        Self(Self::legacy_full().0 | SidebarField::Month.bit())
+    }
+
     pub fn contains(self, field: SidebarField) -> bool {
         self.0 & field.bit() != 0
     }
@@ -357,23 +371,26 @@ impl FieldSet {
             .collect::<Vec<_>>()
             .join(",");
         let mut markers = Vec::new();
-        if !self.contains(SidebarField::Provider)
-            && (self == Self::all().toggled(SidebarField::Provider)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Provider)
-                        .toggled(SidebarField::Month))
-        {
+        // `parse` only ever consults a marker to skip one legacy-list rescue,
+        // and each rescued pattern is frozen without the field its own marker
+        // names (`legacy_pre_provider_full` has no Provider, `legacy_full` no
+        // Month, `legacy_pre_scoped_full` no WeekScoped). So a selection can
+        // only ever match a rescued pattern while that field is off, which
+        // means writing the marker whenever the field is off is always either
+        // the exact suppression `parse` needs, or a marker `parse` reads back
+        // without ever consulting it — never a behaviour change either way,
+        // just a token nothing reads in the cases that did not need it. That
+        // also makes the marker inert to any older or newer build that meets
+        // it: an unrecognised marker token is skipped like any other unknown
+        // field name.
+        if !self.contains(SidebarField::Provider) {
             markers.push(Self::NO_PROVIDER);
         }
-        if !self.contains(SidebarField::Month)
-            && (self == Self::all().toggled(SidebarField::Month)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Provider)
-                        .toggled(SidebarField::Month))
-        {
+        if !self.contains(SidebarField::Month) {
             markers.push(Self::NO_MONTH);
+        }
+        if !self.contains(SidebarField::WeekScoped) {
+            markers.push(Self::NO_WEEK_SCOPED);
         }
         if markers.is_empty() {
             names
@@ -402,6 +419,7 @@ impl FieldSet {
         let mut bits = 0u16;
         let mut provider_named = false;
         let mut month_excluded = false;
+        let mut week_scoped_excluded = false;
         for token in raw.split(',').map(str::trim) {
             if token.eq_ignore_ascii_case(Self::NO_PROVIDER) {
                 provider_named = true;
@@ -409,6 +427,10 @@ impl FieldSet {
             }
             if token.eq_ignore_ascii_case(Self::NO_MONTH) {
                 month_excluded = true;
+                continue;
+            }
+            if token.eq_ignore_ascii_case(Self::NO_WEEK_SCOPED) {
+                week_scoped_excluded = true;
                 continue;
             }
             let Some(field) = SidebarField::parse(token) else {
@@ -422,6 +444,9 @@ impl FieldSet {
             return Some(Self::all());
         }
         if !month_excluded && fields == Self::legacy_full() {
+            return Some(Self::all());
+        }
+        if !week_scoped_excluded && fields == Self::legacy_pre_scoped_full() {
             return Some(Self::all());
         }
         (bits != 0).then_some(fields)
@@ -1374,5 +1399,59 @@ mod tests {
             Some(without_month)
         );
         assert!(without_month.as_list().starts_with("no-30d,"));
+    }
+
+    /// Adding week-scoped is the same shape as adding 30d before it: a saved
+    /// "everything on" list from the previous build never named the new
+    /// field, so that exact list still has to read as `all()`.
+    #[test]
+    fn the_pre_scoped_full_list_still_selects_every_field() {
+        assert_eq!(
+            FieldSet::parse("provider,topic,model,cache,ttl,context,5h,7d,30d"),
+            Some(FieldSet::all())
+        );
+        let without_week_scoped = FieldSet::all().toggled(SidebarField::WeekScoped);
+        assert_eq!(
+            FieldSet::parse(&without_week_scoped.as_list()),
+            Some(without_week_scoped)
+        );
+        assert!(without_week_scoped.as_list().starts_with("no-week-scoped,"));
+    }
+
+    /// Dropping week-scoped together with an older field reopens that older
+    /// field's own legacy collision (the remaining names now also match a
+    /// list from before *that* field existed), so both markers must survive
+    /// the round trip together.
+    #[test]
+    fn combined_legacy_collisions_survive_the_round_trip() {
+        let without_month_or_scoped = FieldSet::all()
+            .toggled(SidebarField::Month)
+            .toggled(SidebarField::WeekScoped);
+        assert_eq!(
+            FieldSet::parse(&without_month_or_scoped.as_list()),
+            Some(without_month_or_scoped)
+        );
+
+        let without_provider_month_or_scoped = FieldSet::all()
+            .toggled(SidebarField::Provider)
+            .toggled(SidebarField::Month)
+            .toggled(SidebarField::WeekScoped);
+        assert_eq!(
+            FieldSet::parse(&without_provider_month_or_scoped.as_list()),
+            Some(without_provider_month_or_scoped)
+        );
+
+        // Dropping week-scoped alongside the provider only (month stays on)
+        // never collides with a legacy list, but the round trip still has to
+        // hold: `as_list` writes both markers unconditionally, and `parse`
+        // must recover the exact same selection even though neither marker
+        // was actually needed to avoid a legacy match here.
+        let without_provider_or_scoped = FieldSet::all()
+            .toggled(SidebarField::Provider)
+            .toggled(SidebarField::WeekScoped);
+        assert_eq!(
+            FieldSet::parse(&without_provider_or_scoped.as_list()),
+            Some(without_provider_or_scoped)
+        );
     }
 }

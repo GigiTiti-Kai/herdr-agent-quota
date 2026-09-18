@@ -114,6 +114,7 @@ fn every_supported_working_harness_keeps_the_watcher_alive() {
             .env("MUSE_AUTH_PATH", dir.path().join("absent"))
             .env("CURSOR_AUTH_FILE", dir.path().join("absent"))
             .env("CURSOR_STATE_DB", dir.path().join("absent"))
+            .env("CLAUDE_CREDENTIALS_FILE", dir.path().join("absent"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -164,6 +165,7 @@ printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","agent":"codex","agent_st
             .env("MUSE_AUTH_PATH", dir.path().join("absent"))
             .env("CURSOR_AUTH_FILE", dir.path().join("absent"))
             .env("CURSOR_STATE_DB", dir.path().join("absent"))
+            .env("CLAUDE_CREDENTIALS_FILE", dir.path().join("absent"))
             .env("TEST_LOG", &log)
             .stdout(Stdio::null())
             .stderr(Stdio::null());

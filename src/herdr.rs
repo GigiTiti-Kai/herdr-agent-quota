@@ -14,7 +14,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 34] = [
+const METADATA_TOKEN_NAMES: [&str; 38] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
@@ -42,6 +42,10 @@ const METADATA_TOKEN_NAMES: [&str; 34] = [
     "quota_week_inline_warning",
     "quota_week_inline_danger",
     "quota_week_inline_unknown",
+    "quota_week_scoped_normal",
+    "quota_week_scoped_warning",
+    "quota_week_scoped_danger",
+    "quota_week_scoped_unknown",
     "quota_month_normal",
     "quota_month_warning",
     "quota_month_danger",
@@ -64,7 +68,7 @@ pub(crate) const HEADROOM_TOKEN: &str = "quota_headroom";
 /// The subset of [`METADATA_TOKEN_NAMES`] whose value comes from the cached
 /// quota windows and nothing else. [`quota_rows_have_drifted`] compares these,
 /// so a name added here must be one a snapshot alone can render.
-const QUOTA_WINDOW_TOKEN_NAMES: [&str; 17] = [
+const QUOTA_WINDOW_TOKEN_NAMES: [&str; 21] = [
     "quota_5h_normal",
     "quota_5h_warning",
     "quota_5h_danger",
@@ -77,6 +81,10 @@ const QUOTA_WINDOW_TOKEN_NAMES: [&str; 17] = [
     "quota_week_inline_warning",
     "quota_week_inline_danger",
     "quota_week_inline_unknown",
+    "quota_week_scoped_normal",
+    "quota_week_scoped_warning",
+    "quota_week_scoped_danger",
+    "quota_week_scoped_unknown",
     "quota_month_normal",
     "quota_month_warning",
     "quota_month_danger",
@@ -1258,6 +1266,12 @@ fn desired_tokens(
         week_base,
         &values.quota_week,
         values.quota_week_severity,
+    );
+    insert_severity_token(
+        &mut tokens,
+        "quota_week_scoped",
+        &values.quota_week_scoped,
+        values.quota_week_scoped_severity,
     );
     insert_severity_token(
         &mut tokens,
@@ -2459,6 +2473,13 @@ mod tests {
                     Some(crate::model::ResetAt::from_unix_seconds(183_600)),
                 )
                 .unwrap(),
+                crate::model::UsageWindow::new(
+                    crate::model::WindowKind::WeeklyScoped,
+                    40.0,
+                    Some(crate::model::ResetAt::from_unix_seconds(183_600)),
+                )
+                .unwrap()
+                .with_source_window("Fab", None),
             ],
             0,
         )
@@ -2485,6 +2506,11 @@ mod tests {
         );
         let desired = desired_tokens(&values, "prompt", gauges);
         assert!(desired.contains_key("quota_context_danger"));
+        // The scoped row is part of the worst case, not an optional extra.
+        assert!(
+            desired.contains_key("quota_week_scoped_normal"),
+            "{desired:?}"
+        );
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
@@ -2652,6 +2678,73 @@ mod tests {
         assert!(!desired.contains_key("quota_5h_label"));
         assert!(desired.contains_key("quota_week_inline_normal"));
         assert!(!desired.contains_key("quota_week_normal"));
+    }
+
+    /// A scoped weekly cap is legitimately absent most of the time — not
+    /// every account or model has one, and it never carries over from a
+    /// prior observation the way 5h/7d do. Absence must publish nothing, not
+    /// an empty or stale row.
+    #[test]
+    fn an_absent_scoped_weekly_window_publishes_no_row() {
+        let snapshot = crate::model::ProviderSnapshot::new(
+            Provider::Claude,
+            vec![crate::model::UsageWindow::new(
+                crate::model::WindowKind::Weekly,
+                31.0,
+                Some(crate::model::ResetAt::from_unix_seconds(183_600)),
+            )
+            .unwrap()],
+            0,
+        );
+        let desired = desired_tokens(
+            &MetadataTokens::from_snapshot(&snapshot, 0),
+            "prompt",
+            SidebarShape::default(),
+        );
+        assert!(
+            !desired
+                .keys()
+                .any(|name| name.starts_with("quota_week_scoped")),
+            "{desired:?}"
+        );
+    }
+
+    #[test]
+    fn a_scoped_weekly_window_publishes_its_own_row_named_by_model() {
+        let snapshot = crate::model::ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                crate::model::UsageWindow::new(
+                    crate::model::WindowKind::FiveHour,
+                    10.0,
+                    Some(crate::model::ResetAt::from_unix_seconds(3_600)),
+                )
+                .unwrap(),
+                crate::model::UsageWindow::new(
+                    crate::model::WindowKind::Weekly,
+                    31.0,
+                    Some(crate::model::ResetAt::from_unix_seconds(183_600)),
+                )
+                .unwrap(),
+                crate::model::UsageWindow::new(crate::model::WindowKind::WeeklyScoped, 92.0, None)
+                    .unwrap()
+                    .with_source_window("Fab", None),
+            ],
+            0,
+        );
+        let desired = desired_tokens(
+            &MetadataTokens::from_snapshot(&snapshot, 0),
+            "prompt",
+            SidebarShape::default(),
+        );
+        assert!(
+            desired
+                .get("quota_week_scoped_danger")
+                .is_some_and(|value| value.contains("Fab")),
+            "{desired:?}"
+        );
+        // Untouched by the account-wide weekly row beside it.
+        assert!(desired.contains_key("quota_week_normal"));
     }
 
     #[test]

@@ -48,3 +48,22 @@ rebuild is enough — Herdr does not need reinstalling. Pick the new binary up w
     herdr plugin action invoke refresh --plugin herdr-agent-quota
 
 Settings and cached quota survive a rebuild.
+
+A change to `herdr-plugin.toml` is the exception. Herdr copies the manifest into
+`~/.config/herdr/plugins.json` when the plugin is linked and reads its own copy
+afterwards, so a rebuild alone leaves the old pane sizes, actions and events in
+place. Run `./install.sh` for those; it relinks and keeps existing preferences.
+
+If you ever run an *older* build after a newer one, it meets a cached snapshot
+containing window kinds it does not know. Loading it fails outright, which
+aborts the whole refresh: no pane is updated at all, so the sidebar keeps
+whatever it last showed rather than going blank. Recover by
+deleting that provider's cached snapshot and refreshing — the state directory is
+`~/.local/state/herdr/plugins/herdr-agent-quota/` and the file is named after the
+source (`claude-statusline.json`, `codex-app-server.json`, ...):
+
+    rm -f ~/.local/state/herdr/plugins/herdr-agent-quota/claude-statusline.json
+    herdr plugin action invoke refresh --plugin herdr-agent-quota
+
+The sidebar field preference lives beside it in `fields` and is not touched by
+that, so a field you turned on stays on.

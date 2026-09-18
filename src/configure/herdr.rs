@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 51] = [
+const QUOTA_ROW_MARKERS: [&str; 55] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -55,6 +55,10 @@ const QUOTA_ROW_MARKERS: [&str; 51] = [
     "$quota_week_inline_warning",
     "$quota_week_inline_danger",
     "$quota_week_inline_unknown",
+    "$quota_week_scoped_normal",
+    "$quota_week_scoped_warning",
+    "$quota_week_scoped_danger",
+    "$quota_week_scoped_unknown",
     "$quota_month_normal",
     "$quota_month_warning",
     "$quota_month_danger",
@@ -1112,6 +1116,11 @@ fn append_stacked_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     append_window_style_tokens(&mut week, "quota_week_inline", palette);
     append_window_style_tokens(&mut week, "quota_week", palette);
     rows.push(Value::Array(week));
+    // Own row, unlike week: a scoped cap never folds onto the context row,
+    // it just renders or (far more often) does not.
+    let mut week_scoped = Array::new();
+    append_window_style_tokens(&mut week_scoped, "quota_week_scoped", palette);
+    rows.push(Value::Array(week_scoped));
     let mut month = Array::new();
     append_window_style_tokens(&mut month, "quota_month", palette);
     rows.push(Value::Array(month));
@@ -1182,6 +1191,9 @@ fn field_for_token(token: &str) -> Option<SidebarField> {
         | "$quota_context_warning"
         | "$quota_context_danger" => Some(SidebarField::Context),
         _ if token.starts_with("$quota_5h") => Some(SidebarField::FiveHour),
+        // Checked before the bare `$quota_week` prefix below, which would
+        // otherwise also match `$quota_week_scoped_*` and hide the wrong row.
+        _ if token.starts_with("$quota_week_scoped") => Some(SidebarField::WeekScoped),
         _ if token.starts_with("$quota_week") => Some(SidebarField::Week),
         _ if token.starts_with("$quota_month") => Some(SidebarField::Month),
         _ => None,
@@ -1244,7 +1256,7 @@ fn append_context_style_tokens(row: &mut Array, palette: [&'static str; 3]) {
 
 fn append_window_row(rows: &mut Array, palette: [&'static str; 3]) {
     let mut row = Array::new();
-    for base in ["quota_5h", "quota_week", "quota_month"] {
+    for base in ["quota_5h", "quota_week", "quota_week_scoped", "quota_month"] {
         append_window_style_tokens(&mut row, base, palette);
     }
     rows.push(Value::Array(row));
@@ -2003,8 +2015,10 @@ rows = [["state_icon", "agent"]]
     }
 
     /// The bytes `packed` and `stacked` write for the agents that existed
-    /// before Muse. A 30d row was added after gauges; these digests track that
-    /// template. An agent added since only appends its own row style.
+    /// before Muse. A 30d row was added after gauges, and a scoped-weekly row
+    /// after that; these digests track that template. This is a default-config
+    /// snapshot, not a wire fixture, so it is expected to move when a field is
+    /// added. An agent added since only appends its own row style.
     #[test]
     fn packed_and_stacked_write_the_same_bytes_as_before_gauges() {
         use sha2::{Digest, Sha256};
@@ -2016,22 +2030,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "a964acd82452de5c16495c47feff70dfbc970607b7f4d0f084795b141342a817",
-                    "9d13cdfc670b3a9330788e9244dffd9e0dba6980620b2df7c738763c27dfd625",
+                    "e4093ac77241ca545e93e4841b023a3762ac2420fc267e5b8370423724500256",
+                    "9db812a5e254c04ab2a268251999aeb33ba3e3cdd042d586f293346445f1677f",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "0b59e8f4e537ace0b0a555f8cf908afb1b1f2d86cf19cb88b2a6edf786ca4967",
-                    "1aeb9b78813a222c7e7590a8c88afa88f48df16f9364b4298f4f966458f14ef3",
+                    "3737b1ddef913b9eb5540cf7786d0112fd2ce6086f75c165bb6b92f0d4411cc5",
+                    "fcf1e39a22f857a555ae74c8206af3aa205bd0df566e0a69f453f453f74cf1a7",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "0b59e8f4e537ace0b0a555f8cf908afb1b1f2d86cf19cb88b2a6edf786ca4967",
-                    "1aeb9b78813a222c7e7590a8c88afa88f48df16f9364b4298f4f966458f14ef3",
+                    "3737b1ddef913b9eb5540cf7786d0112fd2ce6086f75c165bb6b92f0d4411cc5",
+                    "fcf1e39a22f857a555ae74c8206af3aa205bd0df566e0a69f453f453f74cf1a7",
                 ],
             ),
         ] {
@@ -3114,7 +3128,8 @@ mod field_tests {
         let windowless = gauges(
             FieldSet::all()
                 .toggled(SidebarField::FiveHour)
-                .toggled(SidebarField::Week),
+                .toggled(SidebarField::Week)
+                .toggled(SidebarField::WeekScoped),
         );
         assert!(!windowless.contains("$quota_5h"), "{windowless}");
         assert!(!windowless.contains("$quota_week"), "{windowless}");
