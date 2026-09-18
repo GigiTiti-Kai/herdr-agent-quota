@@ -247,15 +247,6 @@ impl AgentStatus {
     pub fn is_working(self) -> bool {
         matches!(self, Self::Working)
     }
-
-    /// Metadata token that carries the brand glyph for this status.
-    fn icon_token(self) -> &'static str {
-        match self {
-            Self::Working => "quota_icon_working",
-            Self::Done => "quota_icon_done",
-            Self::Idle | Self::Blocked | Self::Unknown => "quota_icon",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,10 +290,25 @@ impl AgentPane {
     }
 
     pub fn icon_needs_update(&self) -> bool {
-        let active = self.icon_status().icon_token();
-        ICON_TOKEN_NAMES
-            .into_iter()
-            .any(|name| self.tokens.contains_key(name) != (name == active))
+        // Old installs published colour twins; a leftover name must be
+        // cleared even after the layout moved colour onto `$quota_icon`.
+        if self.tokens.contains_key("quota_icon_working")
+            || self.tokens.contains_key("quota_icon_done")
+        {
+            return true;
+        }
+        let value = self
+            .tokens
+            .get("quota_icon")
+            .map(String::as_str)
+            .unwrap_or("");
+        let working = value.contains(crate::icons::WORKING_TAG);
+        let done = value.contains(crate::icons::DONE_TAG);
+        match self.icon_status() {
+            AgentStatus::Working => !working || done,
+            AgentStatus::Done => !done,
+            _ => working || done || value.is_empty(),
+        }
     }
 }
 
@@ -1483,11 +1489,13 @@ const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_
 
 /// Vendor mark always; group header only on the Space head pane.
 ///
-/// Exactly one of `$quota_icon` / `_working` / `_done` is published so the
-/// brand glyph itself carries Herdr's status colour (no `state_icon` ring).
-/// Members prefix the logo with [`GROUP_MEMBER_INDENT`]. Heads publish the
-/// bare glyph — Herdr already hang-indents their continuation rows. Stale
-/// `$quota_pad` from older builds is cleared.
+/// `$quota_icon` always carries the glyph so it stays the first identity
+/// token. Working/done colour is an invisible suffix matched by Herdr
+/// `rules`; publishing a later twin on a Space head hang-indents the mark
+/// one cell to the right. Members prefix the logo with
+/// [`GROUP_MEMBER_INDENT`]. Heads publish the bare glyph — Herdr already
+/// hang-indents their continuation rows. Stale `$quota_pad` from older
+/// builds is cleared, as are leftover `_working` / `_done` twins.
 fn apply_group_and_icon(
     desired: &mut BTreeMap<String, String>,
     pane: &AgentPane,
@@ -1512,21 +1520,19 @@ fn apply_group_and_icon(
             indent_token(desired, "quota_model");
         }
     } else {
-        let mark = if member {
+        let mut mark = if member {
             format!("{GROUP_MEMBER_INDENT}{glyph}")
         } else {
             glyph.to_string()
         };
-        let active = icon_status
-            .unwrap_or_else(|| pane.icon_status())
-            .icon_token();
-        for token in ICON_TOKEN_NAMES {
-            if token == active {
-                desired.insert(token.to_string(), mark.clone());
-            } else {
-                desired.remove(token);
-            }
+        match icon_status.unwrap_or_else(|| pane.icon_status()) {
+            AgentStatus::Working => mark.push_str(crate::icons::WORKING_TAG),
+            AgentStatus::Done => mark.push_str(crate::icons::DONE_TAG),
+            _ => {}
         }
+        desired.insert("quota_icon".to_string(), mark);
+        desired.remove("quota_icon_working");
+        desired.remove("quota_icon_done");
         desired.remove(NEST_GAP_TOKEN);
     }
     desired.remove("quota_pad");
@@ -2684,8 +2690,8 @@ mod tests {
             "indent glued to a glyph must survive Unicode trim"
         );
 
-        // Brand icon colour follows agent_status: working publishes the
-        // yellow twin and clears idle/done so only one glyph shows.
+        // Brand icon colour follows agent_status on `$quota_icon` so a Space
+        // head does not hang-indent a later twin one cell to the right.
         let mut working = sibling.clone();
         working.status = AgentStatus::Working;
         let mut working_desired = BTreeMap::from([
@@ -2701,12 +2707,13 @@ mod tests {
             None,
         );
         assert!(
-            working_desired
-                .get("quota_icon_working")
-                .is_some_and(|icon| icon.starts_with(GROUP_MEMBER_INDENT)),
-            "working panes publish the yellow brand icon"
+            working_desired.get("quota_icon").is_some_and(|icon| {
+                icon.starts_with(GROUP_MEMBER_INDENT) && icon.contains(crate::icons::WORKING_TAG)
+            }),
+            "working panes tag the brand icon: {:?}",
+            working_desired.get("quota_icon")
         );
-        assert!(!working_desired.contains_key("quota_icon"));
+        assert!(!working_desired.contains_key("quota_icon_working"));
         assert!(!working_desired.contains_key("quota_icon_done"));
 
         let mut done = sibling.clone();
@@ -2720,9 +2727,37 @@ mod tests {
             VendorRow::Flat,
             None,
         );
-        assert!(done_desired.contains_key("quota_icon_done"));
-        assert!(!done_desired.contains_key("quota_icon"));
+        assert!(
+            done_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.contains(crate::icons::DONE_TAG)),
+            "done panes tag the brand icon: {:?}",
+            done_desired.get("quota_icon")
+        );
+        assert!(!done_desired.contains_key("quota_icon_done"));
         assert!(!done_desired.contains_key("quota_icon_working"));
+
+        let mut head_done = head.clone();
+        head_done.status = AgentStatus::Done;
+        let mut head_done_desired = BTreeMap::new();
+        apply_group_and_icon(
+            &mut head_done_desired,
+            &head_done,
+            &heads,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
+        let want_head_done = format!(
+            "{}{}",
+            crate::icons::for_harness(Harness::Codex),
+            crate::icons::DONE_TAG
+        );
+        assert_eq!(
+            head_done_desired.get("quota_icon").map(String::as_str),
+            Some(want_head_done.as_str()),
+            "Space-head done icon stays on the first identity token"
+        );
 
         // Merely being focused when a turn finishes does not acknowledge it.
         let mut seen = done.clone();
@@ -2737,10 +2772,11 @@ mod tests {
             None,
         );
         assert!(
-            seen_desired.contains_key("quota_icon_done"),
+            seen_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.contains(crate::icons::DONE_TAG)),
             "focused completion stays teal until the focus hook acknowledges it"
         );
-        assert!(!seen_desired.contains_key("quota_icon"));
 
         // Unfocused sibling finishing must keep teal — not follow the focused
         // pane's yellow→white shortcut.
@@ -2758,10 +2794,11 @@ mod tests {
             None,
         );
         assert!(
-            other_desired.contains_key("quota_icon_done"),
+            other_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.contains(crate::icons::DONE_TAG)),
             "unfocused completion keeps teal until that pane is focused"
         );
-        assert!(!other_desired.contains_key("quota_icon"));
 
         // Same-tab: refresh folds unseen into status=Done before publish.
         // A leftover done token on idle must not paint teal by itself —
@@ -2781,7 +2818,9 @@ mod tests {
             None,
         );
         assert!(
-            stale_desired.contains_key("quota_icon"),
+            stale_desired.get("quota_icon").is_some_and(|icon| {
+                !icon.contains(crate::icons::DONE_TAG) && !icon.contains(crate::icons::WORKING_TAG)
+            }),
             "idle + leftover done token must not restore teal"
         );
         assert!(!stale_desired.contains_key("quota_icon_done"));

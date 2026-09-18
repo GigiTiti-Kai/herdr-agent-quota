@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Teal (unseen-done) brand icons no longer sit one cell to the right of idle
+  ones. Colour is a `rules` match on `$quota_icon` so the glyph stays the
+  first identity token; a later `$quota_icon_done` twin hang-indented under
+  the Space name. Working uses U+2061, not ZWNJ: ZWNJ joins the vendor PUA
+  glyph and the icon font then draws a yellow `?`.
+- Cursor quota follows a `cursor-agent login` account switch on macOS. The
+  CLI now stores that login in Keychain (`cursor-access-token` /
+  `cursor-user`) and no longer writes `auth.json`; the collector was falling
+  through to a stale desktop `state.vscdb` token. It now reads the CLI
+  Keychain item (after a one-time `--keychain-approve`) and does not borrow
+  the IDE token while `cli-config.json` still has `authInfo`.
 - Cursor sidebar model follows the CLI footer after a model switch:
   `lastUsedModel` of `default` / `auto` uses `cli-config.json` instead of
   staying labelled Auto.

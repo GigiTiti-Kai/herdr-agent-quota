@@ -2,12 +2,17 @@
 //!
 //! Cursor CLI (`cursor-agent`) stores its login in `~/.cursor/auth.json` on
 //! macOS and `$XDG_CONFIG_HOME/cursor/auth.json` (else `~/.config/cursor/auth.json`)
-//! on Linux, or `$CURSOR_AUTH_FILE`. Only `accessToken` is read. When that file
-//! is missing or has no token, the collector falls back to the desktop app's
-//! `state.vscdb` key `cursorAuth/accessToken` — the same account the CLI shares
-//! — opened read-only and selecting only that one key. The 20 GB SQLite file is
-//! never copied, and its mtime is never used as a credential gate: the IDE
-//! writes it constantly.
+//! on Linux, or `$CURSOR_AUTH_FILE`. Only `accessToken` is read. On macOS the
+//! CLI's default store is no longer that file: `cursor-agent login` writes
+//! Keychain item `cursor-access-token` / `cursor-user` (domain `cursor`) and
+//! records `authInfo` in `cli-config.json`. When the auth file is missing or
+//! has no token, the collector reads that Keychain item — the login Herdr
+//! panes actually use. Background processes never prompt: without a recorded
+//! approval marker the keychain branch is skipped, and the user approves once
+//! via `refresh --provider cursor --keychain-approve`. The desktop app's
+//! `state.vscdb` key `cursorAuth/accessToken` is a last resort only when the
+//! CLI has no login of its own. The 20 GB SQLite file is never copied, and
+//! its mtime is never used as a credential gate: the IDE writes it constantly.
 //!
 //! Quota is `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage`,
 //! the DashboardService call the CLI itself makes, authenticated with that
@@ -43,8 +48,10 @@
 //! window, never "0% used". Cache identity is `sha256("cursor\0" || token)` so
 //! another login cannot inherit the previous account's last-good snapshot.
 //! The collector never writes credentials, never refreshes or exchanges them,
-//! never opens Keychain, and never calls a bare `agent` binary — that name is
-//! Grok's on this machine.
+//! never reads `refreshToken`, and never calls a bare `agent` binary — that
+//! name is Grok's on this machine. The Keychain lookup is the same
+//! `security find-generic-password` interface the CLI uses; other Keychain
+//! items are not opened.
 
 use crate::cache::CacheStore;
 use crate::model::{
@@ -57,15 +64,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const USAGE_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const IDE_ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
 /// `auth.json` / `cli-config.json` are a few kilobytes. Anything larger is not
 /// a file this collector understands.
 const MAX_AUTH_BYTES: u64 = 256 * 1024;
+/// CLI Keychain item for domain `cursor` — see `cli-credentials` `jo({domain})`.
+const KEYCHAIN_SERVICE: &str = "cursor-access-token";
+const KEYCHAIN_ACCOUNT: &str = "cursor-user";
+/// Wall-clock budget for `security(1)`. A Keychain ACL prompt can block
+/// forever; the usage HTTP call already gives up at five seconds connect.
+const KEYCHAIN_COMMAND_BUDGET: Duration = Duration::from_secs(5);
+const KEYCHAIN_APPROVE_BUDGET: Duration = Duration::from_secs(300);
+const KEYCHAIN_NO_PROMPT_THRESHOLD: Duration = Duration::from_secs(2);
 /// Unix timestamps at or above this are milliseconds, not seconds.
 const MILLIS_THRESHOLD: u64 = 1_000_000_000_000;
 const SESSION_TAIL_BYTES: u64 = 2 * 1024 * 1024;
@@ -83,6 +102,7 @@ const AUTO_CONTEXT_WINDOW: u64 = 256_000;
 /// token_details record this collector reads.
 const MAX_CONVERSATION_BLOB_BYTES: u64 = 256 * 1024;
 
+#[derive(Clone)]
 struct CursorCredentials {
     access_token: String,
 }
@@ -98,7 +118,10 @@ impl std::fmt::Debug for CursorCredentials {
 /// Fetch Cursor's included monthly pool for the signed-in account.
 pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
     match fetch_once(session_ids) {
-        Err(ProviderError::MissingCredentials) => fetch_once(session_ids),
+        Err(ProviderError::MissingCredentials) => {
+            invalidate_credentials();
+            fetch_once(session_ids)
+        }
         result => result,
     }
     .map_err(anyhow::Error::from)
@@ -284,6 +307,11 @@ fn read_credentials() -> std::result::Result<CursorCredentials, ProviderError> {
             }
         }
     }
+    match read_cli_keychain() {
+        Ok(credentials) => return Ok(credentials),
+        Err(ProviderError::MissingCredentials) => {}
+        Err(error) => return Err(error),
+    }
     read_ide_access_token()
 }
 
@@ -307,6 +335,264 @@ fn token_from_value(value: &Value) -> Option<CursorCredentials> {
         .filter(|token| !token.is_empty())?
         .to_string();
     Some(CursorCredentials { access_token })
+}
+
+fn credential_store_kind() -> &'static str {
+    match std::env::var("AGENT_CLI_CREDENTIAL_STORE") {
+        Ok(value) if value == "file" => "file",
+        Ok(value) if value == "memory" => "memory",
+        _ => "default",
+    }
+}
+
+fn should_read_cli_keychain() -> bool {
+    if credential_store_kind() != "default" {
+        return false;
+    }
+    cfg!(target_os = "macos") || std::env::var_os("HERDR_AGENT_QUOTA_SECURITY_BIN").is_some()
+}
+
+static KEYCHAIN_APPROVE_ATTEMPT: AtomicBool = AtomicBool::new(false);
+
+/// Enable a keychain approval attempt for this process. Called once from
+/// `refresh --keychain-approve`; event hooks, the daemon, and plain refreshes
+/// never set it, so background processes can never trigger a prompt.
+pub fn set_keychain_approve_attempt() {
+    KEYCHAIN_APPROVE_ATTEMPT.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn set_keychain_approve_attempt_for_test(value: bool) {
+    KEYCHAIN_APPROVE_ATTEMPT.store(value, Ordering::Relaxed);
+}
+
+fn keychain_approval_marker() -> Option<PathBuf> {
+    Some(auth_path().ok()?.parent()?.join(".herdr-keychain-approved"))
+}
+
+fn keychain_approval_mtime() -> Option<u64> {
+    fs::metadata(keychain_approval_marker()?)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+fn record_keychain_approval() -> bool {
+    let Some(marker) = keychain_approval_marker() else {
+        return false;
+    };
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        use std::io::Write;
+        let _ = write!(file, "{}", CacheStore::now_unix());
+    }
+    marker.exists()
+}
+
+type CredentialCacheKey = (Option<std::ffi::OsString>, Option<u64>);
+
+static CREDENTIAL_CACHE: LazyLock<Mutex<Option<(CredentialCacheKey, CursorCredentials)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn invalidate_credentials() {
+    *CREDENTIAL_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+fn read_cli_keychain() -> std::result::Result<CursorCredentials, ProviderError> {
+    if !should_read_cli_keychain() {
+        return Err(ProviderError::MissingCredentials);
+    }
+    let security_bin = std::env::var_os("HERDR_AGENT_QUOTA_SECURITY_BIN");
+    let key = (security_bin, keychain_approval_mtime());
+    let mut cache = CREDENTIAL_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some((cached_key, credentials)) = cache.as_ref() {
+        if cached_key == &key {
+            return Ok(credentials.clone());
+        }
+    }
+    let credentials = read_cli_keychain_uncached();
+    if let Ok(credentials) = &credentials {
+        *cache = Some((key, credentials.clone()));
+    }
+    credentials
+}
+
+fn read_cli_keychain_uncached() -> std::result::Result<CursorCredentials, ProviderError> {
+    let force = KEYCHAIN_APPROVE_ATTEMPT.load(Ordering::Relaxed);
+    if force {
+        return approve_keychain_interactive().ok_or_else(|| {
+            ProviderError::Unavailable("keychain approval denied or timed out".to_string())
+        });
+    }
+    if keychain_approval_mtime().is_none() {
+        if cli_config_has_login() {
+            if cfg!(not(test)) && std::io::stderr().is_terminal() {
+                eprintln!(
+                    "cursor: macOS Keychain approval needed — run `herdr-agent-quota refresh --provider cursor --keychain-approve` and click Always Allow (not Allow) on the prompt."
+                );
+            }
+            return Err(ProviderError::Unavailable(
+                "macOS Keychain approval needed — run `herdr-agent-quota refresh --provider cursor --keychain-approve`"
+                    .to_string(),
+            ));
+        }
+        return Err(ProviderError::MissingCredentials);
+    }
+    match read_keychain_access_token(KEYCHAIN_COMMAND_BUDGET) {
+        Some(access_token) => Ok(CursorCredentials { access_token }),
+        None => Err(ProviderError::Unavailable(
+            "Cursor CLI keychain login could not be read".to_string(),
+        )),
+    }
+}
+
+fn cli_config_has_login() -> bool {
+    let Some(value) = cursor_data_home()
+        .ok()
+        .and_then(|home| read_bounded_json(&home.join("cli-config.json")))
+    else {
+        return false;
+    };
+    let Some(info) = value.get("authInfo") else {
+        return false;
+    };
+    if json_number(info.get("userId")).is_some_and(|id| id > 0.0) {
+        return true;
+    }
+    info.get("userId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|id| !id.is_empty())
+        || info
+            .get("authId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|id| !id.is_empty())
+}
+
+fn approve_keychain_interactive() -> Option<CursorCredentials> {
+    #[cfg(not(test))]
+    if !std::io::stderr().is_terminal() {
+        return None;
+    }
+    eprintln!(
+        "cursor: macOS will prompt for keychain access — click Always Allow (not Allow). You have up to 5 minutes."
+    );
+    let started = Instant::now();
+    let Some(access_token) = read_keychain_access_token(KEYCHAIN_APPROVE_BUDGET) else {
+        eprintln!("cursor: keychain approval denied or timed out — no changes made.");
+        return None;
+    };
+    let credentials = CursorCredentials { access_token };
+    if started.elapsed() < KEYCHAIN_NO_PROMPT_THRESHOLD {
+        if record_keychain_approval() {
+            eprintln!("cursor: keychain approval recorded — future refreshes won't prompt.");
+        } else {
+            eprintln!(
+                "cursor: keychain read works, but the approval marker could not be written — future refreshes will prompt again."
+            );
+        }
+        return Some(credentials);
+    }
+    eprintln!("cursor: verifying the grant stuck (no prompt expected)...");
+    let verified = Instant::now();
+    if read_keychain_access_token(KEYCHAIN_COMMAND_BUDGET).is_some()
+        && verified.elapsed() < KEYCHAIN_NO_PROMPT_THRESHOLD
+    {
+        if record_keychain_approval() {
+            eprintln!("cursor: Always Allow confirmed — future refreshes won't prompt.");
+        } else {
+            eprintln!(
+                "cursor: Always Allow confirmed, but the approval marker could not be written — future refreshes will prompt again."
+            );
+        }
+    } else {
+        eprintln!(
+            "cursor: that approval didn't stick (one-time Allow?). Continuing with one-time access; re-run with --keychain-approve and click Always Allow to stop future prompts."
+        );
+    }
+    Some(credentials)
+}
+
+fn read_keychain_access_token(budget: Duration) -> Option<String> {
+    let executable =
+        std::env::var_os("HERDR_AGENT_QUOTA_SECURITY_BIN").unwrap_or_else(|| "security".into());
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "find-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-w",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let stdout = run_command_with_deadline(&mut command, budget)?;
+    if stdout.len() as u64 > MAX_AUTH_BYTES {
+        return None;
+    }
+    let access_token = String::from_utf8(stdout).ok()?;
+    let access_token = access_token.trim();
+    if access_token.is_empty() {
+        return None;
+    }
+    Some(access_token.to_string())
+}
+
+fn run_command_with_deadline(command: &mut Command, budget: Duration) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout
+            .take(MAX_AUTH_BYTES.saturating_add(1))
+            .read_to_end(&mut buf);
+        buf
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < budget => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                terminate_command(&mut child);
+                let _ = reader.join();
+                return None;
+            }
+        }
+    };
+    let stdout = reader.join().ok()?;
+    status.success().then_some(stdout)
+}
+
+fn terminate_command(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn read_ide_access_token() -> std::result::Result<CursorCredentials, ProviderError> {
@@ -1139,6 +1425,57 @@ mod tests {
         crate::providers::test_support::env_guard()
     }
 
+    /// Reset `KEYCHAIN_APPROVE_ATTEMPT` on drop so a panicking test cannot
+    /// leak a 300s-budget approval attempt into the next test.
+    struct KeychainApproveGuard;
+    impl KeychainApproveGuard {
+        fn new(value: bool) -> Self {
+            set_keychain_approve_attempt_for_test(value);
+            Self
+        }
+    }
+    impl Drop for KeychainApproveGuard {
+        fn drop(&mut self) {
+            set_keychain_approve_attempt_for_test(false);
+        }
+    }
+
+    fn isolate_cursor_identity(dir: &Path) {
+        std::env::set_var("CURSOR_HOME", dir);
+        std::env::set_var("CURSOR_AUTH_FILE", dir.join("auth.json"));
+        std::env::set_var("CURSOR_STATE_DB", dir.join("state.vscdb"));
+        invalidate_credentials();
+    }
+
+    fn clear_cursor_identity() {
+        invalidate_credentials();
+        set_keychain_approve_attempt_for_test(false);
+        std::env::remove_var("CURSOR_HOME");
+        std::env::remove_var("CURSOR_AUTH_FILE");
+        std::env::remove_var("CURSOR_STATE_DB");
+        std::env::remove_var("HERDR_AGENT_QUOTA_SECURITY_BIN");
+        std::env::remove_var("AGENT_CLI_CREDENTIAL_STORE");
+    }
+
+    fn write_security_stub(dir: &Path, script: &str) {
+        let stub = dir.join("security-stub");
+        fs::write(&stub, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("HERDR_AGENT_QUOTA_SECURITY_BIN", &stub);
+    }
+
+    fn write_cli_auth_info(dir: &Path) {
+        fs::write(
+            dir.join("cli-config.json"),
+            r#"{"authInfo":{"userId":358956811,"authId":"auth0|new-account"}}"#,
+        )
+        .unwrap();
+    }
+
     fn period_fixture() -> Value {
         serde_json::from_str(include_str!(
             "../../tests/fixtures/cursor/current-period-usage.json"
@@ -1297,15 +1634,17 @@ mod tests {
     fn auth_json_wins_over_the_ide_database() {
         let _guard = env_guard();
         let dir = tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        let db = dir.path().join("state.vscdb");
-        fs::write(&auth, r#"{"accessToken":"cli-token"}"#).unwrap();
-        write_state_db(&db, "ide-token");
-        std::env::set_var("CURSOR_AUTH_FILE", &auth);
-        std::env::set_var("CURSOR_STATE_DB", &db);
+        isolate_cursor_identity(dir.path());
+        write_cli_auth_info(dir.path());
+        write_security_stub(dir.path(), "#!/bin/sh\nprintf '%s\\n' 'keychain-token'\n");
+        fs::write(
+            dir.path().join("auth.json"),
+            r#"{"accessToken":"cli-token"}"#,
+        )
+        .unwrap();
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
         let credentials = read_credentials().unwrap();
-        std::env::remove_var("CURSOR_AUTH_FILE");
-        std::env::remove_var("CURSOR_STATE_DB");
+        clear_cursor_identity();
         assert_eq!(credentials.access_token, "cli-token");
     }
 
@@ -1313,15 +1652,12 @@ mod tests {
     fn an_empty_auth_token_falls_through_to_the_ide_database() {
         let _guard = env_guard();
         let dir = tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        let db = dir.path().join("state.vscdb");
-        fs::write(&auth, r#"{"accessToken":"  "}"#).unwrap();
-        write_state_db(&db, "ide-token");
-        std::env::set_var("CURSOR_AUTH_FILE", &auth);
-        std::env::set_var("CURSOR_STATE_DB", &db);
+        isolate_cursor_identity(dir.path());
+        write_security_stub(dir.path(), "#!/bin/sh\nexit 44\n");
+        fs::write(dir.path().join("auth.json"), r#"{"accessToken":"  "}"#).unwrap();
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
         let credentials = read_credentials().unwrap();
-        std::env::remove_var("CURSOR_AUTH_FILE");
-        std::env::remove_var("CURSOR_STATE_DB");
+        clear_cursor_identity();
         assert_eq!(credentials.access_token, "ide-token");
     }
 
@@ -1329,15 +1665,11 @@ mod tests {
     fn a_malformed_auth_file_does_not_borrow_the_ide_token() {
         let _guard = env_guard();
         let dir = tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        let db = dir.path().join("state.vscdb");
-        fs::write(&auth, "not-json").unwrap();
-        write_state_db(&db, "ide-token");
-        std::env::set_var("CURSOR_AUTH_FILE", &auth);
-        std::env::set_var("CURSOR_STATE_DB", &db);
+        isolate_cursor_identity(dir.path());
+        fs::write(dir.path().join("auth.json"), "not-json").unwrap();
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
         let error = read_credentials().unwrap_err();
-        std::env::remove_var("CURSOR_AUTH_FILE");
-        std::env::remove_var("CURSOR_STATE_DB");
+        clear_cursor_identity();
         assert!(matches!(error, ProviderError::Unavailable(_)));
     }
 
@@ -1345,12 +1677,88 @@ mod tests {
     fn missing_credentials_are_missing() {
         let _guard = env_guard();
         let dir = tempdir().unwrap();
-        std::env::set_var("CURSOR_AUTH_FILE", dir.path().join("absent.json"));
-        std::env::set_var("CURSOR_STATE_DB", dir.path().join("absent.vscdb"));
+        isolate_cursor_identity(dir.path());
+        write_security_stub(dir.path(), "#!/bin/sh\nexit 44\n");
         let error = read_credentials().unwrap_err();
-        std::env::remove_var("CURSOR_AUTH_FILE");
-        std::env::remove_var("CURSOR_STATE_DB");
+        clear_cursor_identity();
         assert!(matches!(error, ProviderError::MissingCredentials));
+    }
+
+    #[test]
+    fn a_cli_login_does_not_borrow_the_previous_ide_account() {
+        let _guard = env_guard();
+        let dir = tempdir().unwrap();
+        isolate_cursor_identity(dir.path());
+        write_cli_auth_info(dir.path());
+        let log = dir.path().join("calls.log");
+        write_security_stub(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\necho called >> '{}'\nprintf '%s\\n' 'keychain-token'\n",
+                log.display()
+            ),
+        );
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
+        let error = read_credentials().unwrap_err();
+        clear_cursor_identity();
+        assert!(
+            matches!(error, ProviderError::Unavailable(ref message) if message.contains("keychain-approve")),
+            "{error:?}"
+        );
+        assert!(
+            !log.exists(),
+            "unapproved background reads must not spawn security"
+        );
+    }
+
+    #[test]
+    fn a_cli_keychain_login_is_not_replaced_by_the_ide_token() {
+        let _guard = env_guard();
+        let dir = tempdir().unwrap();
+        isolate_cursor_identity(dir.path());
+        write_cli_auth_info(dir.path());
+        write_security_stub(dir.path(), "#!/bin/sh\nprintf '%s\\n' 'keychain-token'\n");
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
+        fs::write(dir.path().join(".herdr-keychain-approved"), "1").unwrap();
+        let credentials = read_credentials().unwrap();
+        let account = current_account_id();
+        clear_cursor_identity();
+        assert_eq!(credentials.access_token, "keychain-token");
+        assert_eq!(
+            account.as_deref(),
+            Some(account_pin("keychain-token").as_str())
+        );
+        assert_ne!(account.as_deref(), Some(account_pin("ide-token").as_str()));
+    }
+
+    #[test]
+    fn a_keychain_approve_attempt_records_its_approval() {
+        let _guard = env_guard();
+        let _approve = KeychainApproveGuard::new(true);
+        let dir = tempdir().unwrap();
+        isolate_cursor_identity(dir.path());
+        write_cli_auth_info(dir.path());
+        write_security_stub(dir.path(), "#!/bin/sh\nprintf '%s\\n' 'keychain-token'\n");
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
+        let credentials = read_credentials().unwrap();
+        let marker = dir.path().join(".herdr-keychain-approved");
+        assert_eq!(credentials.access_token, "keychain-token");
+        assert!(marker.exists());
+        clear_cursor_identity();
+    }
+
+    #[test]
+    fn file_store_skips_the_keychain() {
+        let _guard = env_guard();
+        let dir = tempdir().unwrap();
+        isolate_cursor_identity(dir.path());
+        write_cli_auth_info(dir.path());
+        write_security_stub(dir.path(), "#!/bin/sh\nprintf '%s\\n' 'keychain-token'\n");
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
+        std::env::set_var("AGENT_CLI_CREDENTIAL_STORE", "file");
+        let credentials = read_credentials().unwrap();
+        clear_cursor_identity();
+        assert_eq!(credentials.access_token, "ide-token");
     }
 
     #[test]
@@ -1387,14 +1795,12 @@ mod tests {
     fn ide_database_mtime_is_not_the_credential_gate() {
         let _guard = env_guard();
         let dir = tempdir().unwrap();
-        let db = dir.path().join("state.vscdb");
-        write_state_db(&db, "ide-token");
-        std::env::set_var("CURSOR_AUTH_FILE", dir.path().join("absent.json"));
-        std::env::set_var("CURSOR_STATE_DB", &db);
+        isolate_cursor_identity(dir.path());
+        write_security_stub(dir.path(), "#!/bin/sh\nexit 44\n");
+        write_state_db(&dir.path().join("state.vscdb"), "ide-token");
         let mtime = auth_mtime_unix();
         let account = current_account_id();
-        std::env::remove_var("CURSOR_AUTH_FILE");
-        std::env::remove_var("CURSOR_STATE_DB");
+        clear_cursor_identity();
         assert!(mtime.is_none());
         assert_eq!(account.as_deref(), Some(account_pin("ide-token").as_str()));
     }

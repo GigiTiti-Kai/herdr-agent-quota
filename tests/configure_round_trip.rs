@@ -11,6 +11,20 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
+fn sidebar_has_status_icon_rules(sidebar: &str) -> bool {
+    sidebar.contains("$quota_icon")
+        && sidebar.contains("fg = \"#f9e2af\"")
+        && sidebar.contains("fg = \"#94e2d5\"")
+        && !sidebar.contains("$quota_icon_working")
+        && !sidebar.contains("$quota_icon_done")
+}
+
+fn report_sets_done_icon(text: &str) -> bool {
+    (text.contains("--token quota_icon=") || text.contains(" quota_icon="))
+        && text.contains('\u{2060}')
+        && !text.contains("quota_icon_done=")
+}
+
 fn install_herdr_stub(state: &Path, agent_list: &str) -> (PathBuf, PathBuf) {
     let log = state.join("herdr.log");
     let executable = state.join("herdr");
@@ -247,9 +261,7 @@ fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
     assert!(!applied.contains("selection_bg"));
     assert!(!applied.contains("active_row_bg"));
     assert!(!applied.contains("[ui.sidebar.agents.rows_by_agent]"));
-    assert!(applied.contains("$quota_icon"));
-    assert!(applied.contains("$quota_icon_working"));
-    assert!(applied.contains("$quota_icon_done"));
+    assert!(sidebar_has_status_icon_rules(&applied), "{applied}");
     assert!(applied.contains("fg = \"#e9e9f0\""));
     assert!(applied.contains("fg = \"#f9e2af\""));
     assert!(applied.contains("fg = \"#94e2d5\""));
@@ -347,10 +359,10 @@ fn context_is_the_penultimate_row_and_model_shares_provider_style() {
     assert!(!identity
         .iter()
         .any(|item| item.as_str() == Some("state_icon")));
-    assert!(identity
+    assert!(!identity
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_working")));
-    assert!(identity
+    assert!(!identity
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_done")));
     for token in ["$quota_icon", "$quota_provider_model"] {
@@ -387,10 +399,10 @@ fn provider_model_is_compact_and_every_provider_can_fold_week_without_five_hour(
             .any(|item| configured_token(item) == Some("$quota_icon")),
         "identity row must carry the vendor mark: {identity_row}"
     );
-    assert!(identity_tokens
+    assert!(!identity_tokens
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_working")));
-    assert!(identity_tokens
+    assert!(!identity_tokens
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_done")));
     assert!(!identity_tokens.iter().any(|item| {
@@ -957,7 +969,7 @@ fn a_scrolled_pane_completion_reports_only_icon_tokens() {
         .filter(|line| line.contains("pane report-metadata w1:p1"))
         .collect::<Vec<_>>();
     assert_eq!(reports.len(), 1, "{calls}");
-    assert!(reports[0].contains("quota_icon_done="), "{calls}");
+    assert!(report_sets_done_icon(reports[0]), "{calls}");
     assert!(!reports[0].contains("quota_5h"), "{calls}");
 }
 
@@ -1996,12 +2008,8 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
     );
     let joined = paint.join("\n");
     assert!(
-        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
+        report_sets_done_icon(&joined),
         "focused completion must stay teal: {joined}"
-    );
-    assert!(
-        !joined.contains("--token quota_icon=") && !joined.contains(" quota_icon="),
-        "focused completion must clear white: {joined}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(!codex_log.exists(), "codex stub must stay idle");
@@ -2488,9 +2496,7 @@ fn installing_one_agent_leaves_every_other_agent_untouched() {
 
     let sidebar = homes.sidebar();
     // Default layouts publish shared rows only — no per-agent brand copies.
-    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
+    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     for harness in AgentSelection::SUPPORTED {
@@ -2526,9 +2532,7 @@ fn installing_only_pi_adds_only_its_sidebar_style() {
         String::from_utf8_lossy(&output.stderr)
     );
     let sidebar = homes.sidebar();
-    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
+    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     for harness in AgentSelection::SUPPORTED {
@@ -2557,10 +2561,7 @@ fn uninstalling_one_agent_keeps_the_rest_working() {
 
     let sidebar = homes.sidebar();
     assert!(
-        sidebar.contains("$quota_icon")
-            && sidebar.contains("$quota_icon_working")
-            && sidebar.contains("$quota_icon_done")
-            && !sidebar.contains("state_icon"),
+        sidebar_has_status_icon_rules(&sidebar) && !sidebar.contains("state_icon"),
         "shared quota rows were lost: {sidebar}"
     );
     assert!(!sidebar.contains("grok ="), "grok survived: {sidebar}");
@@ -2628,9 +2629,7 @@ fn an_installer_can_narrow_the_selection_through_the_environment() {
     );
 
     let sidebar = homes.sidebar();
-    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
+    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     assert!(!sidebar.contains("claude ="), "{sidebar}");
@@ -2769,10 +2768,7 @@ fn a_saved_pre_muse_full_list_still_configures_when_omp_is_absent() {
     );
     let sidebar = homes.sidebar();
     assert!(
-        sidebar.contains("$quota_icon")
-            && sidebar.contains("$quota_icon_working")
-            && sidebar.contains("$quota_icon_done")
-            && !sidebar.contains("state_icon"),
+        sidebar_has_status_icon_rules(&sidebar) && !sidebar.contains("state_icon"),
         "a once-complete list must still write shared quota rows: {sidebar}"
     );
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
@@ -2828,9 +2824,7 @@ fn an_unusable_environment_selection_still_installs_everything() {
         .status
         .success());
     let sidebar = homes.sidebar();
-    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
+    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     assert!(homes.claude_settings.exists());

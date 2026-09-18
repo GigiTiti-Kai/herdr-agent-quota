@@ -14,16 +14,17 @@ Claude/Agy StatusLine input, and Cursor CLI hook payloads (token counts and
 context-window fields only). Codex quota is obtained through its app-server;
 OMP quota through its usage CLI. OMP's credential database is never opened.
 Local SQLite reads are read-only and limited to session/model data, plus Cursor
-IDE's `state.vscdb` key `cursorAuth/accessToken` when the CLI auth file has no
-token. On macOS, a Muse Code `storage: "keychain"` login has no token in
-`auth.json`; the collector reads only the CLI's own Keychain item
-(`ai.meta.dev.credentials` / `meta`) through `security find-generic-password`.
-Background processes never prompt: without a recorded approval marker the
-keychain branch is skipped outright, and the user approves once via
+IDE's `state.vscdb` key `cursorAuth/accessToken` when the CLI has no login of
+its own. On macOS, Cursor Agent CLI and Muse Code both keep OAuth tokens in
+Keychain (`cursor-access-token` / `cursor-user`, and Muse
+`ai.meta.dev.credentials` / `meta`); the collector reads only those CLI items
+through `security find-generic-password`. Background processes never prompt:
+without a recorded approval marker the keychain branch is skipped outright, and
+the user approves once via `refresh --provider cursor --keychain-approve` or
 `refresh --provider muse --keychain-approve`. A successful token is kept in
 the process until that file changes or the quota API rejects it; it is never
 written to plugin state. Cursor credentials are never written, refreshed, or
-exchanged, and Cursor's Keychain is never opened.
+exchanged.
 
 Authenticated quota requests use the relevant CLI/provider's usage contract.
 The plugin sends no model prompts and does not upload usage to another service.

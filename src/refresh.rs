@@ -538,7 +538,7 @@ fn apply_icon_attention(
     }
     if hydrate {
         for pane in panes.iter() {
-            if !pane.focused && pane.tokens.contains_key("quota_icon_done") {
+            if !pane.focused && tokens_show_done_icon(&pane.tokens) {
                 attention.unseen.insert(pane.pane_id.clone());
             }
         }
@@ -557,8 +557,8 @@ fn apply_icon_attention(
             pane.pane_id == target || previous_focused.as_deref() == Some(pane.pane_id.as_str())
         });
         if acknowledge {
-            let green_on_screen = attention.unseen.contains(&pane.pane_id)
-                || pane.tokens.contains_key("quota_icon_done");
+            let green_on_screen =
+                attention.unseen.contains(&pane.pane_id) || tokens_show_done_icon(&pane.tokens);
             if force_seen == Some(pane.pane_id.as_str()) {
                 pane.focused = true;
             }
@@ -595,8 +595,7 @@ fn apply_icon_attention(
             continue;
         }
         let was_working = attention.working.remove(&pane.pane_id)
-            || (!attention.seen.contains(&pane.pane_id)
-                && pane.tokens.contains_key("quota_icon_working"));
+            || (!attention.seen.contains(&pane.pane_id) && tokens_show_working_icon(&pane.tokens));
         if was_working {
             attention.seen.remove(&pane.pane_id);
             attention.unseen.insert(pane.pane_id.clone());
@@ -637,7 +636,21 @@ fn paint_focus_icons(cache: &CacheStore, force_idle_id: Option<&str>) -> Result<
 
 /// Teal left on a focused pane — needs a clear pass.
 fn has_stale_done_icon(pane: &AgentPane) -> bool {
-    pane.focused && pane.tokens.contains_key("quota_icon_done")
+    pane.focused && tokens_show_done_icon(&pane.tokens)
+}
+
+fn tokens_show_done_icon(tokens: &BTreeMap<String, String>) -> bool {
+    tokens.contains_key("quota_icon_done")
+        || tokens
+            .get("quota_icon")
+            .is_some_and(|value| value.contains(crate::icons::DONE_TAG))
+}
+
+fn tokens_show_working_icon(tokens: &BTreeMap<String, String>) -> bool {
+    tokens.contains_key("quota_icon_working")
+        || tokens
+            .get("quota_icon")
+            .is_some_and(|value| value.contains(crate::icons::WORKING_TAG))
 }
 
 /// The single pane an entry point is allowed to act on.
