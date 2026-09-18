@@ -662,10 +662,12 @@ fn format_ttl(seconds: u64) -> String {
 /// Spending pace for the Claude Code status line: quota consumed versus how
 /// much of the window's clock has run, in percentage points.
 ///
-/// Paces against the binding window — the 5h/7d window with the least
-/// remaining quota, the same rule as [`headroom`], because whichever limit
-/// runs out first is the one the pace has to respect — and names it
-/// (`5h`/`7d`) so a weekly pace is never mistaken for a five-hour one. The
+/// Paces against the binding window — the 5h/7d/scoped-weekly window with the
+/// least remaining quota, the same rule as [`headroom`], because whichever
+/// limit runs out first is the one the pace has to respect — and names it by
+/// its [`UsageWindow::display_label`] (`5h`/`7d`, or a scoped window's own
+/// model name) so a weekly pace is never mistaken for a five-hour one, and a
+/// model-scoped weekly is never mistaken for the account-wide one. The
 /// binding window is chosen *before* asking whether it can be paced: if it
 /// cannot, nothing is rendered rather than pacing the looser window, which
 /// would put a confident arrow on the wrong budget. `↓` means slow down
@@ -680,7 +682,12 @@ pub fn pace_segment(windows: &[UsageWindow], now_unix: u64) -> Option<String> {
     const MIN_ELAPSED_FRACTION: f64 = 0.05;
     let window = windows
         .iter()
-        .filter(|window| matches!(window.kind, WindowKind::FiveHour | WindowKind::Weekly))
+        .filter(|window| {
+            matches!(
+                window.kind,
+                WindowKind::FiveHour | WindowKind::Weekly | WindowKind::WeeklyScoped
+            )
+        })
         // `min_by` keeps the first of equals, and 5h is parsed first.
         .min_by(|a, b| a.remaining_percent.total_cmp(&b.remaining_percent))?;
     let remaining = window
@@ -702,7 +709,7 @@ pub fn pace_segment(windows: &[UsageWindow], now_unix: u64) -> Option<String> {
     } else {
         format!("↑{}%", (-delta).round())
     };
-    Some(format!("⏱ {} {pace}", window.kind.label()))
+    Some(format!("⏱ {} {pace}", window.display_label()))
 }
 
 #[cfg(test)]
@@ -2384,6 +2391,22 @@ mod tests {
             window(WindowKind::Weekly, 90.0, 2 * DAY),
         ];
         assert_eq!(pace_segment(&weekly_binds, 0).as_deref(), Some("⏱ 7d ↓19%"));
+    }
+
+    /// A model-scoped weekly window that binds names itself with its
+    /// `source_label` (the model name), never the enum's `wks` safety-net
+    /// label — otherwise the pace segment would show the one label this
+    /// window kind exists specifically to avoid ever displaying.
+    #[test]
+    fn pace_names_a_scoped_binding_window_by_its_model_not_wks() {
+        let scoped_binds = vec![
+            window(WindowKind::FiveHour, 20.0, 3 * HOUR),
+            window(WindowKind::WeeklyScoped, 90.0, 2 * DAY).with_source_window("Fab", None),
+        ];
+        assert_eq!(
+            pace_segment(&scoped_binds, 0).as_deref(),
+            Some("⏱ Fab ↓19%")
+        );
     }
 
     /// The binding window is chosen before asking whether it can be paced.

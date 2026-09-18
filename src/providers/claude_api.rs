@@ -31,7 +31,9 @@ pub fn credentials_path() -> Result<PathBuf, ProviderError> {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var_os("HOME").ok_or(ProviderError::MissingCredentials)?;
-    Ok(PathBuf::from(home).join(".claude").join(".credentials.json"))
+    Ok(PathBuf::from(home)
+        .join(".claude")
+        .join(".credentials.json"))
 }
 
 /// Read the subscription token. We never refresh it: Claude Code owns that
@@ -64,28 +66,26 @@ pub fn read_credentials(path: &Path) -> Result<ClaudeCredentials, ProviderError>
     })
 }
 
-/// Map one `limits[]` element onto a window kind, or `None` for a bucket this
-/// build does not know. Skipping is deliberate: a new bucket upstream must not
-/// break the rows we do understand.
-fn window_kind(kind: &str) -> Option<WindowKind> {
-    match kind {
-        "session" => Some(WindowKind::FiveHour),
-        "weekly_all" => Some(WindowKind::Weekly),
-        _ => None,
+/// Three characters keeps the scoped row aligned with `5h` and `7d`. A name
+/// shorter than that is used as it is rather than padded.
+fn scoped_label(display_name: &str) -> String {
+    let mut chars = display_name.chars();
+    let head: String = chars.by_ref().take(3).collect();
+    let mut label = head.to_lowercase();
+    if let Some(first) = label.get_mut(0..1) {
+        first.make_ascii_uppercase();
     }
+    label
 }
 
-pub fn parse_usage(
-    value: &Value,
-    fetched_at_unix: u64,
-) -> Result<ProviderSnapshot, ProviderError> {
+pub fn parse_usage(value: &Value, fetched_at_unix: u64) -> Result<ProviderSnapshot, ProviderError> {
     let limits = value
         .get("limits")
         .and_then(Value::as_array)
         .ok_or_else(|| ProviderError::UnsupportedResponse("limits is not an array".to_string()))?;
     let mut windows = Vec::new();
     for limit in limits {
-        let Some(kind) = limit.get("kind").and_then(Value::as_str).and_then(window_kind) else {
+        let Some(raw_kind) = limit.get("kind").and_then(Value::as_str) else {
             continue;
         };
         let Some(percent) = limit.get("percent").and_then(Value::as_f64) else {
@@ -95,8 +95,30 @@ pub fn parse_usage(
             .get("resets_at")
             .and_then(Value::as_str)
             .and_then(ResetAt::parse_rfc3339);
-        let window = UsageWindow::new(kind, percent.clamp(0.0, 100.0), resets_at)
-            .map_err(|error| ProviderError::UnsupportedResponse(error.to_string()))?;
+        let scoped_model = limit
+            .get("scope")
+            .and_then(|scope| scope.get("model"))
+            .and_then(|model| model.get("display_name"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty());
+        let window = match (raw_kind, scoped_model) {
+            ("session", _) => {
+                UsageWindow::new(WindowKind::FiveHour, percent.clamp(0.0, 100.0), resets_at)
+            }
+            ("weekly_all", _) => {
+                UsageWindow::new(WindowKind::Weekly, percent.clamp(0.0, 100.0), resets_at)
+            }
+            // An unnamed scoped window has nothing to label itself with, so it
+            // is skipped rather than rendered as an anonymous second weekly.
+            ("weekly_scoped", Some(model)) => UsageWindow::new(
+                WindowKind::WeeklyScoped,
+                percent.clamp(0.0, 100.0),
+                resets_at,
+            )
+            .map(|window| window.with_source_window(scoped_label(model), None)),
+            _ => continue,
+        }
+        .map_err(|error| ProviderError::UnsupportedResponse(error.to_string()))?;
         windows.push(window);
     }
     if windows.is_empty() {
@@ -215,6 +237,38 @@ mod tests {
     fn a_response_without_any_known_window_is_an_error() {
         let value = json!({"limits": []});
         assert!(parse_usage(&value, 1_000).is_err());
+    }
+
+    #[test]
+    fn parses_the_model_scoped_weekly_window() {
+        let snapshot = parse_usage(&response(), 1_000).unwrap();
+        let scoped = snapshot
+            .windows
+            .iter()
+            .find(|window| window.kind == WindowKind::WeeklyScoped)
+            .expect("scoped weekly window");
+        assert_eq!(scoped.used_percent, 92.0);
+        // The row names its own model rather than reusing the 7d token.
+        assert_eq!(scoped.display_label(), "Fab");
+    }
+
+    #[test]
+    fn a_scoped_window_without_a_model_name_is_skipped() {
+        let mut value = response();
+        value["limits"][2]["scope"] = json!(null);
+        let snapshot = parse_usage(&value, 1_000).unwrap();
+        assert!(snapshot
+            .windows
+            .iter()
+            .all(|window| window.kind != WindowKind::WeeklyScoped));
+    }
+
+    #[test]
+    fn scoped_labels_are_three_characters() {
+        assert_eq!(scoped_label("Fable"), "Fab");
+        assert_eq!(scoped_label("opus"), "Opu");
+        // Shorter names are used as they are rather than padded.
+        assert_eq!(scoped_label("Pi"), "Pi");
     }
 
     #[test]
