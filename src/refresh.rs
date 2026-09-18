@@ -1314,15 +1314,17 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
 /// one it replaces: Claude has no account gate, and a snapshot that claims to
 /// be account-wide without an `account_id` is rejected by
 /// [`ProviderSnapshot::usable_for_account`]. What the endpoint does add is
-/// `account_wide_windows`, which says these particular figures are the
-/// subscription's and not one conversation's. Every Claude pane then renders
-/// them, instead of each pane showing whatever its own last turn happened to
+/// `account_windows`, which holds the subscription's own allowance rather than
+/// one conversation's observation of it. Every Claude pane then renders it,
+/// instead of each pane showing whatever its own last turn happened to
 /// observe — or nothing at all, which is what a pane that has never taken a
 /// turn had to show.
 ///
 /// With no endpoint we degrade to exactly the behaviour that shipped before
-/// this collector existed: the flag stays false and each session falls back to
-/// its own last statusLine reading. With no statusLine observation there is no
+/// this collector existed: nothing account-wide is published, `cache.rs` stops
+/// carrying the previous reading once one of its windows lapses, and each
+/// session falls back to its own last statusLine reading. With no statusLine
+/// observation there is no
 /// session to attach context, cache or model to, but the windows still stand on
 /// their own, so a pane can render quota before the hook has ever run.
 ///
@@ -3236,7 +3238,7 @@ mod tests {
 
     /// The endpoint alone names no session, so it carries no context, model or
     /// prompt-cache — only the account's windows, which every pane renders
-    /// through `account_wide_windows`. What it must not do is take the cache
+    /// through `account_windows`. What it must not do is take the cache
     /// down with it: a `direct` snapshot is written with a raw `cache.save`,
     /// which replaces every other session's context, model, prompt-cache and
     /// window diagnostics with an empty map.
@@ -3294,7 +3296,7 @@ mod tests {
 
     /// The endpoint answered, so the merged snapshot speaks for the whole
     /// subscription — including panes whose statusLine reading is hours old.
-    /// When it fails, the flag stays off and each pane keeps its own reading.
+    /// When it fails, nothing is published and each pane keeps its own reading.
     #[test]
     fn only_a_successful_endpoint_publishes_account_windows() {
         let merged = overlay_claude_windows(
@@ -3352,6 +3354,47 @@ mod tests {
             reloaded.windows_for_session(Some("a-pane-that-never-ran"))[0].used_percent,
             62.0
         );
+    }
+
+    /// The carry must not outlive the window it read. A permanently failing
+    /// endpoint (a revoked token, not a 429) would otherwise keep re-carrying
+    /// the same reading: first frozen at a stale percentage, then -- once the
+    /// renderer filters the lapsed window -- blanking every pane, while each
+    /// pane's own live statusLine figures sat unreachable behind it.
+    #[test]
+    fn a_lapsed_account_reading_is_not_carried_into_the_next_turn() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let now = CacheStore::now_unix();
+        let mut polled = statusline_fetched(10.0);
+        polled.snapshot.account_windows = vec![UsageWindow::new(
+            WindowKind::FiveHour,
+            62.0,
+            Some(crate::model::ResetAt::from_unix_seconds(now - 60)),
+        )
+        .unwrap()];
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        cache
+            .save_preserving_context_for_session(
+                statusline_fetched(11.0).snapshot,
+                Some("session-1"),
+            )
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.account_windows.is_empty());
+        // Back to the pre-endpoint behaviour: the session sees its own reading
+        // and a pane that never ran sees nothing, rather than a dead row.
+        assert_eq!(
+            reloaded.windows_for_session(Some("session-1"))[0].used_percent,
+            11.0
+        );
+        assert!(reloaded
+            .windows_for_session(Some("a-pane-that-never-ran"))
+            .is_empty());
     }
 
     #[test]

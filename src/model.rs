@@ -607,6 +607,11 @@ pub struct ProviderSnapshot {
     /// clear a flag, but it has no endpoint reading to overwrite this with.
     /// Empty on old caches and until the endpoint first answers, which keeps
     /// the session-local reading as the fallback.
+    ///
+    /// Setting this asserts that one allowance covers every conversation. Only
+    /// Claude does today. Agy must not: its gemini and third-party pools are
+    /// one account's, but which pool applies is selected by the conversation's
+    /// active model, so an account-wide list would answer for the wrong pool.
     #[serde(default)]
     pub account_windows: Vec<UsageWindow>,
     pub provider: Provider,
@@ -893,6 +898,7 @@ impl ProviderSnapshot {
     /// fetches use this; a pane uses [`Self::displayed_quota_has_expired`].
     pub fn has_expired_quota(&self, now_unix: u64) -> bool {
         quota_windows_expired(&self.windows, now_unix)
+            || quota_windows_expired(&self.account_windows, now_unix)
             || self
                 .session_windows
                 .values()

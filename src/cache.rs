@@ -340,7 +340,13 @@ impl CacheStore {
                     .insert(session_id.to_string(), context);
             }
         }
-        merge_session_windows(&mut snapshot, previous_snapshot, session_id, quota_scope);
+        merge_session_windows(
+            &mut snapshot,
+            previous_snapshot,
+            session_id,
+            quota_scope,
+            Self::now_unix(),
+        );
         let current_session_ids = session_id
             .map(|session_id| vec![session_id.to_string()])
             .unwrap_or_default();
@@ -435,7 +441,13 @@ impl CacheStore {
                     .insert(session_id.to_string(), context);
             }
         }
-        merge_session_windows(&mut snapshot, previous.as_ref(), session_id, None);
+        merge_session_windows(
+            &mut snapshot,
+            previous.as_ref(),
+            session_id,
+            None,
+            Self::now_unix(),
+        );
         let current_session_ids = session_id
             .map(|session_id| vec![session_id.to_string()])
             .unwrap_or_default();
@@ -985,15 +997,33 @@ fn merge_session_windows(
     previous: Option<&ProviderSnapshot>,
     session_id: Option<&str>,
     quota_scope: Option<&str>,
+    now_unix: u64,
 ) {
     // The account's allowance outlives any one observation of it. A statusLine
     // save reports a session and carries no endpoint reading, so without this
     // every turn would drop the account windows until the next poll.
+    //
+    // Every carried window must still name a future reset, and one lapsed
+    // window drops the whole list. `windows_for_session` returns these ahead of
+    // the session's own reading, and the renderer filters expired windows, so a
+    // partial carry would hide a pane's live statusLine figures behind a row
+    // that draws nothing -- worse than not carrying at all. A permanently
+    // failing endpoint (a revoked token, not a 429) therefore degrades to the
+    // session-local reading within one window period instead of freezing or
+    // blanking the sidebar. This is the rule `overlay_claude_windows` already
+    // applies to the scoped window it carries.
     if snapshot.account_windows.is_empty() {
         if let Some(previous) = previous {
-            snapshot
-                .account_windows
-                .clone_from(&previous.account_windows);
+            if !previous.account_windows.is_empty()
+                && previous
+                    .account_windows
+                    .iter()
+                    .all(|window| window.is_current(now_unix))
+            {
+                snapshot
+                    .account_windows
+                    .clone_from(&previous.account_windows);
+            }
         }
     }
     if snapshot.session_quota_only {
