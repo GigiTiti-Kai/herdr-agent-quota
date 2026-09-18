@@ -279,9 +279,10 @@ impl SidebarField {
 
 /// Which quota fields the sidebar shows.
 ///
-/// Default is provider, topic, model, context, 5h, 7d, and 30d. Cache and TTL
-/// stay off until the user turns them on — most installs care about quota and
-/// context first, and those two rows add noise on a gauges layout.
+/// Default is provider, topic, model, context, 5h, 7d, the model-scoped 7d
+/// row, and 30d. Cache and TTL stay off until the user turns them on — most
+/// installs care about quota and context first, and those two rows add noise
+/// on a gauges layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSet(u16);
 

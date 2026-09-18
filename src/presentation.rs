@@ -682,8 +682,9 @@ fn format_ttl(seconds: u64) -> String {
 /// much of the window's clock has run, in percentage points.
 ///
 /// Paces against the binding window — the 5h/7d/scoped-weekly window with the
-/// least remaining quota, the same rule as [`headroom`], because whichever
-/// limit runs out first is the one the pace has to respect — and names it by
+/// least remaining quota, unfiltered by the sidebar's [`FieldSet`], unlike
+/// [`headroom`], because whichever limit runs out first is the one the pace
+/// has to respect whether or not its row is switched on — and names it by
 /// its [`UsageWindow::display_label`] (`5h`/`7d`, or a scoped window's own
 /// model name) so a weekly pace is never mistaken for a five-hour one, and a
 /// model-scoped weekly is never mistaken for the account-wide one. The

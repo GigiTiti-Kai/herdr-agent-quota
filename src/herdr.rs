@@ -2473,6 +2473,13 @@ mod tests {
                     Some(crate::model::ResetAt::from_unix_seconds(183_600)),
                 )
                 .unwrap(),
+                crate::model::UsageWindow::new(
+                    crate::model::WindowKind::WeeklyScoped,
+                    40.0,
+                    Some(crate::model::ResetAt::from_unix_seconds(183_600)),
+                )
+                .unwrap()
+                .with_source_window("Fab", None),
             ],
             0,
         )
@@ -2499,6 +2506,11 @@ mod tests {
         );
         let desired = desired_tokens(&values, "prompt", gauges);
         assert!(desired.contains_key("quota_context_danger"));
+        // The scoped row is part of the worst case, not an optional extra.
+        assert!(
+            desired.contains_key("quota_week_scoped_normal"),
+            "{desired:?}"
+        );
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),

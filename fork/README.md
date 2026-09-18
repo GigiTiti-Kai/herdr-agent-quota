@@ -49,8 +49,10 @@ rebuild is enough — Herdr does not need reinstalling. Pick the new binary up w
 
 Settings and cached quota survive a rebuild.
 
-If you ever run an *older* build after a newer one, it reads a cached snapshot
-containing window kinds it does not know and shows empty quota rows. Recover by
+If you ever run an *older* build after a newer one, it meets a cached snapshot
+containing window kinds it does not know. Loading it fails outright, which
+aborts the whole refresh: no pane is updated at all, so the sidebar keeps
+whatever it last showed rather than going blank. Recover by
 deleting that provider's cached snapshot and refreshing — the state directory is
 `~/.local/state/herdr/plugins/herdr-agent-quota/` and the file is named after the
 source (`claude-statusline.json`, `codex-app-server.json`, ...):

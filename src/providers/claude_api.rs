@@ -115,7 +115,11 @@ pub fn parse_usage(value: &Value, fetched_at_unix: u64) -> Result<ProviderSnapsh
                 percent.clamp(0.0, 100.0),
                 resets_at,
             )
-            .map(|window| window.with_source_window(scoped_label(model), None)),
+            // `model` is only known non-blank once trimmed: an untrimmed name
+            // produces a whitespace label, which `with_source_window` drops,
+            // and the row falls back to the `wks` placeholder this variant
+            // exists to keep off screen.
+            .map(|window| window.with_source_window(scoped_label(model.trim()), None)),
             _ => continue,
         }
         .map_err(|error| ProviderError::UnsupportedResponse(error.to_string()))?;
@@ -263,6 +267,9 @@ mod tests {
             .windows
             .iter()
             .all(|window| window.kind != WindowKind::WeeklyScoped));
+        // Skipped, not remapped: a scoped limit landing on `Weekly` would draw
+        // a second, unexplained `7d` row beside the account-wide one.
+        assert_eq!(snapshot.windows.len(), 2);
     }
 
     #[test]
