@@ -6,15 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Cursor sidebar model follows the CLI footer after a model switch:
+  `lastUsedModel` of `default` / `auto` uses `cli-config.json` instead of
+  staying labelled Auto.
+
 ### Changed
 
 - Account quota windows (`5h` / `7d` / `30d`) appear on one pane per
-  login-scoped vendor (Grok, Codex, Devin, OpenCode, Cursor). Extra tabs of
-  that vendor are hidden from the Agent sidebar using `$quota_headroom` as
-  the visibility signal, so a narrow sidebar that omits `$quota_provider`
-  cannot hide the representative pane. The focused pane of that vendor wins,
-  then a working pane, then the first pane id. OpenCode and OpenCode Go are
-  the same group. Claude and Agy stay per-pane.
+  login-scoped vendor in each Space (Grok, Codex, Devin, OpenCode, Cursor).
+  Extra tabs of that vendor in the same Space stay in the Agent panel with
+  their model, topic, and context; only the duplicate 5h/7d/30d rows are
+  omitted. The lexicographically first pane id in that Space keeps the
+  windows, so focus and working status do not move the shared row. A Grok
+  in another Space keeps its own windows. OpenCode and OpenCode Go are the
+  same group. Claude and Agy stay per-pane. On a wide sidebar, two or more
+  panes of the same vendor
+  in one Space nest: the head is the brand icon, vendor name, and quota;
+  every pane of that vendor still lists model, topic, and context. Extra
+  tabs have no icon and use the same Space indent as other agents, not an
+  extra nest. Narrow sidebars stay flat. Nested vendor children stay
+  flush even when the settings row gap is 1: Herdr's own `row_gap` would
+  also split those children, so the plugin packs the sidebar and paints
+  the blank after the last child (and after un-nested panes).
 
 ## [1.6.0] - 2026-09-17
 

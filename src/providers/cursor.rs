@@ -22,8 +22,11 @@
 //! The token is sent only to that fixed host.
 //!
 //! Model and topic are local. `cli-config.json` `model.displayName` is the
-//! account default; a session's `chats/<hash>/<id>/store.db` meta
-//! `lastUsedModel` overrides it when present. The topic is the generated
+//! account default and what the CLI footer shows after a model switch.
+//! A session's `chats/<hash>/<id>/store.db` meta `lastUsedModel` overrides
+//! that only when it names a specific model. `default` / `auto` stay on the
+//! catalog — Cursor does not rewrite `lastUsedModel` when you change models
+//! in an existing session. The topic is the generated
 //! session title (`meta.json` `title`, else `store.db` `name`), so a later
 //! follow-up does not replace the session name. Placeholder titles such as
 //! `New Agent` fall back to the last `<user_query>` in
@@ -466,8 +469,18 @@ fn session_model(home: &Path, session_id: &str, catalog_id: Option<&str>) -> Opt
 }
 
 fn display_name_for_id(home: &Path, model_id: &str, catalog_id: Option<&str>) -> Option<String> {
-    if catalog_id.is_some_and(|id| id == model_id) {
-        if let Some(name) = read_bounded_json(&home.join("cli-config.json"))
+    let config = read_bounded_json(&home.join("cli-config.json"));
+    // `lastUsedModel` of default/auto is the CLI's "use the selected model"
+    // sentinel. The footer follows cli-config after a switch; the store field
+    // does not.
+    if is_auto_cursor_model(model_id) {
+        return config
+            .as_ref()
+            .and_then(configured_model_from)
+            .or_else(|| Some(friendly_cursor_model_label(model_id)));
+    }
+    if catalog_id.is_some_and(|id| cursor_model_ids_match(id, model_id)) {
+        if let Some(name) = config
             .as_ref()
             .and_then(|config| config.get("model"))
             .and_then(display_name_from_model)
@@ -475,7 +488,36 @@ fn display_name_for_id(home: &Path, model_id: &str, catalog_id: Option<&str>) ->
             return Some(name);
         }
     }
-    Some(model_id.to_string())
+    Some(friendly_cursor_model_label(model_id))
+}
+
+fn cursor_model_ids_match(catalog_id: &str, model_id: &str) -> bool {
+    let catalog = normalize_cursor_model_id(catalog_id);
+    let model = normalize_cursor_model_id(model_id);
+    catalog == model || model.starts_with(&format!("{catalog}-"))
+}
+
+fn normalize_cursor_model_id(model_id: &str) -> String {
+    model_id
+        .trim()
+        .strip_prefix("cursor-")
+        .unwrap_or(model_id.trim())
+        .to_ascii_lowercase()
+}
+
+fn is_auto_cursor_model(model_id: &str) -> bool {
+    matches!(
+        normalize_cursor_model_id(model_id).as_str(),
+        "default" | "auto"
+    )
+}
+
+fn friendly_cursor_model_label(model_id: &str) -> String {
+    if is_auto_cursor_model(model_id) {
+        "Auto".to_string()
+    } else {
+        model_id.to_string()
+    }
 }
 
 fn last_used_model(home: &Path, session_id: &str) -> Option<String> {
@@ -848,6 +890,7 @@ pub fn overlay_hook_context_at(
     let Some(session_id) = session_id.filter(|id| is_session_id(id)) else {
         return;
     };
+    overlay_hook_model_at(snapshot, state, session_id);
     let Some(hook) = load_mailbox_context(&state.join(HOOK_MAILBOX_DIR), session_id) else {
         return;
     };
@@ -863,6 +906,34 @@ pub fn overlay_hook_context_at(
                 .insert(session_id.to_string(), hook);
         }
     }
+}
+
+fn overlay_hook_model_at(snapshot: &mut ProviderSnapshot, state: &Path, session_id: &str) {
+    let Some(hook_model) = load_observation(
+        &state
+            .join(HOOK_MAILBOX_DIR)
+            .join(format!("{session_id}.json")),
+    )
+    .and_then(|observation| observation.model)
+    .filter(|model| !model.trim().is_empty()) else {
+        return;
+    };
+    if is_auto_cursor_model(&hook_model) {
+        return;
+    }
+    let catalog_id = cursor_data_home()
+        .ok()
+        .and_then(|home| read_bounded_json(&home.join("cli-config.json")))
+        .as_ref()
+        .and_then(|config| config.get("model"))
+        .and_then(|model| json_text(model.get("modelId")));
+    let name = cursor_data_home()
+        .ok()
+        .and_then(|home| display_name_for_id(&home, &hook_model, catalog_id.as_deref()));
+    snapshot.session_models.insert(
+        session_id.to_string(),
+        name.unwrap_or_else(|| friendly_cursor_model_label(&hook_model)),
+    );
 }
 
 /// Merge one Cursor hook payload into the per-session mailbox.
@@ -993,15 +1064,11 @@ fn cache_from_observation(observation: &HookObservation) -> Option<CacheUsage> {
 }
 
 fn documented_context_window(model: &str) -> Option<u64> {
-    let id = model
-        .trim()
-        .strip_prefix("cursor-")
-        .unwrap_or(model.trim())
-        .to_ascii_lowercase();
+    let id = normalize_cursor_model_id(model);
     if id.starts_with("composer-2") {
         return Some(COMPOSER_2_CONTEXT_WINDOW);
     }
-    matches!(id.as_str(), "default" | "auto").then_some(AUTO_CONTEXT_WINDOW)
+    is_auto_cursor_model(&id).then_some(AUTO_CONTEXT_WINDOW)
 }
 
 fn is_session_id(value: &str) -> bool {
@@ -1387,6 +1454,124 @@ mod tests {
             Some("cursor-grok-4.6-high")
         );
         assert_eq!(configured_model_from(&json!({})), None);
+    }
+
+    #[test]
+    fn default_and_auto_last_used_models_follow_the_cli_config_footer() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        fs::write(
+            home.join("cli-config.json"),
+            r#"{"model":{"modelId":"grok-4.6","displayName":"Cursor Grok 4.6 High"}}"#,
+        )
+        .unwrap();
+        for (session_id, last_used) in [
+            ("11111111-1111-1111-1111-111111111111", "default"),
+            ("22222222-2222-2222-2222-222222222222", "auto"),
+        ] {
+            let chat = home.join("chats").join("hash").join(session_id);
+            fs::create_dir_all(&chat).unwrap();
+            write_store_meta(
+                &chat.join("store.db"),
+                &format!(r#"{{"agentId":"{session_id}","lastUsedModel":"{last_used}"}}"#),
+            );
+            let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+            enrich_local_sessions_at(&mut snapshot, home, &[session_id.to_string()]);
+            assert_eq!(
+                snapshot.session_models.get(session_id).map(String::as_str),
+                Some("Cursor Grok 4.6 High"),
+                "{last_used}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_last_used_model_stays_auto_when_cli_config_is_auto() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "55555555-5555-5555-5555-555555555555";
+        fs::write(
+            home.join("cli-config.json"),
+            r#"{"model":{"modelId":"default","displayName":"Auto"}}"#,
+        )
+        .unwrap();
+        let chat = home.join("chats").join("hash").join(session_id);
+        fs::create_dir_all(&chat).unwrap();
+        write_store_meta(
+            &chat.join("store.db"),
+            &format!(r#"{{"agentId":"{session_id}","lastUsedModel":"default"}}"#),
+        );
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, home, &[session_id.to_string()]);
+        assert_eq!(
+            snapshot.session_models.get(session_id).map(String::as_str),
+            Some("Auto")
+        );
+    }
+
+    #[test]
+    fn a_grok_last_used_model_uses_the_cli_config_display_name() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "33333333-3333-3333-3333-333333333333";
+        fs::write(
+            home.join("cli-config.json"),
+            r#"{"model":{"modelId":"grok-4.6","displayName":"Cursor Grok 4.6 High"}}"#,
+        )
+        .unwrap();
+        let chat = home.join("chats").join("hash").join(session_id);
+        fs::create_dir_all(&chat).unwrap();
+        write_store_meta(
+            &chat.join("store.db"),
+            &format!(r#"{{"agentId":"{session_id}","lastUsedModel":"grok-4.6"}}"#),
+        );
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, home, &[session_id.to_string()]);
+        assert_eq!(
+            snapshot.session_models.get(session_id).map(String::as_str),
+            Some("Cursor Grok 4.6 High")
+        );
+    }
+
+    #[test]
+    fn a_hook_grok_model_replaces_a_stale_auto_store_label() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let state = dir.path().join("plugin-state");
+        let session_id = "44444444-4444-4444-4444-444444444444";
+        fs::write(
+            home.join("cli-config.json"),
+            r#"{"model":{"modelId":"grok-4.6","displayName":"Cursor Grok 4.6 High"}}"#,
+        )
+        .unwrap();
+        let chat = home.join("chats").join("hash").join(session_id);
+        fs::create_dir_all(&chat).unwrap();
+        write_store_meta(
+            &chat.join("store.db"),
+            &format!(r#"{{"agentId":"{session_id}","lastUsedModel":"default"}}"#),
+        );
+        let mailbox = state.join("cursor-hooks");
+        fs::create_dir_all(&mailbox).unwrap();
+        fs::write(
+            mailbox.join(format!("{session_id}.json")),
+            r#"{"conversation_id":"44444444-4444-4444-4444-444444444444","model":"cursor-grok-4.6-high"}"#,
+        )
+        .unwrap();
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Cursor, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, home, &[session_id.to_string()]);
+        assert_eq!(
+            snapshot.session_models.get(session_id).map(String::as_str),
+            Some("Cursor Grok 4.6 High")
+        );
+        let _guard = env_guard();
+        std::env::set_var("CURSOR_HOME", home);
+        overlay_hook_context_at(&mut snapshot, &state, Some(session_id));
+        std::env::remove_var("CURSOR_HOME");
+        assert_eq!(
+            snapshot.session_models.get(session_id).map(String::as_str),
+            Some("Cursor Grok 4.6 High")
+        );
     }
 
     #[test]

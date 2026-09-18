@@ -53,6 +53,8 @@ mod tests {
         AgentPane {
             pane_id: pane_id.to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness,
             session: session.map(|value| AgentSession {
                 kind: Some("id".to_string()),

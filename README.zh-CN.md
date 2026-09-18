@@ -19,8 +19,11 @@ Provider／模型保持墨白色；进度条上的严重程度色仍表示剩余
 服务商自定义的窗口名过长时退回普通数字行，而不是截断进度条。进度条按当前连接的
 Herdr endpoint 侧栏宽度定长（已计入缩进和滚动条）。空字段自动折叠，百分比可选择
 显示剩余或已用额度。Cache 与 TTL 默认关闭（需要时可在设置里打开）。Grok、Codex、
-Devin、OpenCode、Cursor 同一登录只在 Agent 侧栏显示一行，其它标签页隐藏；Claude
-和 Agy 仍按窗格各自显示。Agent order 默认按 Space 分组，组内剩余额度最少的优先。
+Devin、OpenCode、Cursor 在同一个 Space 里每个标签页都还在 Agent 列表里，只把重复
+的 5h/7d/30d 收到一行上；宽栏下主行只留图标、厂商名和额度，子行无图标，
+只显示 model、topic、cx。设置里的 1 行空格仍隔开不同 agent；同一厂商的嵌套子行贴在一起。窄栏仍平铺。
+另一个 Space 里的同厂商仍有自己的额度行。Claude 和 Agy 仍按窗格各自显示。Agent
+order 默认按 Space 分组，组内剩余额度最少的优先。
 低额度通知默认关闭，直到你设置阈值。
 布局、字段和百分比口径都可以在设置面板里改（`prefix+shift+q`）。
 

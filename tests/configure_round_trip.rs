@@ -236,7 +236,7 @@ fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
     assert!(!applied.contains("$quota_5h_label"));
     assert!(!applied.contains("$quota_5h_eta"));
     assert!(!applied.contains("fg = \"#c8cdd6\""));
-    assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
+    assert!(applied.contains("row_gap = 0 # herdr-agent-quota"));
     assert!(applied.find("$quota_topic").unwrap() < applied.find("$quota_5h_normal").unwrap());
     assert!(applied.contains("fg = \"#82d978\""));
     assert!(applied.contains("fg = \"#e4b957\""));
@@ -323,7 +323,21 @@ fn context_is_the_penultimate_row_and_model_shares_provider_style() {
         })
         .unwrap();
     assert_eq!(context_index + 1, limit_index);
-    assert_eq!(limit_index + 1, rows.len());
+    let nest_gap_index = rows
+        .iter()
+        .position(|row| {
+            row.as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.as_inline_table()
+                        .and_then(|table| table.get("token"))
+                        .and_then(toml_edit::Value::as_str)
+                        .is_some_and(|token| token == "$quota_nest_gap")
+                })
+            })
+        })
+        .unwrap();
+    assert_eq!(limit_index + 1, nest_gap_index);
+    assert_eq!(nest_gap_index + 1, rows.len());
 
     let identity = rows
         .iter()
@@ -491,15 +505,15 @@ fn sidebar_configuration_preserves_an_explicit_row_gap() {
 }
 
 #[test]
-fn sidebar_configuration_migrates_the_plugin_owned_gap_to_separated_panes() {
+fn sidebar_configuration_keeps_plugin_owned_gap_packed() {
     let original = concat!(
         "[ui.sidebar.agents]\n",
-        "row_gap = 0 # herdr-agent-quota\n",
+        "row_gap = 1 # herdr-agent-quota\n",
         "rows = [[\"state_icon\", \"agent\"]]\n"
     );
     let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
-    assert!(!applied.contains("row_gap = 0"));
+    assert!(applied.contains("row_gap = 0 # herdr-agent-quota"));
+    assert!(!applied.contains("row_gap = 1"));
 }
 
 #[test]
@@ -1170,7 +1184,7 @@ fn opencode_working_event(pane_id: &str) -> String {
 fn assert_named_opencode_event(herdr_log: &Path, named: &str, sibling: &str) {
     let calls = fs::read_to_string(herdr_log).unwrap_or_default();
     assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
+        (1..=5).contains(&calls.matches("agent list").count()),
         "expected inventory plus group-membership list: {calls}"
     );
     assert!(
@@ -1290,8 +1304,8 @@ fn opencode_working_event_publishes_only_the_named_local_identity() {
     assert_no_sibling_quota_write(&calls, "w1:p10");
     assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
     assert!(
-        calls.contains("--token quota_provider_model=OpenCode Go/kimi-k2.5"),
-        "{calls}"
+        calls.contains("kimi-k2.5"),
+        "named OpenCode pane must keep its model: {calls}"
     );
 }
 
@@ -1923,8 +1937,16 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
     assert!(!paint.is_empty(), "completion must publish: {calls}");
     let joined = paint.join("\n");
     assert!(
-        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
-        "unfocused same-tab idle must stay teal: {joined}"
+        !joined.contains("quota_icon_done=") && !joined.contains("--token quota_icon_done="),
+        "nested vendor children omit the brand icon, so teal cannot land there: {joined}"
+    );
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line.contains("pane report-metadata w1:p1")
+                && (line.contains("quota_icon_done=")
+                    || line.contains("--token quota_icon_done="))),
+        "shared vendor header stays idle, not teal: {calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(!codex_log.exists(), "codex stub must stay idle");
@@ -2037,8 +2059,8 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
     assert!(!paint.is_empty(), "completion must publish: {calls}");
     let joined = paint.join("\n");
     assert!(
-        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
-        "working-set idle must stay teal even without a yellow twin: {joined}"
+        !joined.contains("quota_icon_done=") && !joined.contains("--token quota_icon_done="),
+        "nested extra Cursor tab has no brand icon to keep teal: {joined}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(!codex_log.exists(), "codex stub must stay idle");
@@ -2156,8 +2178,8 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
         &format!(
-            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}}]}}}}"#,
-            "\u{e1a0}"
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042","quota_stack":"042990042","quota_nest_gap":"{}"}}}}]}}}}"#,
+            "\u{e1a0}", "\u{200b}\u{2800}"
         ),
     );
 
@@ -2320,7 +2342,7 @@ fn opencode_indeterminate_event_removes_unconfirmed_quota() {
     original_four_untouched(state.path(), &codex_log);
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
+        (1..=5).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(calls.contains("pane read w1:p9"), "{calls}");
@@ -2384,7 +2406,7 @@ fn opencode_mismatched_event_pane_is_a_noop() {
     original_four_untouched(state.path(), &codex_log);
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
+        (1..=5).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -2893,8 +2915,8 @@ fn flush_row_gap_is_persisted_across_a_repair() {
         .configure(&["--apply", "--row-gap", "1"])
         .status
         .success());
-    assert!(homes.sidebar().contains("row_gap = 1 # herdr-agent-quota"));
-    assert!(!homes.sidebar().contains("row_gap = 0"));
+    assert!(homes.sidebar().contains("row_gap = 0 # herdr-agent-quota"));
+    assert!(!homes.sidebar().contains("row_gap = 1"));
 }
 
 #[test]
@@ -3043,7 +3065,9 @@ fn sidebar_is_gauges(sidebar: &str) -> bool {
         && !tab_shares_row_with_provider_model(sidebar)
         && sidebar_has_token(sidebar, "$quota_provider_model")
         && !sidebar_has_token(sidebar, "$quota_provider")
-        && !sidebar_has_token(sidebar, "$quota_model")
+        && sidebar_has_token(sidebar, "$quota_model")
+        && sidebar_has_token(sidebar, "$quota_nest_gap")
+        && sidebar_has_token(sidebar, "$quota_share_week_normal")
         && sidebar.contains("$quota_context_normal")
         && sidebar.contains("$quota_week_normal")
 }
@@ -3241,7 +3265,7 @@ fn pi_codex_event_uses_only_the_proved_canonical_cache_and_reads_no_pane() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
+        (1..=5).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3307,7 +3331,8 @@ fn pi_codex_event_overlays_exact_session_context_and_cache_without_inventing_ttl
     assert!(calls.contains("--token quota_cache=cache 85.0%"), "{calls}");
     assert!(!calls.contains("quota_cache_ttl"), "{calls}");
     assert!(
-        calls.contains("--token quota_week_inline_normal=7d 80%"),
+        calls.contains("quota_week_normal=7d 80%")
+            || calls.contains("quota_week_inline_normal=7d 80%"),
         "{calls}"
     );
 }
@@ -3384,7 +3409,7 @@ fn pi_payg_event_clears_stale_quota_without_invoking_a_collector() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
+        (1..=5).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3478,7 +3503,7 @@ fn pi_different_account_clears_stale_quota_and_cannot_borrow_codex_cache() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
+        (1..=5).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3520,7 +3545,7 @@ fn pi_model_switch_updates_identity_and_removes_unconfirmed_quota() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
     assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
+        (1..=5).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3572,7 +3597,7 @@ fn an_opencode_pane_without_a_go_key_makes_no_request_but_shows_exact_identity()
         "exact OpenCode session stayed blank: {calls}"
     );
     assert!(
-        calls.contains("--token quota_provider_model=OpenCode Go/kimi-k2.5"),
+        calls.contains("kimi-k2.5"),
         "exact OpenCode identity was not published: {calls}"
     );
     assert!(

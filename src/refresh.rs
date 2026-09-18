@@ -659,7 +659,7 @@ fn handle_named_pane(
         return Ok(());
     }
     WatchHerdrEnvironment::current().save(cache)?;
-    let mut panes = [pane];
+    let mut panes = vec![pane];
     apply_icon_attention(&mut panes, cache, None, false, working_event)?;
     if topic_pane == Some(panes[0].pane_id.as_str()) {
         refresh_pane_topic(&mut panes[0]);
@@ -690,13 +690,14 @@ fn handle_named_pane(
         context: None,
         show_account_quota: true,
     });
-    let tokens = vec![tokens];
+    let mut tokens = vec![tokens];
     // Event and focus see one pane, not the whole inventory, which is exactly
     // what the alert needs: the entry is keyed by provider, and a provider
     // with no pane in the pass keeps whatever state it had. Warning here is
     // what makes the alert land at the end of the turn that spent the quota
     // rather than at the next poll.
     notify_low_quota(cache, &tokens);
+    sync_vendor_row_siblings(&mut tokens, &mut panes);
     // Completion colour must land even if this pane is scrolled: the scroll
     // guard exists to protect reading transcript, not to leave a stale glyph.
     publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row)
@@ -1081,7 +1082,17 @@ fn refresh_provider(
     cache.mark_refresh_account(provider, now, account_id.as_deref())?;
     let fetched = match provider {
         Provider::Codex => codex::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Grok => grok::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
+        Provider::Grok => {
+            let cwds = panes
+                .iter()
+                .filter(|pane| pane.harness == Harness::Grok)
+                .filter_map(|pane| {
+                    let session_id = pane.session.as_ref()?.id()?.to_string();
+                    (!pane.cwd.is_empty()).then(|| (session_id, pane.cwd.clone()))
+                })
+                .collect::<Vec<_>>();
+            grok::fetch_for_sessions_with_cwds(&session_ids, &cwds).map(FetchedSnapshot::direct)
+        }
         Provider::Devin => devin::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Muse => muse::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Cursor => cursor::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
@@ -1326,102 +1337,179 @@ fn publish_resolved(
         );
     }
     notify_low_quota(cache, &tokens);
-    mark_one_quota_row_per_vendor(&mut tokens, panes);
+    let mut publish_panes = panes.to_vec();
+    sync_vendor_row_siblings(&mut tokens, &mut publish_panes);
     if allow_icon_while_scrolled {
-        publish_pane_tokens_with_scrolled_icons(panes, &tokens, CacheStore::now_millis(), row)
+        publish_pane_tokens_with_scrolled_icons(
+            &publish_panes,
+            &tokens,
+            CacheStore::now_millis(),
+            row,
+        )
     } else {
-        publish_pane_tokens(panes, &tokens, CacheStore::now_millis(), row)
+        publish_pane_tokens(&publish_panes, &tokens, CacheStore::now_millis(), row)
     }
 }
 
-/// Keep account quota on one pane per login-scoped vendor.
+/// Overlay this pass's fresher focus/status onto the full agent list so an
+/// event that names one pane still sees same-space siblings.
+fn panes_for_vendor_rows(live: &[AgentPane]) -> Vec<AgentPane> {
+    let Ok(mut inventory) = list_agent_panes() else {
+        return live.to_vec();
+    };
+    if inventory.is_empty() {
+        return live.to_vec();
+    }
+    for pane in live {
+        if let Some(existing) = inventory
+            .iter_mut()
+            .find(|existing| existing.pane_id == pane.pane_id)
+        {
+            *existing = pane.clone();
+        } else {
+            inventory.push(pane.clone());
+        }
+    }
+    inventory
+}
+
+/// Mark the current pass, then republish same-Space extras whose account
+/// windows still disagree with the representative. An event that only names
+/// one Grok would otherwise leave a sibling showing duplicate 5h/7d/30d.
+fn sync_vendor_row_siblings(tokens: &mut Vec<PaneTokens>, panes: &mut Vec<AgentPane>) {
+    let inventory = panes_for_vendor_rows(panes);
+    mark_one_quota_row_per_vendor(tokens, &inventory);
+    for extra in vendor_row_sync_extras(tokens, &inventory) {
+        if let Some(pane) = inventory
+            .iter()
+            .find(|pane| pane.pane_id == extra.pane_id)
+            .cloned()
+        {
+            panes.push(pane);
+            tokens.push(extra);
+        }
+    }
+}
+
+fn vendor_row_sync_extras(tokens: &[PaneTokens], inventory: &[AgentPane]) -> Vec<PaneTokens> {
+    let published = tokens
+        .iter()
+        .map(|token| token.pane_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let live_groups = tokens
+        .iter()
+        .filter_map(|token| {
+            inventory
+                .iter()
+                .find(|pane| pane.pane_id == token.pane_id)
+                .filter(|pane| crate::herdr::shares_login_quota(pane.harness))
+                .map(crate::herdr::nest_group_key)
+        })
+        .collect::<BTreeSet<_>>();
+    inventory
+        .iter()
+        .filter(|pane| {
+            !published.contains(pane.pane_id.as_str())
+                && crate::herdr::shares_login_quota(pane.harness)
+                && live_groups.contains(&crate::herdr::nest_group_key(pane))
+        })
+        .filter_map(|pane| {
+            let should_show = representative_pane_id(pane, inventory) == pane.pane_id;
+            pane_needs_vendor_restyle(pane, inventory, should_show).then(|| PaneTokens {
+                pane_id: pane.pane_id.clone(),
+                quota: PaneQuotaUpdate::Preserve,
+                identity: None,
+                context: None,
+                show_account_quota: should_show,
+            })
+        })
+        .collect()
+}
+
+/// Keep account quota on one pane per login-scoped vendor *in each Space*.
+/// Two Grok tabs in the same project collapse; a Grok in another Space stays.
 fn mark_one_quota_row_per_vendor(tokens: &mut [PaneTokens], panes: &[AgentPane]) {
     for token in tokens.iter_mut() {
-        let Some(vendor) = vendor_key(token) else {
+        let Some(pane) = panes.iter().find(|pane| pane.pane_id == token.pane_id) else {
             continue;
         };
-        if !shares_account_quota(&vendor) {
+        if !crate::herdr::shares_login_quota(pane.harness) {
             continue;
         }
-        let representative = representative_pane_id(&vendor, token, panes);
+        let representative = representative_pane_id(pane, panes);
         if token.pane_id != representative {
             token.show_account_quota = false;
-            if let PaneQuotaUpdate::Replace(values) = &mut token.quota {
-                values.quota_headroom = None;
-            }
         }
     }
 }
 
-fn vendor_key(tokens: &PaneTokens) -> Option<String> {
-    if let Some(identity) = &tokens.identity {
-        if !identity.provider.is_empty() {
-            return Some(normalize_vendor(&identity.provider));
-        }
-    }
-    match &tokens.quota {
-        PaneQuotaUpdate::Replace(values) if !values.quota_provider.is_empty() => {
-            Some(normalize_vendor(&values.quota_provider))
-        }
-        _ => None,
-    }
+fn pane_has_account_windows(pane: &AgentPane) -> bool {
+    pane.tokens.keys().any(|name| {
+        name.starts_with("quota_5h_")
+            || name.starts_with("quota_week_")
+            || name.starts_with("quota_month_")
+            || name.starts_with("quota_share_")
+    })
 }
 
-fn normalize_vendor(name: &str) -> String {
-    match name {
-        "OpenCode Go" => "OpenCode".to_string(),
-        other => other.to_string(),
-    }
+fn pane_has_share_windows(pane: &AgentPane) -> bool {
+    pane.tokens
+        .keys()
+        .any(|name| name.starts_with("quota_share_"))
 }
 
-fn shares_account_quota(vendor: &str) -> bool {
-    matches!(vendor, "Grok" | "Codex" | "Devin" | "OpenCode" | "Cursor")
+fn pane_has_brand_identity(pane: &AgentPane) -> bool {
+    pane.tokens.keys().any(|name| {
+        matches!(
+            name.as_str(),
+            "quota_icon"
+                | "quota_icon_working"
+                | "quota_icon_done"
+                | "quota_provider"
+                | "quota_provider_model"
+        )
+    })
 }
 
-fn representative_pane_id(vendor: &str, current: &PaneTokens, panes: &[AgentPane]) -> String {
-    let members: Vec<&AgentPane> = panes
+fn group_is_nested(pane: &AgentPane, inventory: &[AgentPane]) -> bool {
+    let key = crate::herdr::nest_group_key(pane);
+    inventory
         .iter()
-        .filter(|pane| pane_vendor_name(pane).as_deref() == Some(vendor))
-        .collect();
-    if members.is_empty() {
-        return current.pane_id.clone();
+        .filter(|candidate| crate::herdr::nest_group_key(candidate) == key)
+        .count()
+        >= 2
+}
+
+/// True when this unpublished sibling's tokens would render the wrong vendor
+/// role. A second Cursor in a Space must restyle the existing Flat
+/// representative into a nested head even if it already has 5h/7d/30d.
+fn pane_needs_vendor_restyle(pane: &AgentPane, inventory: &[AgentPane], should_show: bool) -> bool {
+    let has_windows = pane_has_account_windows(pane);
+    if should_show != has_windows {
+        return true;
     }
-    if let Some(pane) = members.iter().find(|pane| pane.focused) {
-        return pane.pane_id.clone();
+    let nested = group_is_nested(pane, inventory);
+    if nested && should_show && !pane_has_share_windows(pane) {
+        return true;
     }
-    if let Some(pane) = members.iter().find(|pane| pane.working()) {
-        return pane.pane_id.clone();
+    if nested && !should_show && pane_has_brand_identity(pane) {
+        return true;
     }
-    members
+    if !nested && (pane_has_share_windows(pane) || !pane_has_brand_identity(pane)) {
+        return plugin_quota_present(&pane.tokens);
+    }
+    false
+}
+
+fn representative_pane_id(current: &AgentPane, panes: &[AgentPane]) -> String {
+    let key = crate::herdr::nest_group_key(current);
+    panes
         .iter()
+        .filter(|pane| crate::herdr::nest_group_key(pane) == key)
         .map(|pane| pane.pane_id.as_str())
         .min()
         .unwrap_or(current.pane_id.as_str())
         .to_string()
-}
-
-fn pane_vendor_name(pane: &AgentPane) -> Option<String> {
-    if let Some(name) = pane.tokens.get("quota_provider") {
-        if !name.is_empty() {
-            return Some(normalize_vendor(name));
-        }
-    }
-    if let Some(name) = pane.tokens.get("quota_provider_model") {
-        if let Some((provider, _)) = name.split_once('/') {
-            return Some(normalize_vendor(provider));
-        }
-        if !name.is_empty() {
-            return Some(normalize_vendor(name));
-        }
-    }
-    match pane.harness {
-        Harness::Grok => Some("Grok".to_string()),
-        Harness::Codex => Some("Codex".to_string()),
-        Harness::Devin => Some("Devin".to_string()),
-        Harness::OpenCode => Some("OpenCode".to_string()),
-        Harness::Cursor => Some("Cursor".to_string()),
-        _ => None,
-    }
 }
 
 /// The lowest headroom each provider is showing in this pass.
@@ -1673,6 +1761,8 @@ mod tests {
         AgentPane {
             pane_id: id.to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness,
             session: None,
             session_summary: String::new(),
@@ -2254,7 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn one_vendor_quota_row_stays_on_the_focused_pane() {
+    fn one_vendor_quota_row_stays_on_the_stable_pane() {
         let mut tokens = vec![
             quota_tokens("w1:p1", "Grok", Some(87)),
             quota_tokens("w1:p2", "Grok", Some(87)),
@@ -2267,13 +2357,13 @@ mod tests {
         ];
         panes[1].focused = true;
         mark_one_quota_row_per_vendor(&mut tokens, &panes);
-        assert!(!tokens[0].show_account_quota);
-        assert!(tokens[1].show_account_quota);
+        assert!(tokens[0].show_account_quota);
+        assert!(!tokens[1].show_account_quota);
         assert!(tokens[2].show_account_quota);
     }
 
     #[test]
-    fn without_focus_the_working_pane_keeps_the_vendor_row() {
+    fn focusing_another_tab_does_not_move_the_vendor_quota_row() {
         let mut tokens = vec![
             quota_tokens("w1:p1", "Grok", Some(87)),
             quota_tokens("w1:p2", "Grok", Some(87)),
@@ -2283,9 +2373,10 @@ mod tests {
             test_pane("w1:p2", Harness::Grok),
         ];
         panes[1].status = AgentStatus::Working;
+        panes[1].focused = true;
         mark_one_quota_row_per_vendor(&mut tokens, &panes);
-        assert!(!tokens[0].show_account_quota);
-        assert!(tokens[1].show_account_quota);
+        assert!(tokens[0].show_account_quota);
+        assert!(!tokens[1].show_account_quota);
     }
 
     #[test]
@@ -2313,20 +2404,109 @@ mod tests {
 
     #[test]
     fn opencode_go_and_opencode_share_one_vendor_row() {
-        let mut go = quota_tokens("w1:p9", "OpenCode Go", Some(40));
+        let mut go = quota_tokens("w1:p1", "OpenCode Go", Some(40));
         go.identity = Some(crate::herdr::PaneIdentity {
             provider: "OpenCode Go".to_string(),
             model: "kimi-k2.5".to_string(),
         });
-        let mut tokens = vec![go, quota_tokens("w1:p10", "OpenCode", Some(40))];
+        let mut tokens = vec![go, quota_tokens("w1:p2", "OpenCode", Some(40))];
         let mut panes = vec![
-            test_pane("w1:p9", Harness::OpenCode),
-            test_pane("w1:p10", Harness::OpenCode),
+            test_pane("w1:p1", Harness::OpenCode),
+            test_pane("w1:p2", Harness::OpenCode),
         ];
-        panes[0].focused = true;
+        panes[1].focused = true;
         mark_one_quota_row_per_vendor(&mut tokens, &panes);
         assert!(tokens[0].show_account_quota);
         assert!(!tokens[1].show_account_quota);
+    }
+
+    #[test]
+    fn each_space_keeps_its_own_vendor_row() {
+        let mut other = test_pane("w9:p1", Harness::Grok);
+        other.workspace_id = "w9".to_string();
+        let mut tokens = vec![
+            quota_tokens("w1:p1", "Grok", Some(87)),
+            quota_tokens("w9:p1", "Grok", Some(87)),
+        ];
+        let mut panes = vec![test_pane("w1:p1", Harness::Grok), other];
+        panes[0].focused = true;
+        mark_one_quota_row_per_vendor(&mut tokens, &panes);
+        assert!(tokens[0].show_account_quota);
+        assert!(tokens[1].show_account_quota);
+    }
+
+    #[test]
+    fn a_stale_same_space_sibling_is_queued_to_drop_windows() {
+        let mut focused = test_pane("w5:pA", Harness::Grok);
+        focused.focused = true;
+        focused.workspace_id = "w5".to_string();
+        let mut extra = test_pane("w5:pD", Harness::Grok);
+        extra.workspace_id = "w5".to_string();
+        extra
+            .tokens
+            .insert("quota_week_inline_normal".to_string(), "7d 54%".to_string());
+        let tokens = vec![quota_tokens("w5:pA", "Grok", Some(54))];
+        let extras = vendor_row_sync_extras(&tokens, &[focused, extra]);
+        assert_eq!(extras.len(), 1, "{extras:?}");
+        assert_eq!(extras[0].pane_id, "w5:pD");
+        assert!(!extras[0].show_account_quota);
+    }
+
+    #[test]
+    fn a_flat_representative_is_queued_when_a_sibling_joins() {
+        let mut head = test_pane("w9:p1", Harness::Cursor);
+        head.workspace_id = "w9".to_string();
+        head.tokens
+            .insert("quota_icon".to_string(), "x".to_string());
+        head.tokens.insert(
+            "quota_provider_model".to_string(),
+            "Cursor/default".to_string(),
+        );
+        head.tokens
+            .insert("quota_week_danger".to_string(), "7d 0%".to_string());
+        let mut child = test_pane("w9:p7", Harness::Cursor);
+        child.workspace_id = "w9".to_string();
+        let tokens = vec![quota_tokens("w9:p7", "Cursor", Some(0))];
+        let extras = vendor_row_sync_extras(&tokens, &[head, child]);
+        assert_eq!(extras.len(), 1, "{extras:?}");
+        assert_eq!(extras[0].pane_id, "w9:p1");
+        assert!(extras[0].show_account_quota);
+    }
+
+    #[test]
+    fn a_nested_head_with_share_windows_is_not_queued_from_a_child_event() {
+        let mut head = test_pane("w5:pA", Harness::Grok);
+        head.workspace_id = "w5".to_string();
+        head.tokens.insert(
+            "quota_share_week_inline_normal".to_string(),
+            "7d 54%".to_string(),
+        );
+        let mut child = test_pane("w5:pD", Harness::Grok);
+        child.workspace_id = "w5".to_string();
+        child.focused = true;
+        let tokens = vec![quota_tokens("w5:pD", "Grok", Some(54))];
+        let extras = vendor_row_sync_extras(&tokens, &[head, child]);
+        assert!(
+            extras.iter().all(|extra| extra.pane_id != "w5:pA"),
+            "share tokens already count as account windows: {extras:?}"
+        );
+    }
+
+    #[test]
+    fn vendor_sync_does_not_queue_a_different_vendor() {
+        let mut grok = test_pane("w5:pA", Harness::Grok);
+        grok.workspace_id = "w5".to_string();
+        let mut extra_grok = test_pane("w5:pD", Harness::Grok);
+        extra_grok.workspace_id = "w5".to_string();
+        extra_grok
+            .tokens
+            .insert("quota_week_inline_normal".to_string(), "7d 54%".to_string());
+        let mut codex = test_pane("w5:pB", Harness::Codex);
+        codex.workspace_id = "w5".to_string();
+        let tokens = vec![quota_tokens("w5:pA", "Grok", Some(54))];
+        let extras = vendor_row_sync_extras(&tokens, &[grok, extra_grok, codex]);
+        assert_eq!(extras.len(), 1, "{extras:?}");
+        assert_eq!(extras[0].pane_id, "w5:pD");
     }
 
     #[test]

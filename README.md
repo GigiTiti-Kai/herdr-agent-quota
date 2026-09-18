@@ -23,8 +23,12 @@ long for that column keeps a plain row instead of a truncated bar. Meters size
 to the connected Herdr endpoint's sidebar — indent and scrollbar included.
 Empty fields collapse; percentages can show remaining or used quota. Cache and
 TTL are off by default (turn them on in settings if you want them). Login-scoped
-vendors (Grok, Codex, Devin, OpenCode, Cursor) show one Agent-sidebar row even
-when several tabs share the same subscription; Claude and Agy stay per-pane.
+vendors (Grok, Codex, Devin, OpenCode, Cursor) keep every tab visible in the
+Agent panel; duplicate 5h/7d/30d rows collapse to one pane per Space. On a
+wide sidebar, the vendor icon and name sit above that pane's quota, and extra
+tabs list model, topic, and context with no icon. A settings row gap of 1 still
+separates different agents; nested extra tabs of the same vendor stay flush.
+Claude and Agy stay per-pane.
 Agent order defaults to Space grouping with least quota left first inside each space.
 Low-quota notifications stay off until you set a threshold. Switch layout,
 fields, and percentages from the settings pane (`prefix+shift+q`).
