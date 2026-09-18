@@ -8,6 +8,17 @@
 
 use crate::model::Harness;
 
+/// Invisible suffix on `$quota_icon` so working/done colour can live on the
+/// first identity token. A later twin (`$quota_icon_done`) on a Space-head
+/// row hang-indents one cell to the right because the leading empty slots
+/// still eat the group indent.
+///
+/// These must be `Grapheme_Cluster_Break=Control`, not Extend. U+200C
+/// (ZWNJ) is Extend: it joins the vendor PUA glyph into one cluster, the
+/// icon font has no ZWNJ, and the cell renders as a yellow `?`.
+pub const WORKING_TAG: &str = "\u{2061}";
+pub const DONE_TAG: &str = "\u{2060}";
+
 /// One-cell mark for a harness.
 pub fn for_harness(harness: Harness) -> &'static str {
     match harness {
@@ -46,5 +57,17 @@ mod tests {
         assert_eq!(for_harness(Harness::Agy), "\u{e1b2}");
         assert_eq!(for_harness(Harness::Cursor), "\u{e1ab}");
         assert_eq!(for_harness(Harness::Muse), "◈");
+    }
+
+    #[test]
+    fn status_tags_do_not_join_the_vendor_glyph() {
+        assert_ne!(
+            WORKING_TAG, "\u{200c}",
+            "ZWNJ extends U+E1AB and the icon font draws a replacement ?"
+        );
+        assert_ne!(WORKING_TAG, DONE_TAG);
+        let marked = format!("{}{WORKING_TAG}", for_harness(Harness::Cursor));
+        assert!(marked.starts_with('\u{e1ab}'));
+        assert_eq!(marked.chars().count(), 2);
     }
 }

@@ -18,8 +18,13 @@ Provider／模型保持墨白色；进度条上的严重程度色仍表示剩余
 `cx`、`5h`、`7d`、`30d` 都跟随 `quota-percent`。标签列三个字符，内置周期对齐；
 服务商自定义的窗口名过长时退回普通数字行，而不是截断进度条。进度条按当前连接的
 Herdr endpoint 侧栏宽度定长（已计入缩进和滚动条）。空字段自动折叠，百分比可选择
-显示剩余或已用额度。Cache 与 TTL 默认关闭（需要时可在设置里打开）。Agent order
-默认按 Space 分组，组内剩余额度最少的优先。低额度通知默认关闭，直到你设置阈值。
+显示剩余或已用额度。Cache 与 TTL 默认关闭（需要时可在设置里打开）。Grok、Codex、
+Devin、OpenCode、Cursor 在同一个 Space 里每个标签页都还在 Agent 列表里，只把重复
+的 5h/7d/30d 收到一行上；宽栏下主行只留图标、厂商名和额度，子行无图标，
+只显示 model、topic、cx。设置里的 1 行空格仍隔开不同 agent；同一厂商的嵌套子行贴在一起。窄栏仍平铺。
+另一个 Space 里的同厂商仍有自己的额度行。Claude 和 Agy 仍按窗格各自显示。Agent
+order 默认按 Space 分组，组内剩余额度最少的优先。
+低额度通知默认关闭，直到你设置阈值。
 布局、字段和百分比口径都可以在设置面板里改（`prefix+shift+q`）。
 
 ## 安装与升级
@@ -77,7 +82,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Grok | CLI billing 接口；7d 或 30d | 当前 CLI 凭据 |
 | Devin | CLI usage 接口；1d 和 7d | 当前 CLI 凭据 |
 | Muse Code | CLI 订阅接口；5h 和 7d | 当前 CLI 账号登录；会话通过 Muse 的 session lock 识别（Linux） |
-| Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；`cx` 来自 `store.db` `token_details`（CLI 底栏百分比）；cache 来自 CLI hook |
+| Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则 macOS Keychain 里 `cursor-agent login` 的登录，否则桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；`cx` 来自 `store.db` `token_details`（CLI 底栏百分比）；cache 来自 CLI hook |
 | Claude Code | StatusLine；5h 和 7d | 精确会话的观测 |
 | Agy / Antigravity | StatusLine；5h、7d，以及 Gemini 会话上的 api（第三方池） | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
@@ -112,7 +117,7 @@ Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
 | OMP 缺少额度 | 检查 `omp usage --json --redact --provider <id>` |
 | Devin 缺少额度 | 检查 CLI 登录；使用自定义路径时检查 `DEVIN_CREDENTIALS_FILE` |
 | Muse 缺少额度 | 运行 `muse login`（API key 登录没有订阅额度）；使用自定义路径时检查 `MUSE_AUTH_PATH`。macOS 上 `storage: "keychain"` 登录还需一次性 Keychain 授权：运行 `herdr-agent-quota refresh --provider muse --keychain-approve`，并点击 **Always Allow** |
-| Cursor 缺少额度 | 运行 `cursor login`，或登录 Cursor 桌面端；使用自定义路径时检查 `CURSOR_AUTH_FILE` |
+| Cursor 缺少额度或仍显示上一账号 | 运行 `cursor login`。macOS 上 `cursor-agent login` 把 token 存在 Keychain：运行 `herdr-agent-quota refresh --provider cursor --keychain-approve` 并点击 **Always Allow**。仅当 CLI 本身没有登录时才使用桌面端 token |
 | Cursor 缺少 cache/cx | `cx` 来自该会话的 `store.db`；cache 仍需重启 pane 以加载 `hooks.json` 后再发一轮（headless `--print` 不会触发这些 hook） |
 | 缺少侧栏行 | 运行下面的 configure action 修复插件配置 |
 | 侧栏太窄，`gauges` 不显示进度条 | 约 24 列以下是预期行为；调宽后刷新即可 |
