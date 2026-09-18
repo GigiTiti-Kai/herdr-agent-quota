@@ -3133,6 +3133,11 @@ mod tests {
         // `refresh_provider` only preserves diagnostics for a preserving
         // fetch; Claude is not in its fallback list.
         assert!(merged.preserve_context);
+        // And it has to stay session-local. A non-session-local snapshot
+        // survives *this* save — the other branch of `merge_session_windows`
+        // copies the maps too — but the next statusLine tick then filters it
+        // out as `previous` and every session's windows vanish.
+        assert!(merged.snapshot.session_quota_only);
         cache
             .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
             .unwrap();
