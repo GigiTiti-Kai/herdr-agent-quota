@@ -115,10 +115,11 @@ pub fn parse_usage(value: &Value, fetched_at_unix: u64) -> Result<ProviderSnapsh
                 percent.clamp(0.0, 100.0),
                 resets_at,
             )
-            // `model` is only known non-blank once trimmed: an untrimmed name
-            // produces a whitespace label, which `with_source_window` drops,
-            // and the row falls back to the `wks` placeholder this variant
-            // exists to keep off screen.
+            // The filter above tests `name.trim()`, so trim here too or the
+            // label gets cut from the padding instead of the name: `"  Fable"`
+            // would label the row `"  f"`, and a name whose first three
+            // characters are all whitespace labels it nothing, leaving the
+            // `wks` placeholder this variant exists to keep off screen.
             .map(|window| window.with_source_window(scoped_label(model.trim()), None)),
             _ => continue,
         }
@@ -130,10 +131,12 @@ pub fn parse_usage(value: &Value, fetched_at_unix: u64) -> Result<ProviderSnapsh
             "no known quota window in limits".to_string(),
         ));
     }
-    // No `session_local()` here: this is the raw endpoint reading. The caller
-    // (`overlay_claude_windows`) marks the merged snapshot session-local before
-    // it is cached, because Claude snapshots have no account gate to be
-    // validated against.
+    // No `session_local()` here: this is the raw endpoint reading, and what
+    // reaches the cache is always session-local either way. On the merged path
+    // these windows are copied into the statusLine snapshot, which already is;
+    // on the api-alone path `overlay_claude_windows` calls `session_local()`
+    // itself. Claude has no account gate, so a snapshot that is neither
+    // session-local nor stamped is rejected by `usable_for_account`.
     Ok(ProviderSnapshot::new(
         Provider::Claude,
         windows,

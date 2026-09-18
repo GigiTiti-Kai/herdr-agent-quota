@@ -141,6 +141,14 @@ fn run_claude_refresh(state: &Path, herdr: &Path) {
         .args(["refresh", "--provider", "claude", "--force"])
         .env("HERDR_PLUGIN_STATE_DIR", state)
         .env("HERDR_BIN_PATH", herdr)
+        // Without this the Claude collector falls back to
+        // `$HOME/.claude/.credentials.json` and sends a real authenticated
+        // request to the usage endpoint, so the test's own fixtures lose to
+        // whatever the developer's live account says.
+        .env(
+            "CLAUDE_CREDENTIALS_FILE",
+            state.join("absent-claude-auth.json"),
+        )
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -3649,6 +3657,10 @@ fn a_manual_refresh_reads_no_pane_at_all() {
             "CURSOR_STATE_DB",
             state.path().join("absent-cursor-state.vscdb"),
         )
+        .env(
+            "CLAUDE_CREDENTIALS_FILE",
+            state.path().join("absent-claude-auth.json"),
+        )
         .output()
         .unwrap();
     assert!(
@@ -3677,6 +3689,10 @@ fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
         .args(["refresh", "--provider", "claude"])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
+        .env(
+            "CLAUDE_CREDENTIALS_FILE",
+            state.path().join("absent-claude-auth.json"),
+        )
         .output()
         .unwrap();
     assert!(output.status.success());
