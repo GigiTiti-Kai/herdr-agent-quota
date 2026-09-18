@@ -7,7 +7,7 @@ use crate::providers::ProviderError;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeSet, BinaryHeap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,15 @@ impl GrokCredentials {
 /// provides their ids. Direct CLI refreshes pass an empty slice and use the
 /// bounded newest-session fallback instead.
 pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
+    fetch_for_sessions_with_cwds(session_ids, &[])
+}
+
+/// `cwds` maps a Herdr session id to the pane working directory so a stale
+/// Herdr id can still bind to the live Grok session in that directory.
+pub fn fetch_for_sessions_with_cwds(
+    session_ids: &[String],
+    cwds: &[(String, String)],
+) -> Result<ProviderSnapshot> {
     let path = auth_path().context("resolve Grok auth path")?;
     let credentials = read_credentials(&path).map_err(anyhow::Error::from)?;
     let agent = ureq::AgentBuilder::new()
@@ -60,7 +69,7 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
         .context("decode Grok billing response")?;
     let mut snapshot =
         parse_billing_response(&value, CacheStore::now_unix()).map_err(anyhow::Error::from)?;
-    enrich_local_sessions(&mut snapshot, session_ids);
+    enrich_local_sessions(&mut snapshot, session_ids, cwds);
     Ok(snapshot.with_account_id(Some(credentials.account_id())))
 }
 
@@ -228,17 +237,26 @@ pub fn parse_billing_response(
 /// newest session directories and never reads Herdr panes or chat history.
 /// `summary.json` `generated_title` (else `session_summary`) is the sidebar
 /// topic so a follow-up that has scrolled off the pane still has a name.
-fn enrich_local_sessions(snapshot: &mut ProviderSnapshot, session_ids: &[String]) {
+fn enrich_local_sessions(
+    snapshot: &mut ProviderSnapshot,
+    session_ids: &[String],
+    cwds: &[(String, String)],
+) {
     let Some(home) = grok_home().ok() else {
         return;
     };
-    enrich_local_sessions_at(snapshot, &home, session_ids);
+    enrich_local_sessions_at(snapshot, &home, session_ids, cwds);
 }
 
-fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, session_ids: &[String]) {
+fn enrich_local_sessions_at(
+    snapshot: &mut ProviderSnapshot,
+    home: &Path,
+    session_ids: &[String],
+    cwds: &[(String, String)],
+) {
     let sessions_dir = home.join("sessions");
     let active = read_active_sessions(home);
-    let lookup_ids = expand_session_ids_with_active_siblings(&active, session_ids);
+    let lookup_ids = expand_session_ids_with_active_siblings(&active, session_ids, cwds);
     let sessions = if lookup_ids.is_empty() {
         collect_recent_session_dirs(&sessions_dir)
     } else {
@@ -281,6 +299,7 @@ fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, sessio
         }
     }
     alias_missing_diagnostics_from_active_siblings(snapshot, &active, session_ids);
+    alias_unmatched_sessions_by_cwd(snapshot, &active, session_ids, cwds);
     if let Some((_, model, context)) = newest {
         if model.is_some() {
             snapshot.model = model;
@@ -345,6 +364,7 @@ fn collect_recent_session_dirs(directory: &Path) -> Vec<(u64, PathBuf)> {
 struct ActiveSessionRecord {
     session_id: String,
     pid: u64,
+    cwd: String,
 }
 
 fn read_active_sessions(home: &Path) -> Vec<ActiveSessionRecord> {
@@ -363,7 +383,16 @@ fn read_active_sessions(home: &Path) -> Vec<ActiveSessionRecord> {
                 .filter(|id| !id.is_empty())?
                 .to_string();
             let pid = entry.get("pid").and_then(Value::as_u64)?;
-            Some(ActiveSessionRecord { session_id, pid })
+            let cwd = entry
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(ActiveSessionRecord {
+                session_id,
+                pid,
+                cwd,
+            })
         })
         .collect()
 }
@@ -371,6 +400,7 @@ fn read_active_sessions(home: &Path) -> Vec<ActiveSessionRecord> {
 fn expand_session_ids_with_active_siblings(
     active: &[ActiveSessionRecord],
     session_ids: &[String],
+    cwds: &[(String, String)],
 ) -> Vec<String> {
     if session_ids.is_empty() {
         return Vec::new();
@@ -388,6 +418,26 @@ fn expand_session_ids_with_active_siblings(
             if !output.iter().any(|id| id == &sibling.session_id) {
                 output.push(sibling.session_id.clone());
             }
+        }
+    }
+    for (requested, cwd) in cwds {
+        if cwd.is_empty() {
+            continue;
+        }
+        if active
+            .iter()
+            .any(|session| session.session_id == *requested)
+        {
+            continue;
+        }
+        let unmatched = active
+            .iter()
+            .filter(|session| {
+                session.cwd == *cwd && !output.iter().any(|id| id == &session.session_id)
+            })
+            .collect::<Vec<_>>();
+        if unmatched.len() == 1 {
+            output.push(unmatched[0].session_id.clone());
         }
     }
     output
@@ -483,6 +533,61 @@ fn session_dir_mtime(session_dir: &Path) -> Option<u64> {
     CacheStore::file_mtime_unix(&session_dir.join("signals.json"))
         .or_else(|| CacheStore::file_mtime_unix(&session_dir.join("summary.json")))
         .or_else(|| CacheStore::file_mtime_unix(session_dir))
+}
+
+fn alias_unmatched_sessions_by_cwd(
+    snapshot: &mut ProviderSnapshot,
+    active: &[ActiveSessionRecord],
+    session_ids: &[String],
+    cwds: &[(String, String)],
+) {
+    let claimed_pids = active
+        .iter()
+        .filter(|session| session_ids.iter().any(|id| id == &session.session_id))
+        .map(|session| session.pid)
+        .collect::<BTreeSet<_>>();
+    let mut used_donors = BTreeSet::new();
+    for (requested, cwd) in cwds {
+        if cwd.is_empty() {
+            continue;
+        }
+        if snapshot.session_models.contains_key(requested)
+            && snapshot.session_summaries.contains_key(requested)
+        {
+            continue;
+        }
+        let unmatched = active
+            .iter()
+            .filter(|session| {
+                session.cwd == *cwd
+                    && !session_ids.iter().any(|id| id == &session.session_id)
+                    && !claimed_pids.contains(&session.pid)
+                    && !used_donors.contains(&session.session_id)
+            })
+            .collect::<Vec<_>>();
+        if unmatched.len() != 1 {
+            continue;
+        }
+        let donor = unmatched[0];
+        used_donors.insert(donor.session_id.clone());
+        if !snapshot.session_models.contains_key(requested) {
+            if let Some(model) = snapshot.session_models.get(&donor.session_id).cloned() {
+                snapshot.session_models.insert(requested.clone(), model);
+            }
+        }
+        if !snapshot.session_summaries.contains_key(requested) {
+            if let Some(summary) = snapshot.session_summaries.get(&donor.session_id).cloned() {
+                snapshot
+                    .session_summaries
+                    .insert(requested.clone(), summary);
+            }
+        }
+        if !snapshot.session_contexts.contains_key(requested) {
+            if let Some(context) = snapshot.session_contexts.get(&donor.session_id).cloned() {
+                snapshot.session_contexts.insert(requested.clone(), context);
+            }
+        }
+    }
 }
 
 struct LocalSessionObservation {
@@ -934,7 +1039,12 @@ mod tests {
         )
         .unwrap();
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["session-1".to_string()],
+            &[],
+        );
         let context = snapshot.context_for_session(Some("session-1")).unwrap();
         assert_eq!(context.used_percent, 35.0);
         let cache = context.cache.as_ref().unwrap();
@@ -958,7 +1068,12 @@ mod tests {
         )
         .unwrap();
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["session-1".to_string()],
+            &[],
+        );
         assert_eq!(snapshot.session_models["session-1"], "grok-4.5");
         assert!(snapshot.context_for_session(Some("session-1")).is_some());
         assert!(snapshot.context_for_session(Some("session-2")).is_none());
@@ -993,7 +1108,12 @@ mod tests {
         )
         .unwrap();
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["session-1".to_string()],
+            &[],
+        );
         assert_eq!(snapshot.session_models["session-1"], "grok-4.6");
         assert!(snapshot.context_for_session(Some("session-1")).is_none());
     }
@@ -1009,7 +1129,12 @@ mod tests {
         )
         .unwrap();
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["session-1".to_string()],
+            &[],
+        );
         assert_eq!(
             snapshot.session_summaries["session-1"],
             "Chat honesty: unsupported answers"
@@ -1027,7 +1152,12 @@ mod tests {
         )
         .unwrap();
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["session-1".to_string()],
+            &[],
+        );
         assert_eq!(snapshot.session_summaries["session-1"], "Review PR 91");
     }
 
@@ -1042,7 +1172,12 @@ mod tests {
         )
         .unwrap();
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["session-1".to_string()],
+            &[],
+        );
         assert!(!snapshot.session_summaries.contains_key("session-1"));
     }
 
@@ -1075,7 +1210,7 @@ mod tests {
         .unwrap();
 
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["stub".to_string()]);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["stub".to_string()], &[]);
         let context = snapshot.context_for_session(Some("stub")).unwrap();
         assert_eq!(context.used_percent, 79.0);
         let cache = context.cache.as_ref().unwrap();
@@ -1107,7 +1242,7 @@ mod tests {
         .unwrap();
 
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["stub".to_string()]);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["stub".to_string()], &[]);
         assert_eq!(
             snapshot.session_summaries["stub"],
             "Chat honesty: unsupported answers"
@@ -1138,8 +1273,108 @@ mod tests {
         .unwrap();
 
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["stub".to_string()]);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["stub".to_string()], &[]);
         assert!(snapshot.context_for_session(Some("stub")).is_none());
+        assert_eq!(snapshot.session_models["stub"], "grok-4.6");
+    }
+
+    #[test]
+    fn same_cwd_does_not_copy_diagnostics_across_two_live_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("sessions/cwd/first");
+        let second = directory.path().join("sessions/cwd/second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(
+            first.join("signals.json"),
+            r#"{"contextWindowUsage":12,"primaryModelId":"grok-4.6"}"#,
+        )
+        .unwrap();
+        fs::write(
+            first.join("summary.json"),
+            r#"{"generated_title":"first pane"}"#,
+        )
+        .unwrap();
+        fs::write(
+            second.join("signals.json"),
+            r#"{"contextWindowUsage":79,"primaryModelId":"grok-4.5"}"#,
+        )
+        .unwrap();
+        fs::write(
+            second.join("summary.json"),
+            r#"{"generated_title":"second pane"}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("active_sessions.json"),
+            r#"[{"session_id":"first","pid":1,"cwd":"/project"},{"session_id":"second","pid":2,"cwd":"/project"}]"#,
+        )
+        .unwrap();
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["first".to_string(), "second".to_string()],
+            &[
+                ("first".to_string(), "/project".to_string()),
+                ("second".to_string(), "/project".to_string()),
+            ],
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("first"))
+                .unwrap()
+                .used_percent,
+            12.0
+        );
+        assert_eq!(snapshot.session_summaries["first"], "first pane");
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("second"))
+                .unwrap()
+                .used_percent,
+            79.0
+        );
+        assert_eq!(snapshot.session_summaries["second"], "second pane");
+    }
+
+    #[test]
+    fn unmatched_herdr_id_binds_the_unique_cwd_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("sessions/cwd/live");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(
+            live.join("signals.json"),
+            r#"{"contextWindowUsage":41,"primaryModelId":"grok-4.6"}"#,
+        )
+        .unwrap();
+        fs::write(
+            live.join("summary.json"),
+            r#"{"generated_title":"cwd recovered"}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("active_sessions.json"),
+            r#"[{"session_id":"live","pid":9,"cwd":"/project"}]"#,
+        )
+        .unwrap();
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["stub".to_string()],
+            &[("stub".to_string(), "/project".to_string())],
+        );
+        assert_eq!(
+            snapshot
+                .context_for_session(Some("stub"))
+                .unwrap()
+                .used_percent,
+            41.0
+        );
+        assert_eq!(snapshot.session_summaries["stub"], "cwd recovered");
         assert_eq!(snapshot.session_models["stub"], "grok-4.6");
     }
 
@@ -1167,7 +1402,7 @@ mod tests {
         .unwrap();
 
         let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
-        enrich_local_sessions_at(&mut snapshot, directory.path(), &["bound".to_string()]);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["bound".to_string()], &[]);
         assert_eq!(
             snapshot
                 .context_for_session(Some("bound"))

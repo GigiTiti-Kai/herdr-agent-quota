@@ -205,8 +205,11 @@ with `Connect-Protocol-Version: 1`, the same call the CLI makes. Included is
 row — and only then `includedSpend / limit`. The three bars map onto at
 (`autoPercentUsed`, 5h), api (`apiPercentUsed`, 7d), and 30d (Included).
 `billingCycleEnd` is Unix milliseconds. Model is
-`cli-config.json` `model.displayName`, overridden per session by store.db meta
-`lastUsedModel` (never the encrypted blobs). Turn token counts are not in the
+`cli-config.json` `model.displayName` — the CLI footer after a model switch.
+store.db meta `lastUsedModel` overrides that only when it names a specific
+model; `default` / `auto` keep the catalog, because Cursor does not rewrite
+the store field when you change models in an existing session (never the
+encrypted blobs). Turn token counts are not in the
 jsonl. Cache and context come from the interactive CLI's `afterAgentResponse`,
 `stop`, and `preCompact` hooks: token counts map the same way the CLI
 statusLine `current_usage` does (`fresh = input - cache_read - cache_write`);
