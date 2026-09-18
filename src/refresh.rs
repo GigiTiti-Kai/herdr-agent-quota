@@ -1083,7 +1083,11 @@ fn refresh_provider(
         Provider::Devin => devin::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Muse => muse::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Cursor => cursor::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Claude | Provider::Agy => load_statusline_snapshot(cache, provider),
+        Provider::Claude => overlay_claude_windows(
+            crate::providers::claude_api::fetch(now),
+            load_statusline_snapshot(cache, provider),
+        ),
+        Provider::Agy => load_statusline_snapshot(cache, provider),
         // OpenCode Go is fetched for a resolved pane, never through the
         // provider list; see `fetch_opencode_go`.
         Provider::OpenCodeGo | Provider::Omp => Err(anyhow::anyhow!(
@@ -1283,6 +1287,28 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
         preserve_context: true,
         session_id,
     })
+}
+
+/// Claude quota is account-wide and pollable; context, cache, model and topic
+/// are per session and only the statusLine has them. Take the windows from the
+/// endpoint and keep everything else the session already reported.
+///
+/// Either source alone is still publishable: with no statusLine observation the
+/// endpoint gives quota without context, and with no endpoint we degrade to
+/// exactly the behaviour that shipped before this collector existed.
+fn overlay_claude_windows(
+    api: Result<ProviderSnapshot>,
+    statusline: Result<FetchedSnapshot>,
+) -> Result<FetchedSnapshot> {
+    match (api, statusline) {
+        (Ok(api), Ok(mut fetched)) => {
+            fetched.snapshot.windows = api.windows;
+            fetched.snapshot.session_quota_only = false;
+            Ok(fetched)
+        }
+        (Ok(api), Err(_)) => Ok(FetchedSnapshot::direct(api)),
+        (Err(_), statusline) => statusline,
+    }
 }
 
 fn publish_resolved(
@@ -2963,5 +2989,71 @@ mod tests {
             !has_stale_done_icon(&pane),
             "unfocused idle+done_token stays until focus"
         );
+    }
+
+    fn api_snapshot(used: f64) -> ProviderSnapshot {
+        ProviderSnapshot::new(
+            Provider::Claude,
+            vec![UsageWindow::new(WindowKind::Weekly, used, None).unwrap()],
+            10,
+        )
+    }
+
+    fn statusline_fetched(used: f64) -> FetchedSnapshot {
+        FetchedSnapshot {
+            snapshot: ProviderSnapshot::new(
+                Provider::Claude,
+                vec![UsageWindow::new(WindowKind::Weekly, used, None).unwrap()],
+                5,
+            )
+            .session_local()
+            .with_model(Some("Opus 5".to_string())),
+            preserve_context: true,
+            session_id: Some("session-1".to_string()),
+        }
+    }
+
+    #[test]
+    fn api_windows_replace_statusline_windows_and_keep_session_data() {
+        let merged =
+            overlay_claude_windows(Ok(api_snapshot(62.0)), Ok(statusline_fetched(10.0))).unwrap();
+        assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
+        // Session-scoped facts survive: only the windows come from the endpoint.
+        assert_eq!(merged.snapshot.model.as_deref(), Some("Opus 5"));
+        assert_eq!(merged.session_id.as_deref(), Some("session-1"));
+        assert!(merged.preserve_context);
+        // The reading is account-wide now, so panes may share it.
+        assert!(!merged.snapshot.session_quota_only);
+    }
+
+    #[test]
+    fn a_failed_api_call_falls_back_to_the_statusline_reading() {
+        let merged = overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 401")),
+            Ok(statusline_fetched(10.0)),
+        )
+        .unwrap();
+        assert_eq!(merged.snapshot.windows[0].used_percent, 10.0);
+        assert!(merged.snapshot.session_quota_only);
+    }
+
+    #[test]
+    fn the_api_alone_still_publishes_when_no_statusline_observation_exists() {
+        let merged = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Err(anyhow::anyhow!("no observation yet")),
+        )
+        .unwrap();
+        assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
+        assert!(merged.session_id.is_none());
+    }
+
+    #[test]
+    fn both_failing_reports_the_statusline_error() {
+        assert!(overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 401")),
+            Err(anyhow::anyhow!("no observation yet")),
+        )
+        .is_err());
     }
 }
