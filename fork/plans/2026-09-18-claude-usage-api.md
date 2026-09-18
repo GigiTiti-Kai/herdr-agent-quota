@@ -730,12 +730,22 @@ fn the_scoped_weekly_window_gets_its_own_token() {
         ],
         0,
     );
-    let tokens = MetadataTokens::from_snapshot(&snapshot, 0);
+    // `PercentStyle::Used`, because the default is `Remaining`: under the
+    // default these windows print 8% and 25%, and the assertions below cannot
+    // pass. Passing the style explicitly also proves it is threaded into the
+    // scoped token like every other window instead of hardcoded.
+    let tokens = MetadataTokens::from_snapshot_for_session(
+        &snapshot,
+        0,
+        None,
+        PercentStyle::Used,
+        SidebarShape::default(),
+    );
     // The row names its model instead of reading 7d a second time.
     assert!(tokens.quota_week_scoped.contains("Fab"));
-    assert!(tokens.quota_week_scoped.contains("92"));
+    assert!(tokens.quota_week_scoped.contains("92%"));
     // The account-wide weekly is untouched by the scoped one.
-    assert!(tokens.quota_week.contains("75"));
+    assert!(tokens.quota_week.contains("75%"));
 }
 
 #[test]
@@ -792,10 +802,24 @@ pub enum SidebarField {
     ];
 ```
 
-Add `Self::WeekScoped => "week-scoped",` to `SidebarField::name`. `FieldSet` is a
-bitset keyed off `SidebarField::ALL`, so the new field needs no further wiring;
-confirm `FieldSet::all()` still round-trips through `parse` by running its existing
-tests.
+Add `Self::WeekScoped => "week-scoped",` to `SidebarField::name`.
+
+`FieldSet` needs more than the new bit. `AGENTS.md:354` / `CLAUDE.md:354` require a
+new sidebar field to follow the Month migration's shape: a stored preference written
+by an older build spelled "everything on" as the field list that existed *then*, so
+without a marker that older list reads back as `all()` and silently turns the new
+field on. Follow the `NO_PROVIDER` / `NO_MONTH` precedent at `src/cli.rs:297,300`:
+
+- add a `NO_WEEK_SCOPED` marker constant,
+- add a `legacy_pre_scoped_full` pattern (every field except `WeekScoped`) to the
+  rescue in `parse`,
+- emit `NO_WEEK_SCOPED` in `to_string` whenever `WeekScoped` is off. Do not enumerate
+  which legacy spellings it applies to — each legacy pattern already excludes its own
+  field, so an unconditional check is equivalent and does not grow with the next field.
+
+Confirm `FieldSet::all()` still round-trips through `parse`, and add round-trip tests
+for the upgrade path (old list → new build), the downgrade path (new list → old build)
+and the collision between the three legacy spellings.
 
 In `src/presentation.rs`, add the token fields beside `quota_week` at line 140:
 
