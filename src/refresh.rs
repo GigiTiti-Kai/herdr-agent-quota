@@ -1313,7 +1313,16 @@ fn overlay_claude_windows(
             fetched.snapshot.windows = api.windows;
             Ok(fetched)
         }
-        (Ok(api), Err(_)) => Ok(FetchedSnapshot::direct(api)),
+        // No statusLine observation means no session to attach the windows to,
+        // so this publishes nothing a pane can render. It must still not be a
+        // `direct` save: that is a raw overwrite of the Claude cache file, and
+        // it would drop every other session's context, model, prompt-cache and
+        // window diagnostics.
+        (Ok(api), Err(_)) => Ok(FetchedSnapshot {
+            snapshot: api.session_local(),
+            preserve_context: true,
+            session_id: None,
+        }),
         (Err(_), statusline) => statusline,
     }
 }
@@ -3095,8 +3104,25 @@ mod tests {
         assert!(merged.snapshot.session_quota_only);
     }
 
+    /// The endpoint alone names no session, so `windows_for_session` returns
+    /// nothing and no pane can render this reading. What it must not do is
+    /// take the cache down with it: a `direct` snapshot is written with a raw
+    /// `cache.save`, which replaces every other session's context, model,
+    /// prompt-cache and window diagnostics with an empty map.
     #[test]
-    fn the_api_alone_still_publishes_when_no_statusline_observation_exists() {
+    fn the_api_alone_does_not_wipe_the_cached_session_diagnostics() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let seeded = statusline_fetched(10.0);
+        cache
+            .save_preserving_context_for_session(
+                seeded
+                    .snapshot
+                    .with_context(Some(crate::model::ContextUsage::new(42.0).unwrap())),
+                seeded.session_id.as_deref(),
+            )
+            .unwrap();
+
         let merged = overlay_claude_windows(
             Ok(api_snapshot(62.0)),
             Err(anyhow::anyhow!("no observation yet")),
@@ -3104,6 +3130,17 @@ mod tests {
         .unwrap();
         assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
         assert!(merged.session_id.is_none());
+        // `refresh_provider` only preserves diagnostics for a preserving
+        // fetch; Claude is not in its fallback list.
+        assert!(merged.preserve_context);
+        cache
+            .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.session_contexts.contains_key("session-1"));
+        assert!(reloaded.session_models.contains_key("session-1"));
+        assert!(reloaded.session_windows.contains_key("session-1"));
     }
 
     #[test]
