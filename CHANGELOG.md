@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Account quota windows (`5h` / `7d` / `30d`) appear on one pane per
+  login-scoped vendor (Grok, Codex, Devin, OpenCode, Cursor). Extra tabs of
+  that vendor are hidden from the Agent sidebar using `$quota_headroom` as
+  the visibility signal, so a narrow sidebar that omits `$quota_provider`
+  cannot hide the representative pane. The focused pane of that vendor wins,
+  then a working pane, then the first pane id. OpenCode and OpenCode Go are
+  the same group. Claude and Agy stay per-pane.
+
 ## [1.6.0] - 2026-09-17
 
 ### Changed
