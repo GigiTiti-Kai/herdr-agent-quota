@@ -986,6 +986,16 @@ fn merge_session_windows(
     session_id: Option<&str>,
     quota_scope: Option<&str>,
 ) {
+    // The account's allowance outlives any one observation of it. A statusLine
+    // save reports a session and carries no endpoint reading, so without this
+    // every turn would drop the account windows until the next poll.
+    if snapshot.account_windows.is_empty() {
+        if let Some(previous) = previous {
+            snapshot
+                .account_windows
+                .clone_from(&previous.account_windows);
+        }
+    }
     if snapshot.session_quota_only {
         let previous = previous.filter(|previous| previous.session_quota_only);
         if let Some(previous) = previous {

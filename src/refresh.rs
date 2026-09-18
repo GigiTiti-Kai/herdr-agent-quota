@@ -1310,17 +1310,21 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
 /// per session and only the statusLine has them. Take the windows from the
 /// endpoint and keep everything else the session already reported.
 ///
-/// The merged reading stays session-local, exactly like the statusLine one it
-/// replaces: Claude has no account gate, and a snapshot that claims to be
-/// account-wide without an `account_id` is rejected by
-/// [`ProviderSnapshot::usable_for_account`]. The endpoint therefore refreshes
-/// the session the newest statusLine observation names, which is the same
-/// scope Codex and Grok already publish at.
+/// The merged reading stays `session_quota_only`, exactly like the statusLine
+/// one it replaces: Claude has no account gate, and a snapshot that claims to
+/// be account-wide without an `account_id` is rejected by
+/// [`ProviderSnapshot::usable_for_account`]. What the endpoint does add is
+/// `account_wide_windows`, which says these particular figures are the
+/// subscription's and not one conversation's. Every Claude pane then renders
+/// them, instead of each pane showing whatever its own last turn happened to
+/// observe — or nothing at all, which is what a pane that has never taken a
+/// turn had to show.
 ///
 /// With no endpoint we degrade to exactly the behaviour that shipped before
-/// this collector existed. With no statusLine observation there is no session
-/// to attach the windows to, so the fetch only keeps the cache warm until the
-/// hook first runs.
+/// this collector existed: the flag stays false and each session falls back to
+/// its own last statusLine reading. With no statusLine observation there is no
+/// session to attach context, cache or model to, but the windows still stand on
+/// their own, so a pane can render quota before the hook has ever run.
 ///
 /// `carried` is what the cache last held for the session the statusLine names.
 /// When the endpoint fails (a 429 is the common case) the statusLine reading
@@ -1343,16 +1347,20 @@ fn overlay_claude_windows(
 ) -> Result<FetchedSnapshot> {
     match (api, statusline) {
         (Ok(api), Ok(mut fetched)) => {
-            fetched.snapshot.windows = api.windows;
+            fetched.snapshot.windows = api.windows.clone();
+            fetched.snapshot.account_windows = api.windows;
             Ok(fetched)
         }
-        // No statusLine observation means no session to attach the windows to,
-        // so this publishes nothing a pane can render. It must still not be a
-        // `direct` save: that is a raw overwrite of the Claude cache file, and
-        // it would drop every other session's context, model, prompt-cache and
-        // window diagnostics.
+        // No statusLine observation means no session to attach context, cache,
+        // model or topic to, but the windows are the account's and every pane
+        // can render them. It must still not be a `direct` save: that is a raw
+        // overwrite of the Claude cache file, and it would drop every other
+        // session's context, model, prompt-cache and window diagnostics.
         (Ok(api), Err(_)) => Ok(FetchedSnapshot {
-            snapshot: api.session_local(),
+            snapshot: {
+                let windows = api.windows.clone();
+                api.session_local().with_account_windows(windows)
+            },
             preserve_context: true,
             session_id: None,
         }),
@@ -3226,11 +3234,12 @@ mod tests {
         }
     }
 
-    /// The endpoint alone names no session, so `windows_for_session` returns
-    /// nothing and no pane can render this reading. What it must not do is
-    /// take the cache down with it: a `direct` snapshot is written with a raw
-    /// `cache.save`, which replaces every other session's context, model,
-    /// prompt-cache and window diagnostics with an empty map.
+    /// The endpoint alone names no session, so it carries no context, model or
+    /// prompt-cache — only the account's windows, which every pane renders
+    /// through `account_wide_windows`. What it must not do is take the cache
+    /// down with it: a `direct` snapshot is written with a raw `cache.save`,
+    /// which replaces every other session's context, model, prompt-cache and
+    /// window diagnostics with an empty map.
     #[test]
     fn the_api_alone_does_not_wipe_the_cached_session_diagnostics() {
         let dir = tempdir().unwrap();
@@ -3262,6 +3271,9 @@ mod tests {
         // copies the maps too — but the next statusLine tick then filters it
         // out as `previous` and every session's windows vanish.
         assert!(merged.snapshot.session_quota_only);
+        // Session-local storage, account-wide meaning: the pane that seeded the
+        // cache renders 62.0, not the 10.0 its own turn last reported.
+        assert_eq!(merged.snapshot.account_windows[0].used_percent, 62.0);
         cache
             .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
             .unwrap();
@@ -3270,6 +3282,76 @@ mod tests {
         assert!(reloaded.session_contexts.contains_key("session-1"));
         assert!(reloaded.session_models.contains_key("session-1"));
         assert!(reloaded.session_windows.contains_key("session-1"));
+        assert_eq!(
+            reloaded.windows_for_session(Some("session-1"))[0].used_percent,
+            62.0
+        );
+        assert_eq!(
+            reloaded.windows_for_session(Some("a-pane-that-never-ran"))[0].used_percent,
+            62.0
+        );
+    }
+
+    /// The endpoint answered, so the merged snapshot speaks for the whole
+    /// subscription — including panes whose statusLine reading is hours old.
+    /// When it fails, the flag stays off and each pane keeps its own reading.
+    #[test]
+    fn only_a_successful_endpoint_publishes_account_windows() {
+        let merged = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            merged.snapshot.windows_for_session(Some("another-session"))[0].used_percent,
+            62.0
+        );
+
+        let degraded = overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 429")),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        assert!(degraded.snapshot.account_windows.is_empty());
+        assert!(degraded
+            .snapshot
+            .windows_for_session(Some("another-session"))
+            .is_empty());
+    }
+
+    /// The statusLine hook saves after every turn and carries no endpoint
+    /// reading. Measured against the live cache before this was handled: a poll
+    /// wrote the account windows and the next turn dropped them again.
+    #[test]
+    fn a_statusline_save_keeps_the_account_windows() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let polled = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        let turn = statusline_fetched(11.0);
+        assert!(turn.snapshot.account_windows.is_empty());
+        cache
+            .save_preserving_context_for_session(turn.snapshot, turn.session_id.as_deref())
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert_eq!(
+            reloaded.windows_for_session(Some("a-pane-that-never-ran"))[0].used_percent,
+            62.0
+        );
     }
 
     #[test]

@@ -590,6 +590,25 @@ pub struct ProviderSnapshot {
     /// profile windows from an earlier plugin version.
     #[serde(default)]
     pub session_quota_only: bool,
+    /// The subscription's own allowance, read from a credential-scoped account
+    /// endpoint rather than observed by one conversation. Every session of this
+    /// provider is under it, so every pane renders these figures.
+    ///
+    /// Claude's statusLine reports the account's 5h and 7d through whichever
+    /// session happens to be taking a turn, and its schema carries no
+    /// model-scoped weekly window at all. Keeping those readings session-local
+    /// therefore shows each pane whatever that pane last observed: a pane that
+    /// has never taken a turn shows nothing, an idle one shows a percentage
+    /// from hours ago, and the scoped row appears only on the pane that
+    /// triggered the last successful fetch.
+    ///
+    /// This is a separate field rather than a flag on `windows` because the
+    /// statusLine hook saves a snapshot of its own after every turn; it would
+    /// clear a flag, but it has no endpoint reading to overwrite this with.
+    /// Empty on old caches and until the endpoint first answers, which keeps
+    /// the session-local reading as the fallback.
+    #[serde(default)]
+    pub account_windows: Vec<UsageWindow>,
     pub provider: Provider,
     pub source: String,
     pub fetched_at_unix: u64,
@@ -641,6 +660,7 @@ impl ProviderSnapshot {
     pub fn new(provider: Provider, windows: Vec<UsageWindow>, fetched_at_unix: u64) -> Self {
         Self {
             session_quota_only: false,
+            account_windows: Vec::new(),
             provider,
             source: provider.source().to_string(),
             fetched_at_unix,
@@ -664,6 +684,12 @@ impl ProviderSnapshot {
 
     pub fn session_local(mut self) -> Self {
         self.session_quota_only = true;
+        self
+    }
+
+    /// Record the subscription's own allowance. See [`Self::account_windows`].
+    pub fn with_account_windows(mut self, windows: Vec<UsageWindow>) -> Self {
+        self.account_windows = windows;
         self
     }
 
@@ -775,15 +801,20 @@ impl ProviderSnapshot {
     /// active conversation's model selects the gemini or 3p pool.
     ///
     /// Lookup order:
-    /// 1. Agy with no Herdr session id → latest top-level statusLine windows.
-    /// 2. Session-local snapshot → exact session windows; Agy may bridge an
+    /// 1. An endpoint reading in `account_windows` → that, for every session.
+    ///    The account has one allowance, so no session has its own to report.
+    /// 2. Agy with no Herdr session id → latest top-level statusLine windows.
+    /// 3. Session-local snapshot → exact session windows; Agy may bridge an
     ///    unmatched subagent id only when exactly one conversation is stored.
-    /// 3. Session has a legacy Claude profile scope → canonical scope windows.
-    /// 4. Session has legacy `session_windows` → those.
-    /// 5. Every keyed map is empty → top-level windows (Grok/Codex/Devin and a
+    /// 4. Session has a legacy Claude profile scope → canonical scope windows.
+    /// 5. Session has legacy `session_windows` → those.
+    /// 6. Every keyed map is empty → top-level windows (Grok/Codex/Devin and a
     ///    StatusLine cache written before session maps existed).
-    /// 6. Keyed maps exist but this session is unknown → empty.
+    /// 7. Keyed maps exist but this session is unknown → empty.
     pub fn windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
+        if !self.account_windows.is_empty() {
+            return &self.account_windows;
+        }
         if self.provider == Provider::Agy && session_id.is_none() {
             return &self.windows;
         }
@@ -1996,6 +2027,95 @@ mod tests {
                 .unwrap()
                 .used_percent,
             82.0
+        );
+        assert!(snapshot.windows_for_session(Some("unknown")).is_empty());
+    }
+
+    /// The subscription has one allowance, so the endpoint's reading is every
+    /// pane's reading: the one that took the last turn, one that has never
+    /// taken a turn, and a lookup with no session at all.
+    #[test]
+    fn an_account_endpoint_reading_reaches_every_claude_pane() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, Vec::new(), 1)
+            .session_local()
+            .with_account_windows(vec![
+                quota_window(WindowKind::FiveHour, 3.0, 16_000),
+                quota_window(WindowKind::Weekly, 69.0, 16_000),
+                quota_window(WindowKind::WeeklyScoped, 98.0, 16_000),
+            ]);
+        // What the statusLine left behind: a reading from hours ago, and no
+        // scoped window, because its schema has no member for one.
+        snapshot.session_windows.insert(
+            "took-a-turn".to_string(),
+            vec![
+                quota_window(WindowKind::FiveHour, 84.0, 16_000),
+                quota_window(WindowKind::Weekly, 24.0, 16_000),
+            ],
+        );
+
+        for session in [Some("took-a-turn"), Some("never-ran"), None] {
+            assert_eq!(
+                snapshot
+                    .windows_for_session(session)
+                    .iter()
+                    .map(|window| (window.kind, window.used_percent))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (WindowKind::FiveHour, 3.0),
+                    (WindowKind::Weekly, 69.0),
+                    (WindowKind::WeeklyScoped, 98.0),
+                ],
+                "{session:?}"
+            );
+        }
+    }
+
+    /// Until the endpoint answers there is nothing account-wide to show, and a
+    /// pane that has its own observation must keep rendering it.
+    #[test]
+    fn no_account_reading_falls_back_to_the_session() {
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, Vec::new(), 1).session_local();
+        snapshot.session_windows.insert(
+            "own".to_string(),
+            vec![quota_window(WindowKind::FiveHour, 40.0, 16_000)],
+        );
+
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some("own"))
+                .first()
+                .unwrap()
+                .used_percent,
+            40.0
+        );
+    }
+
+    /// A cache written before this field existed holds no endpoint reading, so
+    /// it keeps the session-local lookup.
+    #[test]
+    fn legacy_snapshots_carry_no_account_windows() {
+        let snapshot: ProviderSnapshot = serde_json::from_str(
+            r#"{
+                "session_quota_only":true,
+                "provider":"claude",
+                "source":"claude-statusline",
+                "fetched_at_unix":1,
+                "windows":[{"kind":"five_hour","used_percent":90.0,"remaining_percent":10.0}],
+                "session_windows":{
+                    "old":[{"kind":"five_hour","used_percent":20.0,"remaining_percent":80.0}]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(snapshot.account_windows.is_empty());
+        assert_eq!(
+            snapshot
+                .windows_for_session(Some("old"))
+                .first()
+                .unwrap()
+                .used_percent,
+            20.0
         );
         assert!(snapshot.windows_for_session(Some("unknown")).is_empty());
     }
