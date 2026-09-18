@@ -370,57 +370,25 @@ impl FieldSet {
             .collect::<Vec<_>>()
             .join(",");
         let mut markers = Vec::new();
-        // Each check below is a set of fields whose absence, together, is
-        // otherwise indistinguishable from a legacy "everything on" list from
-        // before that field existed. Adding week-scoped introduced a new such
-        // collision (an all-but-week-scoped selection now reads exactly like
-        // a pre-week-scoped full list), which also reopened the two older
-        // collisions in the combinations that also drop week-scoped — those
-        // are the disjuncts naming `WeekScoped` below.
-        if !self.contains(SidebarField::Provider)
-            && (self == Self::all().toggled(SidebarField::Provider)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Provider)
-                        .toggled(SidebarField::Month)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Provider)
-                        .toggled(SidebarField::Month)
-                        .toggled(SidebarField::WeekScoped))
-        {
+        // `parse` only ever consults a marker to skip one legacy-list rescue,
+        // and each rescued pattern is frozen without the field its own marker
+        // names (`legacy_pre_provider_full` has no Provider, `legacy_full` no
+        // Month, `legacy_pre_scoped_full` no WeekScoped). So a selection can
+        // only ever match a rescued pattern while that field is off, which
+        // means writing the marker whenever the field is off is always either
+        // the exact suppression `parse` needs, or a marker `parse` reads back
+        // without ever consulting it — never a behaviour change either way,
+        // just a token nothing reads in the cases that did not need it. That
+        // also makes the marker inert to any older or newer build that meets
+        // it: an unrecognised marker token is skipped like any other unknown
+        // field name.
+        if !self.contains(SidebarField::Provider) {
             markers.push(Self::NO_PROVIDER);
         }
-        if !self.contains(SidebarField::Month)
-            && (self == Self::all().toggled(SidebarField::Month)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Provider)
-                        .toggled(SidebarField::Month)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Month)
-                        .toggled(SidebarField::WeekScoped)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Provider)
-                        .toggled(SidebarField::Month)
-                        .toggled(SidebarField::WeekScoped))
-        {
+        if !self.contains(SidebarField::Month) {
             markers.push(Self::NO_MONTH);
         }
-        if !self.contains(SidebarField::WeekScoped)
-            && (self == Self::all().toggled(SidebarField::WeekScoped)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Month)
-                        .toggled(SidebarField::WeekScoped)
-                || self
-                    == Self::all()
-                        .toggled(SidebarField::Provider)
-                        .toggled(SidebarField::Month)
-                        .toggled(SidebarField::WeekScoped))
-        {
+        if !self.contains(SidebarField::WeekScoped) {
             markers.push(Self::NO_WEEK_SCOPED);
         }
         if markers.is_empty() {
@@ -1473,7 +1441,10 @@ mod tests {
         );
 
         // Dropping week-scoped alongside the provider only (month stays on)
-        // never collides with a legacy list, so it needs no marker at all.
+        // never collides with a legacy list, but the round trip still has to
+        // hold: `as_list` writes both markers unconditionally, and `parse`
+        // must recover the exact same selection even though neither marker
+        // was actually needed to avoid a legacy match here.
         let without_provider_or_scoped = FieldSet::all()
             .toggled(SidebarField::Provider)
             .toggled(SidebarField::WeekScoped);
@@ -1481,8 +1452,5 @@ mod tests {
             FieldSet::parse(&without_provider_or_scoped.as_list()),
             Some(without_provider_or_scoped)
         );
-        assert!(!without_provider_or_scoped
-            .as_list()
-            .contains("no-week-scoped"));
     }
 }
