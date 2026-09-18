@@ -393,9 +393,10 @@ fn provider_model_label(provider: &str, model: &str, content_width: usize) -> St
     format!("{provider}/{model}")
 }
 
-/// Every window the collector reported, including a monthly one. The sidebar
-/// publishes 5h, 7d, and 30d as separate tokens; a 30d value must never be
-/// folded into a weekly one.
+/// Every window the collector reported, including a monthly one and a
+/// model-scoped weekly one. The sidebar publishes 5h, 7d, the scoped 7d and
+/// 30d as separate tokens; neither a scoped nor a 30d value may ever be folded
+/// into the account-wide weekly one.
 pub fn dashboard_summary(
     snapshot: &ProviderSnapshot,
     now_unix: u64,
@@ -407,6 +408,7 @@ pub fn dashboard_summary(
         &[
             WindowKind::FiveHour,
             WindowKind::Weekly,
+            WindowKind::WeeklyScoped,
             WindowKind::Monthly,
         ],
         now_unix,
@@ -1125,6 +1127,31 @@ mod tests {
         );
         assert!(!summary.contains('\u{25b0}'));
         assert!(!summary.contains('\u{25b1}'));
+    }
+
+    /// `dashboard_summary` lists its window kinds explicitly, so a new kind is
+    /// silently omitted rather than failing to compile. The scoped row is on
+    /// the sidebar; the dashboard claims to be the surface with room for a
+    /// collector's *full* window set, so it has to carry it too.
+    #[test]
+    fn the_dashboard_lists_the_scoped_weekly_window_between_7d_and_30d() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 58.0, 14_820),
+                window(WindowKind::Weekly, 27.0, 183_600),
+                window(WindowKind::WeeklyScoped, 92.0, 183_600).with_source_window("Fab", None),
+                window(WindowKind::Monthly, 10.0, 1_500_000),
+            ],
+            0,
+        );
+        let summary = dashboard_summary(&snapshot, 0, PercentStyle::default());
+        assert_eq!(
+            summary,
+            "5h 42% left reset 4h07m \u{b7} 7d 73% left reset 2d3h \u{b7} \
+             Fab 8% left reset 2d3h \u{b7} 30d 90% left reset 17d8h",
+            "{summary}"
+        );
     }
 
     #[test]
