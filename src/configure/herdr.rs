@@ -1051,31 +1051,15 @@ fn append_identity_row(rows: &mut Array) {
     )));
 }
 
-/// Brand icon in three mutually exclusive colours, then the name.
+/// Brand icon, then the name.
 ///
-/// Herdr collapses empty tokens, so only the published status twin shows. No
-/// `state_icon`: two circles on one row is what this replaces. Focus changes
-/// acknowledge only the old and new panes; unrelated green icons stay green.
+/// Colour lives on `$quota_icon` via `rules` so the glyph stays the first
+/// identity token. A later `$quota_icon_done` twin on a Space-head row
+/// hang-indents one cell to the right. No `state_icon`: two circles on one
+/// row is what this replaces.
 fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
     let mut row = Array::new();
-    row.push(styled_token(
-        "$quota_icon",
-        Some(IDLE_ICON_COLOR),
-        Some(false),
-        Some(false),
-    ));
-    row.push(styled_token(
-        "$quota_icon_working",
-        Some(WORKING_ICON_COLOR),
-        Some(false),
-        Some(false),
-    ));
-    row.push(styled_token(
-        "$quota_icon_done",
-        Some(DONE_ICON_COLOR),
-        Some(false),
-        Some(false),
-    ));
+    row.push(identity_icon_token());
     row.push(styled_token(
         name,
         Some(IDLE_ICON_COLOR),
@@ -1083,6 +1067,29 @@ fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
         Some(false),
     ));
     row
+}
+
+fn identity_icon_token() -> Value {
+    let mut value = InlineTable::new();
+    value.insert("token", Value::from("$quota_icon"));
+    value.insert("fg", Value::from(IDLE_ICON_COLOR));
+    value.insert("bold", Value::from(false));
+    value.insert("dim", Value::from(false));
+    let mut rules = Array::new();
+    rules.push(contains_fg_rule(crate::icons::DONE_TAG, DONE_ICON_COLOR));
+    rules.push(contains_fg_rule(
+        crate::icons::WORKING_TAG,
+        WORKING_ICON_COLOR,
+    ));
+    value.insert("rules", Value::Array(rules));
+    Value::InlineTable(value)
+}
+
+fn contains_fg_rule(contains: &str, fg: &str) -> Value {
+    let mut rule = InlineTable::new();
+    rule.insert("contains", Value::from(contains));
+    rule.insert("fg", Value::from(fg));
+    Value::InlineTable(rule)
 }
 
 fn append_packed_quota_rows(rows: &mut Array) {
@@ -1638,12 +1645,18 @@ mod tests {
                     "native agent row duplicates provider/model:\n{updated}"
                 );
                 assert!(rows.iter().any(|row| row_contains_token(row, "$quota_icon")));
-                assert!(rows
-                    .iter()
-                    .any(|row| row_contains_token(row, "$quota_icon_working")));
-                assert!(rows
-                    .iter()
-                    .any(|row| row_contains_token(row, "$quota_icon_done")));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row_contains_token(row, "$quota_icon_working")),
+                    "working colour is a rule on $quota_icon, not a later twin"
+                );
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row_contains_token(row, "$quota_icon_done")),
+                    "done colour is a rule on $quota_icon, not a later twin"
+                );
                 assert!(
                     !rows.iter().any(|row| {
                         row.as_array().is_some_and(|items| {
@@ -1724,8 +1737,14 @@ rows = [["state_icon", "agent"]]
         assert!(updated.contains("$quota_week"));
         assert!(updated.contains("$quota_group"));
         assert!(updated.contains("$quota_icon"));
-        assert!(updated.contains("$quota_icon_working"));
-        assert!(updated.contains("$quota_icon_done"));
+        assert!(
+            !updated.contains("$quota_icon_working"),
+            "working colour is a rule, not a twin token:\n{updated}"
+        );
+        assert!(
+            !updated.contains("$quota_icon_done"),
+            "done colour is a rule, not a twin token:\n{updated}"
+        );
         assert!(!updated.contains("state_icon") || updated.contains("machine")); // stock may remain elsewhere only if preserve
         assert!(!updated.contains("$quota_pad"));
         assert!(!updated.contains("\"workspace\""));
@@ -2103,22 +2122,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "ba3ae29e35c075c5476c648cc4dff8a80bf56d0b508742cc34cbdeb797ab091d",
-                    "dfd7dea3cb5746126c863f39c61cfd65d568c2651a0c5877a72bd4748eed4da0",
+                    "28b19eb28563a128dd3bb392c1e354f9de642ca5ce65a3f87108ccd74e000725",
+                    "1a4ef2743304ebf7dd9b50c874b6061494e1b31d74e440e65ef9a37b3bbd9525",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "473c8f0f1437e9434123c879b62cd8065c5ed24ca0e8f45c934346c8c8183cfa",
-                    "e7d792e5ab0cadb8cc15c38a0a0c83870683080f7e9746a4709fa725798d1adc",
+                    "2ff68065b66bc095be0f47ed4b9d555bb94f2862d4b78490db39e17510a3e3a1",
+                    "2a4b45e75e4731e21aaa0df9dd64c4beca94a5d4e1d9cfa2b4954a790cfb7f1b",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "473c8f0f1437e9434123c879b62cd8065c5ed24ca0e8f45c934346c8c8183cfa",
-                    "e7d792e5ab0cadb8cc15c38a0a0c83870683080f7e9746a4709fa725798d1adc",
+                    "2ff68065b66bc095be0f47ed4b9d555bb94f2862d4b78490db39e17510a3e3a1",
+                    "2a4b45e75e4731e21aaa0df9dd64c4beca94a5d4e1d9cfa2b4954a790cfb7f1b",
                 ],
             ),
         ] {
@@ -2294,11 +2313,7 @@ rows = [["state_icon", "agent"]]
         );
         assert_eq!(
             configured_token_name(identity.get(1).unwrap()),
-            Some("$quota_icon_working")
-        );
-        assert_eq!(
-            configured_token_name(identity.get(2).unwrap()),
-            Some("$quota_icon_done")
+            Some("$quota_provider_model")
         );
         assert!(identity
             .iter()
@@ -2321,23 +2336,25 @@ rows = [["state_icon", "agent"]]
             idle.get("fg").and_then(Value::as_str),
             Some(IDLE_ICON_COLOR)
         );
-        let working = identity
-            .iter()
-            .find(|item| configured_token_name(item) == Some("$quota_icon_working"))
-            .and_then(Value::as_inline_table)
-            .unwrap();
+        let rules = idle.get("rules").and_then(Value::as_array).unwrap();
+        assert_eq!(rules.len(), 2);
+        let done = rules.get(0).unwrap().as_inline_table().unwrap();
         assert_eq!(
-            working.get("fg").and_then(Value::as_str),
-            Some(WORKING_ICON_COLOR)
+            done.get("contains").and_then(Value::as_str),
+            Some(crate::icons::DONE_TAG)
         );
-        let done = identity
-            .iter()
-            .find(|item| configured_token_name(item) == Some("$quota_icon_done"))
-            .and_then(Value::as_inline_table)
-            .unwrap();
         assert_eq!(
             done.get("fg").and_then(Value::as_str),
             Some(DONE_ICON_COLOR)
+        );
+        let working = rules.get(1).unwrap().as_inline_table().unwrap();
+        assert_eq!(
+            working.get("contains").and_then(Value::as_str),
+            Some(crate::icons::WORKING_TAG)
+        );
+        assert_eq!(
+            working.get("fg").and_then(Value::as_str),
+            Some(WORKING_ICON_COLOR)
         );
     }
 
@@ -3089,8 +3106,14 @@ mod field_tests {
         // it is how a broken pane is reported.
         assert!(bare.contains("$quota_group"), "{bare}");
         assert!(bare.contains("$quota_icon"), "{bare}");
-        assert!(bare.contains("$quota_icon_working"), "{bare}");
-        assert!(bare.contains("$quota_icon_done"), "{bare}");
+        assert!(
+            !bare.contains("$quota_icon_working"),
+            "working colour is a rule on $quota_icon:\n{bare}"
+        );
+        assert!(
+            !bare.contains("$quota_icon_done"),
+            "done colour is a rule on $quota_icon:\n{bare}"
+        );
         assert!(!bare.contains("state_icon"), "{bare}");
         assert!(!bare.contains("$quota_pad"), "{bare}");
         assert!(bare.contains("$quota_error"), "{bare}");

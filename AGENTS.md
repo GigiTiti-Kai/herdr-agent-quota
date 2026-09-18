@@ -136,7 +136,9 @@ than a wrong number.
 - Cursor stamps `sha256("cursor\0" || access token)`. Included is
   `planUsage.totalPercentUsed` when present — the CLI usage panel's Included
   row — and only then `includedSpend / limit`. The IDE `state.vscdb` mtime is
-  not a credential gate.
+  not a credential gate. On macOS, `cursor-agent login` stores the token in
+  Keychain, not `auth.json`; do not fall back to the IDE token while the CLI
+  still has `cli-config.json` `authInfo`.
 
 ## Devin's per-session model is local SQLite, not the quota API
 
@@ -191,13 +193,19 @@ pane: the generated session title (`meta.json` `title`, else `store.db`
 `<user_query>` in the session jsonl.
 
 Credentials, in order: `accessToken` in the CLI auth file (`$CURSOR_AUTH_FILE`,
-else `~/.cursor/auth.json` on macOS, else `$XDG_CONFIG_HOME/cursor/auth.json`),
+else `~/.cursor/auth.json` on macOS, else `$XDG_CONFIG_HOME/cursor/auth.json`);
+on macOS, Keychain item `cursor-access-token` / `cursor-user` (what
+`cursor-agent login` writes when `AGENT_CLI_CREDENTIAL_STORE` is default);
 then `cursorAuth/accessToken` in the desktop `state.vscdb` (`$CURSOR_STATE_DB`
-or the platform Cursor config path). Open that SQLite file read-only and
+or the platform Cursor config path) only when the CLI has no login of its
+own (`cli-config.json` has no `authInfo`). Open that SQLite file read-only and
 select only that one key. Never copy it, never use its mtime as a gate, never
-read `refreshToken`, never open Keychain, never send a `WorkosCursorSessionToken`
-cookie. The collector does not write, refresh, or exchange tokens; a 401
-re-reads the current files once.
+read `refreshToken`, never send a `WorkosCursorSessionToken` cookie. Background
+processes never prompt for Keychain: without a recorded approval marker the
+keychain branch is skipped, and the user approves once via
+`refresh --provider cursor --keychain-approve` (click **Always Allow**, not
+Allow). The collector does not write, refresh, or exchange tokens; a 401
+re-reads the current files and Keychain once.
 
 Quota is `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage`
 with `Connect-Protocol-Version: 1`, the same call the CLI makes. Included is
@@ -250,8 +258,10 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    `workspace_order` ascending, then `quota_headroom` ascending — never a
    flat headroom list that scatters one project's panes across the panel.
    `$quota_group` names the Space on the tightest pane in that workspace;
-   `$quota_icon` / `_working` / `_done` is the vendor mark on every identity
-   row (bundled icon font; Muse uses a text glyph). Colour replaces Herdr's `state_icon`
+   `$quota_icon` is the vendor mark on every identity row (bundled icon font;
+   Muse uses a text glyph). Working/done colour is an invisible suffix matched
+   by sidebar `rules`, not a later twin token — a later `$quota_icon_done`
+   hang-indents one cell under the Space name. Colour replaces Herdr's `state_icon`
    ring: yellow while working, teal for an unseen completion, white after
    focusing that pane or moving focus away from it. Do not trust CLI `agent_status` for the teal
    step — same-tab siblings finish as server `idle` while the TUI ring is

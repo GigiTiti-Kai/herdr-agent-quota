@@ -92,7 +92,7 @@ Installer options are also available through `./install.sh --help`.
 | Grok | CLI billing endpoint; 7d or 30d | Current CLI credentials |
 | Devin | CLI usage endpoint; 1d and 7d | Current CLI credentials |
 | Muse Code | CLI subscription endpoint; 5h and 7d | Current CLI account login; session via Muse's session lock (Linux) |
-| Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the desktop `state.vscdb` access token; model from local session files; topic from the generated session title; `cx` from `store.db` `token_details` (the CLI footer percent); cache from CLI hooks |
+| Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the macOS Keychain login from `cursor-agent login`, else the desktop `state.vscdb` access token; model from local session files; topic from the generated session title; `cx` from `store.db` `token_details` (the CLI footer percent); cache from CLI hooks |
 | Claude Code | StatusLine; 5h and 7d | Exact session observation |
 | Agy / Antigravity | StatusLine; 5h, 7d, and api (third-party pool on Gemini) | Exact session and identifiable model pool |
 | OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
@@ -135,7 +135,7 @@ turn failures into zero usage.
 | OMP quota is missing | Check `omp usage --json --redact --provider <id>` |
 | Devin quota is missing | Check the CLI login and `DEVIN_CREDENTIALS_FILE` if customized |
 | Muse quota is missing | Run `muse login` (API-key logins have no subscription quota); check `MUSE_AUTH_PATH` if customized. On macOS, a `storage: "keychain"` login also needs a one-time Keychain approval: run `herdr-agent-quota refresh --provider muse --keychain-approve` and click **Always Allow** |
-| Cursor quota is missing | Run `cursor login`, or sign in to the Cursor desktop app; check `CURSOR_AUTH_FILE` if customized |
+| Cursor quota is missing or stuck on a previous account | Run `cursor login`. On macOS, `cursor-agent login` stores the token in Keychain: run `herdr-agent-quota refresh --provider cursor --keychain-approve` and click **Always Allow**. The desktop app token is only used when the CLI has no login of its own |
 | Cursor cache/context is missing | `cx` comes from that session's `store.db`; cache still needs the pane to have reloaded `hooks.json` and sent a turn (headless `--print` does not fire those hooks) |
 | Rows are missing | Run the configure action below to repair managed configuration |
 | The `gauges` meter disappears on a narrow sidebar | Expected below ~24 columns; widen the sidebar and refresh |
