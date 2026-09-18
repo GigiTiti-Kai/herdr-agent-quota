@@ -7,7 +7,8 @@ use crate::herdr::{
     refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens,
 };
 use crate::model::{
-    BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution,
+    BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution, UsageWindow,
+    WindowKind,
 };
 use crate::omp::OmpEvidence;
 use crate::opencode::OpenCodePaths;
@@ -1083,10 +1084,25 @@ fn refresh_provider(
         Provider::Devin => devin::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Muse => muse::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Cursor => cursor::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Claude => overlay_claude_windows(
-            crate::providers::claude_api::fetch(now),
-            load_statusline_snapshot(cache, provider),
-        ),
+        Provider::Claude => {
+            let statusline = load_statusline_snapshot(cache, provider);
+            let previous = cache.load(provider).ok().flatten();
+            let carried = statusline
+                .as_ref()
+                .ok()
+                .and_then(|fetched| fetched.session_id.as_deref())
+                .and_then(|session| {
+                    previous
+                        .as_ref()
+                        .map(|snapshot| snapshot.windows_for_session(Some(session)))
+                })
+                .map(<[UsageWindow]>::to_vec);
+            overlay_claude_windows(
+                crate::providers::claude_api::fetch(now),
+                statusline,
+                carried.as_deref(),
+            )
+        }
         Provider::Agy => load_statusline_snapshot(cache, provider),
         // OpenCode Go is fetched for a resolved pane, never through the
         // provider list; see `fetch_opencode_go`.
@@ -1304,9 +1320,17 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
 /// this collector existed. With no statusLine observation there is no session
 /// to attach the windows to, so the fetch only keeps the cache warm until the
 /// hook first runs.
+///
+/// `carried` is what the cache last held for the session the statusLine names.
+/// When the endpoint fails (a 429 is the common case) the statusLine reading
+/// would otherwise replace that session's windows wholesale and the scoped row
+/// would flap off until the next successful fetch. The scoped window only ever
+/// comes from the endpoint, so it is carried over; 5h and 7d come from the
+/// statusLine, which may well be fresher.
 fn overlay_claude_windows(
     api: Result<ProviderSnapshot>,
     statusline: Result<FetchedSnapshot>,
+    carried: Option<&[UsageWindow]>,
 ) -> Result<FetchedSnapshot> {
     match (api, statusline) {
         (Ok(api), Ok(mut fetched)) => {
@@ -1323,7 +1347,24 @@ fn overlay_claude_windows(
             preserve_context: true,
             session_id: None,
         }),
-        (Err(_), statusline) => statusline,
+        (Err(_), Ok(mut fetched)) => {
+            let scoped = carried
+                .into_iter()
+                .flatten()
+                .filter(|window| window.kind == WindowKind::WeeklyScoped)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !fetched
+                .snapshot
+                .windows
+                .iter()
+                .any(|window| window.kind == WindowKind::WeeklyScoped)
+            {
+                fetched.snapshot.windows.extend(scoped);
+            }
+            Ok(fetched)
+        }
+        (Err(_), Err(error)) => Err(error),
     }
 }
 
@@ -3032,7 +3073,8 @@ mod tests {
     #[test]
     fn api_windows_replace_statusline_windows_and_keep_session_data() {
         let merged =
-            overlay_claude_windows(Ok(api_snapshot(62.0)), Ok(statusline_fetched(10.0))).unwrap();
+            overlay_claude_windows(Ok(api_snapshot(62.0)), Ok(statusline_fetched(10.0)), None)
+                .unwrap();
         assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
         // Session-scoped facts survive: only the windows come from the endpoint.
         assert_eq!(merged.snapshot.model.as_deref(), Some("Opus 5"));
@@ -3069,7 +3111,7 @@ mod tests {
             ],
             10,
         );
-        let merged = overlay_claude_windows(Ok(api), Ok(statusline_fetched(10.0))).unwrap();
+        let merged = overlay_claude_windows(Ok(api), Ok(statusline_fetched(10.0)), None).unwrap();
         cache
             .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
             .unwrap();
@@ -3098,10 +3140,37 @@ mod tests {
         let merged = overlay_claude_windows(
             Err(anyhow::anyhow!("HTTP 401")),
             Ok(statusline_fetched(10.0)),
+            None,
         )
         .unwrap();
         assert_eq!(merged.snapshot.windows[0].used_percent, 10.0);
         assert!(merged.snapshot.session_quota_only);
+    }
+
+    /// A 429 must not knock the scoped row off: the statusLine never carries
+    /// it, so the last endpoint reading for the session is carried over.
+    #[test]
+    fn an_endpoint_failure_keeps_the_carried_scoped_window() {
+        let carried = vec![
+            UsageWindow::new(WindowKind::FiveHour, 8.0, None).unwrap(),
+            UsageWindow::new(WindowKind::WeeklyScoped, 92.0, None)
+                .unwrap()
+                .with_source_window("Fab", None),
+        ];
+        let merged = overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 429")),
+            Ok(statusline_fetched(10.0)),
+            Some(&carried),
+        )
+        .unwrap();
+        let kinds: Vec<_> = merged.snapshot.windows.iter().map(|w| w.kind).collect();
+        assert!(kinds.contains(&WindowKind::WeeklyScoped), "{kinds:?}");
+        // Only the scoped window is carried; 5h/7d stay the statusLine's own.
+        assert!(!kinds.contains(&WindowKind::FiveHour), "{kinds:?}");
+        assert_eq!(
+            kinds.iter().filter(|k| **k == WindowKind::Weekly).count(),
+            1
+        );
     }
 
     /// The endpoint alone names no session, so `windows_for_session` returns
@@ -3126,6 +3195,7 @@ mod tests {
         let merged = overlay_claude_windows(
             Ok(api_snapshot(62.0)),
             Err(anyhow::anyhow!("no observation yet")),
+            None,
         )
         .unwrap();
         assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
@@ -3153,6 +3223,7 @@ mod tests {
         assert!(overlay_claude_windows(
             Err(anyhow::anyhow!("HTTP 401")),
             Err(anyhow::anyhow!("no observation yet")),
+            None,
         )
         .is_err());
     }
