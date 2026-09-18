@@ -49,6 +49,11 @@ rebuild is enough — Herdr does not need reinstalling. Pick the new binary up w
 
 Settings and cached quota survive a rebuild.
 
+A change to `herdr-plugin.toml` is the exception. Herdr copies the manifest into
+`~/.config/herdr/plugins.json` when the plugin is linked and reads its own copy
+afterwards, so a rebuild alone leaves the old pane sizes, actions and events in
+place. Run `./install.sh` for those; it relinks and keeps existing preferences.
+
 If you ever run an *older* build after a newer one, it meets a cached snapshot
 containing window kinds it does not know. Loading it fails outright, which
 aborts the whole refresh: no pane is updated at all, so the sidebar keeps
