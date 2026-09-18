@@ -8,19 +8,16 @@
 use crate::cache::CacheStore;
 use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
 use crate::providers::ProviderError;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// `cedar_ember=1` selects the current response shape; `skip_spend=1` drops the
 /// spend block, which only a gateway account populates.
-// ponytail: unused until the follow-up task wires the HTTP call; kept here now
-// so both tasks share one set of constants instead of duplicating the literals.
-#[allow(dead_code)]
 pub(crate) const USAGE_URL: &str =
     "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1";
-#[allow(dead_code)]
 pub(crate) const OAUTH_BETA: &str = "oauth-2025-04-20";
-#[allow(dead_code)]
 pub(crate) const USER_AGENT: &str = "claude-cli/2.1.0 (external, cli)";
 
 #[derive(Debug)]
@@ -114,6 +111,41 @@ pub fn parse_usage(
         windows,
         fetched_at_unix,
     ))
+}
+
+fn http_error_status(error: &ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        ureq::Error::Transport(error) => error.to_string(),
+    }
+}
+
+/// Fetch the account-wide subscription windows. Callers treat any error as
+/// "use the statusLine instead" — this never invents a zero reading.
+pub fn fetch(fetched_at_unix: u64) -> Result<ProviderSnapshot> {
+    let path = credentials_path().map_err(anyhow::Error::from)?;
+    let credentials = read_credentials(&path).map_err(anyhow::Error::from)?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(10))
+        .timeout_write(Duration::from_secs(10))
+        .build();
+    let response = agent
+        .get(USAGE_URL)
+        .set(
+            "Authorization",
+            &format!("Bearer {}", credentials.access_token),
+        )
+        .set("anthropic-beta", OAUTH_BETA)
+        .set("User-Agent", USER_AGENT)
+        .set("Accept", "application/json")
+        .call()
+        .map_err(|error| ProviderError::Request(http_error_status(&error)))
+        .map_err(anyhow::Error::from)?;
+    let value: Value = response
+        .into_json()
+        .context("decode Claude usage response")?;
+    parse_usage(&value, fetched_at_unix).map_err(anyhow::Error::from)
 }
 
 #[cfg(test)]
