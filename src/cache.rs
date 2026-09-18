@@ -999,26 +999,30 @@ fn merge_session_windows(
     quota_scope: Option<&str>,
     now_unix: u64,
 ) {
-    // The account's allowance outlives any one observation of it. A statusLine
-    // save reports a session and carries no endpoint reading, so without this
-    // every turn would drop the account windows until the next poll.
+    // The account's allowance outlives any one observation of it. A save that
+    // carries no endpoint reading -- the degrade path when the endpoint fails,
+    // and any future writer -- would otherwise drop the account windows until
+    // the next successful poll. This helper is the one chokepoint both save
+    // paths reach, so the carry and its guard cannot be bypassed.
     //
-    // Every carried window must still name a future reset, and one lapsed
-    // window drops the whole list. `windows_for_session` returns these ahead of
-    // the session's own reading, and the renderer filters expired windows, so a
+    // Every carried window must *prove* it is still live, and one that cannot
+    // drops the whole list. `windows_for_session` returns these ahead of the
+    // session's own reading, and the renderer filters expired windows, so a
     // partial carry would hide a pane's live statusLine figures behind a row
     // that draws nothing -- worse than not carrying at all. A permanently
     // failing endpoint (a revoked token, not a 429) therefore degrades to the
     // session-local reading within one window period instead of freezing or
-    // blanking the sidebar. This is the rule `overlay_claude_windows` already
-    // applies to the scoped window it carries.
+    // blanking the sidebar. `has_future_reset`, not `is_current`: a window with
+    // no `resets_at` cannot be proven stale and would be carried forever. This
+    // is the rule `overlay_claude_windows` already applies to the scoped window
+    // it carries.
     if snapshot.account_windows.is_empty() {
         if let Some(previous) = previous {
             if !previous.account_windows.is_empty()
                 && previous
                     .account_windows
                     .iter()
-                    .all(|window| window.is_current(now_unix))
+                    .all(|window| window.has_future_reset(now_unix))
             {
                 snapshot
                     .account_windows

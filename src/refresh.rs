@@ -1371,11 +1371,7 @@ fn overlay_claude_windows(
                 .into_iter()
                 .flatten()
                 .filter(|window| window.kind == WindowKind::WeeklyScoped)
-                .filter(|window| {
-                    window
-                        .resets_at
-                        .is_some_and(|reset| reset.unix_seconds() > now_unix)
-                })
+                .filter(|window| window.has_future_reset(now_unix))
                 .cloned()
                 .collect::<Vec<_>>();
             if !fetched
@@ -3072,10 +3068,19 @@ mod tests {
         );
     }
 
+    /// A real endpoint reading always names its reset, and the carry guard
+    /// requires one, so the fixture has to carry one too: with `resets_at:
+    /// None` the positive carry tests pass through the "cannot be proven
+    /// stale" branch and never exercise the path they claim to.
     fn api_snapshot(used: f64) -> ProviderSnapshot {
         ProviderSnapshot::new(
             Provider::Claude,
-            vec![UsageWindow::new(WindowKind::Weekly, used, None).unwrap()],
+            vec![UsageWindow::new(
+                WindowKind::Weekly,
+                used,
+                Some(ResetAt::from_unix_seconds(CacheStore::now_unix() + 3_600)),
+            )
+            .unwrap()],
             10,
         )
     }
@@ -3370,7 +3375,7 @@ mod tests {
         polled.snapshot.account_windows = vec![UsageWindow::new(
             WindowKind::FiveHour,
             62.0,
-            Some(crate::model::ResetAt::from_unix_seconds(now - 60)),
+            Some(ResetAt::from_unix_seconds(now - 60)),
         )
         .unwrap()];
         cache
@@ -3395,6 +3400,74 @@ mod tests {
         assert!(reloaded
             .windows_for_session(Some("a-pane-that-never-ran"))
             .is_empty());
+    }
+
+    /// One lapsed window drops the whole list, because `windows_for_session`
+    /// returns it wholesale: a surviving 7d would still suppress the pane's own
+    /// fresh 5h and leave the lapsed row drawing nothing.
+    #[test]
+    fn one_lapsed_window_drops_the_whole_carried_list() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let now = CacheStore::now_unix();
+        let mut polled = statusline_fetched(10.0);
+        polled.snapshot.account_windows = vec![
+            UsageWindow::new(
+                WindowKind::Weekly,
+                70.0,
+                Some(ResetAt::from_unix_seconds(now + 3_600)),
+            )
+            .unwrap(),
+            UsageWindow::new(
+                WindowKind::FiveHour,
+                62.0,
+                Some(ResetAt::from_unix_seconds(now - 60)),
+            )
+            .unwrap(),
+        ];
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        cache
+            .save_preserving_context_for_session(
+                statusline_fetched(11.0).snapshot,
+                Some("session-1"),
+            )
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.account_windows.is_empty());
+    }
+
+    /// A window with no `resets_at` can never be proven stale, so carrying it
+    /// would freeze every pane at a stale percentage for as long as the
+    /// endpoint stays down. `claude_api::parse_usage` builds one whenever the
+    /// response omits or malforms `resets_at`.
+    #[test]
+    fn an_account_window_without_a_reset_is_not_carried() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut polled = statusline_fetched(10.0);
+        polled.snapshot.account_windows =
+            vec![UsageWindow::new(WindowKind::Weekly, 62.0, None).unwrap()];
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        cache
+            .save_preserving_context_for_session(
+                statusline_fetched(11.0).snapshot,
+                Some("session-1"),
+            )
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.account_windows.is_empty());
+        assert_eq!(
+            reloaded.windows_for_session(Some("session-1"))[0].used_percent,
+            11.0
+        );
     }
 
     #[test]

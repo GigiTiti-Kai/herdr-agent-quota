@@ -420,6 +420,21 @@ impl UsageWindow {
         self.resets_at
             .is_none_or(|reset| reset.unix_seconds() > now_unix)
     }
+
+    /// Whether this window proves it is still live, rather than merely failing
+    /// to prove otherwise.
+    ///
+    /// The strict counterpart to [`Self::is_current`]: a missing `resets_at`
+    /// fails here. Displaying a reading is a decision about what is on screen
+    /// now, so "cannot be proven stale" is the right rule there. Carrying one
+    /// forward decides what a *later* pass shows without re-reading it, and a
+    /// window that can never expire would be carried forever, so a carry
+    /// requires the proof. `resets_at` is optional on every collector's parse
+    /// path, so this is reachable whenever a provider omits or malforms it.
+    pub fn has_future_reset(&self, now_unix: u64) -> bool {
+        self.resets_at
+            .is_some_and(|reset| reset.unix_seconds() > now_unix)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
