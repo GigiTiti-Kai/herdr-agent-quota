@@ -1178,16 +1178,6 @@ fn group_label_for(
         })
 }
 
-/// Herdr hang-indents a head pane's rows under `$quota_group`. Member panes
-/// collapse an empty group, so their identity is row 1 and needs the same
-/// offset baked into the first plugin cell — same as herdr-radar
-/// `group_indent = 2`.
-///
-/// The indent must ride on the logo token, not a stand-alone `$quota_pad`:
-/// Herdr inserts ` · ` between adjacent non-empty tokens, so a pad cell drew
-/// a leading middle-dot before the logo. ZWSP + spaces survive trim only when
-/// a non-whitespace glyph follows in the same value.
-const GROUP_MEMBER_INDENT: &str = "\u{200b}  ";
 /// Always reported together so a lagging inventory cannot leave a stale
 /// colour twin on screen after working→done or done→idle.
 const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_icon_done"];
@@ -1196,29 +1186,27 @@ const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_
 ///
 /// Exactly one of `$quota_icon` / `_working` / `_done` is published so the
 /// brand glyph itself carries Herdr's status colour (no `state_icon` ring).
-/// Members prefix the logo with [`GROUP_MEMBER_INDENT`]. Heads publish the
-/// bare glyph — Herdr already hang-indents their continuation rows. Stale
-/// `$quota_pad` from older builds is cleared.
+/// Every pane publishes the bare glyph. Stale `$quota_pad` and the member
+/// indent older builds baked into the logo are cleared.
+///
+/// No member indent: Herdr indents by row *index* (row 0 by 1 column, every
+/// later row by 3), not by group membership. A member collapses its empty
+/// `$quota_group`, which pulls its whole row list up by one — so the logo row
+/// is a continuation row on heads and members alike and already shares the
+/// 3-column offset. Padding it moved members' logos 2 columns right of
+/// everyone else's, and only on the logo row, whenever a user row sat between
+/// the group header and the logo (`build_managed_rows` preserves those).
 fn apply_group_and_icon(
     desired: &mut BTreeMap<String, String>,
     pane: &AgentPane,
     group_heads: &BTreeMap<String, String>,
     workspace_labels: &BTreeMap<String, String>,
 ) {
-    let glyph = crate::icons::for_harness(pane.harness);
-    let member = !pane.workspace_id.is_empty()
-        && group_heads
-            .get(&pane.workspace_id)
-            .is_some_and(|head| head != &pane.pane_id);
-    let mark = if member {
-        format!("{GROUP_MEMBER_INDENT}{glyph}")
-    } else {
-        glyph.to_string()
-    };
+    let mark = crate::icons::for_harness(pane.harness);
     let active = pane.icon_status().icon_token();
     for token in ICON_TOKEN_NAMES {
         if token == active {
-            desired.insert(token.to_string(), mark.clone());
+            desired.insert(token.to_string(), mark.to_string());
         } else {
             desired.remove(token);
         }
@@ -1795,12 +1783,11 @@ mod tests {
         let mut sibling_desired = sibling.tokens.clone();
         apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &labels);
         assert!(!sibling_desired.contains_key("quota_group"));
-        assert!(
-            sibling_desired
-                .get("quota_icon")
-                .is_some_and(|icon| icon.starts_with(GROUP_MEMBER_INDENT)),
-            "member logo must carry the hang-indent: {:?}",
-            sibling_desired.get("quota_icon")
+        assert_eq!(
+            sibling_desired.get("quota_icon").map(String::as_str),
+            Some(crate::icons::for_harness(sibling.harness)),
+            "member logo stays bare: Herdr indents by row index, so the logo \
+             row is already hang-indented on heads and members alike"
         );
         assert!(
             !sibling_desired.contains_key("quota_pad"),
@@ -1811,16 +1798,10 @@ mod tests {
             None,
             "stale sibling header must clear"
         );
-        assert!(
-            head_desired
-                .get("quota_icon")
-                .is_some_and(|icon| !icon.starts_with('\u{200b}')),
-            "head logo stays bare; Herdr hang-indents the row"
-        );
         assert_eq!(
-            format!("{GROUP_MEMBER_INDENT}x").trim(),
-            format!("{GROUP_MEMBER_INDENT}x"),
-            "indent glued to a glyph must survive Unicode trim"
+            head_desired.get("quota_icon").map(String::as_str),
+            Some(crate::icons::for_harness(head.harness)),
+            "head logo stays bare; Herdr hang-indents the row"
         );
 
         // Brand icon colour follows agent_status: working publishes the
@@ -1832,10 +1813,11 @@ mod tests {
             ("quota_icon_done".to_string(), "stale".to_string()),
         ]);
         apply_group_and_icon(&mut working_desired, &working, &heads, &labels);
-        assert!(
+        assert_eq!(
             working_desired
                 .get("quota_icon_working")
-                .is_some_and(|icon| icon.starts_with(GROUP_MEMBER_INDENT)),
+                .map(String::as_str),
+            Some(crate::icons::for_harness(working.harness)),
             "working panes publish the yellow brand icon"
         );
         assert!(!working_desired.contains_key("quota_icon"));
