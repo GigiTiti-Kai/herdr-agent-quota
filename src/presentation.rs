@@ -139,6 +139,11 @@ pub struct MetadataTokens {
     pub quota_5h_severity: Option<Severity>,
     pub quota_week: String,
     pub quota_week_severity: Option<Severity>,
+    /// A model-scoped weekly cap (`Fab 92% 3d`), when the account has one.
+    /// Absent far more often than present: not every account or model has a
+    /// scoped cap, so this stays empty rather than showing a stale value.
+    pub quota_week_scoped: String,
+    pub quota_week_scoped_severity: Option<Severity>,
     pub quota_month: String,
     pub quota_month_severity: Option<Severity>,
     pub quota_context: String,
@@ -267,6 +272,7 @@ impl MetadataTokens {
             shape.content_width > 0 && shape.content_width < NARROW_IDENTITY_CONTENT_WIDTH;
         let five_hour = window_in(windows, WindowKind::FiveHour);
         let weekly = window_in(windows, WindowKind::Weekly);
+        let weekly_scoped = window_in(windows, WindowKind::WeeklyScoped);
         let monthly = window_in(windows, WindowKind::Monthly);
         Self {
             quota_provider_model,
@@ -284,6 +290,11 @@ impl MetadataTokens {
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_week_severity: weekly.map(|window| Severity::for_window(window, now_unix)),
+            quota_week_scoped: weekly_scoped
+                .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
+                .unwrap_or_default(),
+            quota_week_scoped_severity: weekly_scoped
+                .map(|window| Severity::for_window(window, now_unix)),
             quota_month: monthly
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
@@ -311,6 +322,8 @@ impl MetadataTokens {
             quota_5h_severity: None,
             quota_week: String::new(),
             quota_week_severity: None,
+            quota_week_scoped: String::new(),
+            quota_week_scoped_severity: None,
             quota_month: String::new(),
             quota_month_severity: None,
             quota_context: String::new(),
@@ -350,6 +363,10 @@ fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
         fields
             .contains(SidebarField::Week)
             .then(|| window_in(windows, WindowKind::Weekly))
+            .flatten(),
+        fields
+            .contains(SidebarField::WeekScoped)
+            .then(|| window_in(windows, WindowKind::WeeklyScoped))
             .flatten(),
         fields
             .contains(SidebarField::Month)
@@ -820,6 +837,57 @@ mod tests {
 
     fn window(kind: WindowKind, used: f64, reset: u64) -> UsageWindow {
         UsageWindow::new(kind, used, Some(ResetAt::from_unix_seconds(reset))).unwrap()
+    }
+
+    fn scoped_window(used: f64) -> UsageWindow {
+        UsageWindow::new(WindowKind::WeeklyScoped, used, None)
+            .unwrap()
+            .with_source_window("Fab", None)
+    }
+
+    #[test]
+    fn the_scoped_weekly_window_gets_its_own_token() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 40.0, 3_600),
+                window(WindowKind::Weekly, 75.0, 183_600),
+                scoped_window(92.0),
+            ],
+            0,
+        );
+        // `Used` style so the plan's percentages (92%, 75%) show literally,
+        // and to prove `style` is threaded into the scoped token like every
+        // other window rather than hardcoded.
+        let tokens = MetadataTokens::from_snapshot_for_session(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::Used,
+            SidebarShape::default(),
+        );
+        // The row names its model instead of reading 7d a second time.
+        assert!(tokens.quota_week_scoped.contains("Fab"));
+        assert!(tokens.quota_week_scoped.contains("92%"));
+        // The account-wide weekly is untouched by the scoped one.
+        assert!(tokens.quota_week.contains("75%"));
+    }
+
+    #[test]
+    fn headroom_counts_the_scoped_weekly_window() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::Weekly, 60.0, 183_600),
+                scoped_window(92.0),
+            ],
+            0,
+        );
+        // 8 points left on Fable is tighter than the 40 left on the weekly.
+        assert_eq!(
+            MetadataTokens::from_snapshot(&snapshot, 0).quota_headroom,
+            Some(8)
+        );
     }
 
     /// A monthly-only plan (Grok billed monthly, a Go plan with no weekly
