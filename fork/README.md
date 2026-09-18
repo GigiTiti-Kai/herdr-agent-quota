@@ -9,7 +9,9 @@ cannot conflict during a sync. Fork-only design docs live in `fork/specs/`.
 ## Branches
 
 - `main`: mirror of upstream, pinned to a release tag. Never commit here;
-  `fork/sync.sh` fast-forwards it.
+  `fork/sync.sh` fast-forwards it. It is **not pushed** — GitHub created
+  `origin/main` from upstream's head when it made the fork, and that copy is
+  irrelevant. Only the local branch matters.
 - `dev`: everything of ours, merged on top of `main`. Build source. Pushed to `origin`.
 
 Unlike the herdr fork, upstream's release tags are reachable from `upstream/main`,
