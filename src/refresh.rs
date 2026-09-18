@@ -1101,6 +1101,7 @@ fn refresh_provider(
                 crate::providers::claude_api::fetch(now),
                 statusline,
                 carried.as_deref(),
+                now,
             )
         }
         Provider::Agy => load_statusline_snapshot(cache, provider),
@@ -1327,10 +1328,18 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
 /// would flap off until the next successful fetch. The scoped window only ever
 /// comes from the endpoint, so it is carried over; 5h and 7d come from the
 /// statusLine, which may well be fresher.
+///
+/// A carried window must still name a future reset. Without that guard the
+/// carry perpetuates itself — `merge_session_windows` writes it back into the
+/// session, so the next failure reads the same one out again — and a
+/// permanently failing fetch (a revoked token, not a 429) would freeze the row
+/// at a stale percentage forever. This is the same rule
+/// `merge_omitted_window_list` applies when it restores an omitted 5h or 7d.
 fn overlay_claude_windows(
     api: Result<ProviderSnapshot>,
     statusline: Result<FetchedSnapshot>,
     carried: Option<&[UsageWindow]>,
+    now_unix: u64,
 ) -> Result<FetchedSnapshot> {
     match (api, statusline) {
         (Ok(api), Ok(mut fetched)) => {
@@ -1352,6 +1361,11 @@ fn overlay_claude_windows(
                 .into_iter()
                 .flatten()
                 .filter(|window| window.kind == WindowKind::WeeklyScoped)
+                .filter(|window| {
+                    window
+                        .resets_at
+                        .is_some_and(|reset| reset.unix_seconds() > now_unix)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if !fetched
@@ -3072,9 +3086,13 @@ mod tests {
 
     #[test]
     fn api_windows_replace_statusline_windows_and_keep_session_data() {
-        let merged =
-            overlay_claude_windows(Ok(api_snapshot(62.0)), Ok(statusline_fetched(10.0)), None)
-                .unwrap();
+        let merged = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
         assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
         // Session-scoped facts survive: only the windows come from the endpoint.
         assert_eq!(merged.snapshot.model.as_deref(), Some("Opus 5"));
@@ -3111,7 +3129,8 @@ mod tests {
             ],
             10,
         );
-        let merged = overlay_claude_windows(Ok(api), Ok(statusline_fetched(10.0)), None).unwrap();
+        let merged =
+            overlay_claude_windows(Ok(api), Ok(statusline_fetched(10.0)), None, 10).unwrap();
         cache
             .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
             .unwrap();
@@ -3141,6 +3160,7 @@ mod tests {
             Err(anyhow::anyhow!("HTTP 401")),
             Ok(statusline_fetched(10.0)),
             None,
+            10,
         )
         .unwrap();
         assert_eq!(merged.snapshot.windows[0].used_percent, 10.0);
@@ -3153,14 +3173,19 @@ mod tests {
     fn an_endpoint_failure_keeps_the_carried_scoped_window() {
         let carried = vec![
             UsageWindow::new(WindowKind::FiveHour, 8.0, None).unwrap(),
-            UsageWindow::new(WindowKind::WeeklyScoped, 92.0, None)
-                .unwrap()
-                .with_source_window("Fab", None),
+            UsageWindow::new(
+                WindowKind::WeeklyScoped,
+                92.0,
+                Some(ResetAt::from_unix_seconds(900)),
+            )
+            .unwrap()
+            .with_source_window("Fab", None),
         ];
         let merged = overlay_claude_windows(
             Err(anyhow::anyhow!("HTTP 429")),
             Ok(statusline_fetched(10.0)),
             Some(&carried),
+            10,
         )
         .unwrap();
         let kinds: Vec<_> = merged.snapshot.windows.iter().map(|w| w.kind).collect();
@@ -3171,6 +3196,34 @@ mod tests {
             kinds.iter().filter(|k| **k == WindowKind::Weekly).count(),
             1
         );
+    }
+
+    /// A carry with no future reset must be dropped, not perpetuated. Without
+    /// this the row freezes at a stale percentage for as long as the endpoint
+    /// keeps failing, which for a revoked token is forever.
+    #[test]
+    fn an_endpoint_failure_drops_a_stale_carried_scoped_window() {
+        let expired = vec![UsageWindow::new(
+            WindowKind::WeeklyScoped,
+            92.0,
+            Some(ResetAt::from_unix_seconds(900)),
+        )
+        .unwrap()
+        .with_source_window("Fab", None)];
+        let undated = vec![UsageWindow::new(WindowKind::WeeklyScoped, 92.0, None)
+            .unwrap()
+            .with_source_window("Fab", None)];
+        for carried in [expired, undated] {
+            let merged = overlay_claude_windows(
+                Err(anyhow::anyhow!("missing credentials")),
+                Ok(statusline_fetched(10.0)),
+                Some(&carried),
+                1_000,
+            )
+            .unwrap();
+            let kinds: Vec<_> = merged.snapshot.windows.iter().map(|w| w.kind).collect();
+            assert!(!kinds.contains(&WindowKind::WeeklyScoped), "{kinds:?}");
+        }
     }
 
     /// The endpoint alone names no session, so `windows_for_session` returns
@@ -3196,6 +3249,7 @@ mod tests {
             Ok(api_snapshot(62.0)),
             Err(anyhow::anyhow!("no observation yet")),
             None,
+            10,
         )
         .unwrap();
         assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
@@ -3224,6 +3278,7 @@ mod tests {
             Err(anyhow::anyhow!("HTTP 401")),
             Err(anyhow::anyhow!("no observation yet")),
             None,
+            10,
         )
         .is_err());
     }
