@@ -262,6 +262,7 @@ impl MetadataTokens {
         let style = row.percent;
         let shape = row.shape;
         let fields = row.fields;
+        let all_windows = windows;
         let live = live_windows(windows, now_unix);
         let windows = live.as_slice();
         let quota_provider = snapshot.provider.display_name().to_string();
@@ -284,18 +285,22 @@ impl MetadataTokens {
             quota_model,
             quota_5h_severity: five_hour.map(|window| Severity::for_window(window, now_unix)),
             quota_5h: five_hour
+                .or_else(|| window_in(all_windows, WindowKind::FiveHour))
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_week: weekly
+                .or_else(|| window_in(all_windows, WindowKind::Weekly))
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_week_severity: weekly.map(|window| Severity::for_window(window, now_unix)),
             quota_week_scoped: weekly_scoped
+                .or_else(|| window_in(all_windows, WindowKind::WeeklyScoped))
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_week_scoped_severity: weekly_scoped
                 .map(|window| Severity::for_window(window, now_unix)),
             quota_month: monthly
+                .or_else(|| window_in(all_windows, WindowKind::Monthly))
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_month_severity: monthly.map(|window| Severity::for_window(window, now_unix)),
@@ -586,6 +591,19 @@ fn compact_window_parts(
     shape: SidebarShape,
 ) -> WindowParts {
     let label = window.display_label();
+    if !window.is_current(now_unix) {
+        let cells = gauge_cells(shape, label);
+        return WindowParts {
+            label: if cells.is_some() {
+                format!("{label:<width$}", width = GAUGE_LABEL_WIDTH)
+            } else {
+                label.to_string()
+            },
+            percent: if cells.is_some() { "  --" } else { "--" }.to_string(),
+            eta: String::new(),
+            meter: cells.map(|cells| meter(0, cells)),
+        };
+    }
     let percent = style.percent_of(window);
     let eta = window
         .resets_at
@@ -1716,13 +1734,78 @@ mod tests {
 
     #[test]
     fn an_expired_window_is_not_shown_as_live_quota() {
+        for kind in [
+            WindowKind::FiveHour,
+            WindowKind::Weekly,
+            WindowKind::WeeklyScoped,
+            WindowKind::Monthly,
+        ] {
+            let expired = window(kind, 20.0, 1_000);
+            let expired = if kind == WindowKind::WeeklyScoped {
+                expired.with_source_window("Fab", None)
+            } else {
+                expired
+            };
+            let label = expired.display_label().to_string();
+            let snapshot = ProviderSnapshot::new(Provider::Claude, vec![expired], 0);
+            for now in [1_000, 1_001] {
+                for style in [PercentStyle::Remaining, PercentStyle::Used] {
+                    for layout in [
+                        SidebarLayout::Packed,
+                        SidebarLayout::Stacked,
+                        SidebarLayout::Gauges,
+                    ] {
+                        for width in [23, 26] {
+                            let tokens = MetadataTokens::from_snapshot_for_session(
+                                &snapshot,
+                                now,
+                                None,
+                                style,
+                                SidebarShape::new(layout, width),
+                            );
+                            let (value, severity) = match kind {
+                                WindowKind::FiveHour => {
+                                    (&tokens.quota_5h, tokens.quota_5h_severity)
+                                }
+                                WindowKind::Weekly => {
+                                    (&tokens.quota_week, tokens.quota_week_severity)
+                                }
+                                WindowKind::WeeklyScoped => {
+                                    (&tokens.quota_week_scoped, tokens.quota_week_scoped_severity)
+                                }
+                                WindowKind::Monthly => {
+                                    (&tokens.quota_month, tokens.quota_month_severity)
+                                }
+                            };
+                            let expected = if layout == SidebarLayout::Gauges && width == 26 {
+                                format!("{label:<3} ▱▱▱▱▱▱   --")
+                            } else {
+                                format!("{label} --")
+                            };
+                            assert_eq!(*value, expected, "{kind:?} {layout:?} {style:?} {width}");
+                            assert_eq!(severity, None);
+                            assert_eq!(tokens.quota_headroom, None);
+                            assert_eq!(dashboard_summary(&snapshot, now, style), "");
+                            assert_eq!(
+                                ProviderSnapshot::severity_for_windows(
+                                    Provider::Claude,
+                                    &snapshot.windows,
+                                    now
+                                ),
+                                Severity::Unknown
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let snapshot = ProviderSnapshot::new(
             Provider::Claude,
             vec![window(WindowKind::FiveHour, 20.0, 1_000)],
             0,
         );
         let tokens = MetadataTokens::from_snapshot(&snapshot, 1_001);
-        assert_eq!(tokens.quota_5h, "");
+        assert_eq!(tokens.quota_5h, "5h --");
         assert_eq!(tokens.quota_5h_severity, None);
         assert_eq!(tokens.quota_headroom, None);
         assert!(!tokens.quota_5h.contains("80%"), "{tokens:?}");
@@ -1747,7 +1830,7 @@ mod tests {
             0,
         );
         let tokens = MetadataTokens::from_snapshot(&snapshot, 1_001);
-        assert_eq!(tokens.quota_5h, "");
+        assert_eq!(tokens.quota_5h, "5h --");
         assert_eq!(tokens.quota_5h_severity, None);
         assert!(tokens.quota_week.starts_with("7d 90%"), "{tokens:?}");
         assert_eq!(tokens.quota_headroom, Some(90));
