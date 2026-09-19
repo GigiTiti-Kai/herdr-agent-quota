@@ -11,20 +11,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
-fn sidebar_has_status_icon_rules(sidebar: &str) -> bool {
-    sidebar.contains("$quota_icon")
-        && sidebar.contains("fg = \"#f9e2af\"")
-        && sidebar.contains("fg = \"#94e2d5\"")
-        && !sidebar.contains("$quota_icon_working")
-        && !sidebar.contains("$quota_icon_done")
-}
-
-fn report_sets_done_icon(text: &str) -> bool {
-    (text.contains("--token quota_icon=") || text.contains(" quota_icon="))
-        && text.contains('\u{2060}')
-        && !text.contains("quota_icon_done=")
-}
-
 fn install_herdr_stub(state: &Path, agent_list: &str) -> (PathBuf, PathBuf) {
     let log = state.join("herdr.log");
     let executable = state.join("herdr");
@@ -258,7 +244,7 @@ fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
     assert!(!applied.contains("$quota_5h_label"));
     assert!(!applied.contains("$quota_5h_eta"));
     assert!(!applied.contains("fg = \"#c8cdd6\""));
-    assert!(applied.contains("row_gap = 0 # herdr-agent-quota"));
+    assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
     assert!(applied.find("$quota_topic").unwrap() < applied.find("$quota_5h_normal").unwrap());
     assert!(applied.contains("fg = \"#82d978\""));
     assert!(applied.contains("fg = \"#e4b957\""));
@@ -269,7 +255,9 @@ fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
     assert!(!applied.contains("selection_bg"));
     assert!(!applied.contains("active_row_bg"));
     assert!(!applied.contains("[ui.sidebar.agents.rows_by_agent]"));
-    assert!(sidebar_has_status_icon_rules(&applied), "{applied}");
+    assert!(applied.contains("$quota_icon"));
+    assert!(applied.contains("$quota_icon_working"));
+    assert!(applied.contains("$quota_icon_done"));
     assert!(applied.contains("fg = \"#e9e9f0\""));
     assert!(applied.contains("fg = \"#f9e2af\""));
     assert!(applied.contains("fg = \"#94e2d5\""));
@@ -343,21 +331,7 @@ fn context_is_the_penultimate_row_and_model_shares_provider_style() {
         })
         .unwrap();
     assert_eq!(context_index + 1, limit_index);
-    let nest_gap_index = rows
-        .iter()
-        .position(|row| {
-            row.as_array().is_some_and(|items| {
-                items.iter().any(|item| {
-                    item.as_inline_table()
-                        .and_then(|table| table.get("token"))
-                        .and_then(toml_edit::Value::as_str)
-                        .is_some_and(|token| token == "$quota_nest_gap")
-                })
-            })
-        })
-        .unwrap();
-    assert_eq!(limit_index + 1, nest_gap_index);
-    assert_eq!(nest_gap_index + 1, rows.len());
+    assert_eq!(limit_index + 1, rows.len());
 
     let identity = rows
         .iter()
@@ -367,10 +341,10 @@ fn context_is_the_penultimate_row_and_model_shares_provider_style() {
     assert!(!identity
         .iter()
         .any(|item| item.as_str() == Some("state_icon")));
-    assert!(!identity
+    assert!(identity
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_working")));
-    assert!(!identity
+    assert!(identity
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_done")));
     for token in ["$quota_icon", "$quota_provider_model"] {
@@ -407,10 +381,10 @@ fn provider_model_is_compact_and_every_provider_can_fold_week_without_five_hour(
             .any(|item| configured_token(item) == Some("$quota_icon")),
         "identity row must carry the vendor mark: {identity_row}"
     );
-    assert!(!identity_tokens
+    assert!(identity_tokens
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_working")));
-    assert!(!identity_tokens
+    assert!(identity_tokens
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_done")));
     assert!(!identity_tokens.iter().any(|item| {
@@ -525,15 +499,15 @@ fn sidebar_configuration_preserves_an_explicit_row_gap() {
 }
 
 #[test]
-fn sidebar_configuration_keeps_plugin_owned_gap_packed() {
+fn sidebar_configuration_migrates_the_plugin_owned_gap_to_separated_panes() {
     let original = concat!(
         "[ui.sidebar.agents]\n",
-        "row_gap = 1 # herdr-agent-quota\n",
+        "row_gap = 0 # herdr-agent-quota\n",
         "rows = [[\"state_icon\", \"agent\"]]\n"
     );
     let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("row_gap = 0 # herdr-agent-quota"));
-    assert!(!applied.contains("row_gap = 1"));
+    assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
+    assert!(!applied.contains("row_gap = 0"));
 }
 
 #[test]
@@ -977,7 +951,7 @@ fn a_scrolled_pane_completion_reports_only_icon_tokens() {
         .filter(|line| line.contains("pane report-metadata w1:p1"))
         .collect::<Vec<_>>();
     assert_eq!(reports.len(), 1, "{calls}");
-    assert!(report_sets_done_icon(reports[0]), "{calls}");
+    assert!(reports[0].contains("quota_icon_done="), "{calls}");
     assert!(!reports[0].contains("quota_5h"), "{calls}");
 }
 
@@ -1204,7 +1178,7 @@ fn opencode_working_event(pane_id: &str) -> String {
 fn assert_named_opencode_event(herdr_log: &Path, named: &str, sibling: &str) {
     let calls = fs::read_to_string(herdr_log).unwrap_or_default();
     assert!(
-        (1..=5).contains(&calls.matches("agent list").count()),
+        (1..=2).contains(&calls.matches("agent list").count()),
         "expected inventory plus group-membership list: {calls}"
     );
     assert!(
@@ -1324,8 +1298,8 @@ fn opencode_working_event_publishes_only_the_named_local_identity() {
     assert_no_sibling_quota_write(&calls, "w1:p10");
     assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
     assert!(
-        calls.contains("kimi-k2.5"),
-        "named OpenCode pane must keep its model: {calls}"
+        calls.contains("--token quota_provider_model=OpenCode Go/kimi-k2.5"),
+        "{calls}"
     );
 }
 
@@ -1957,16 +1931,8 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
     assert!(!paint.is_empty(), "completion must publish: {calls}");
     let joined = paint.join("\n");
     assert!(
-        !joined.contains("quota_icon_done=") && !joined.contains("--token quota_icon_done="),
-        "nested vendor children omit the brand icon, so teal cannot land there: {joined}"
-    );
-    assert!(
-        !calls
-            .lines()
-            .any(|line| line.contains("pane report-metadata w1:p1")
-                && (line.contains("quota_icon_done=")
-                    || line.contains("--token quota_icon_done="))),
-        "shared vendor header stays idle, not teal: {calls}"
+        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
+        "unfocused same-tab idle must stay teal: {joined}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(!codex_log.exists(), "codex stub must stay idle");
@@ -2016,8 +1982,12 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
     );
     let joined = paint.join("\n");
     assert!(
-        report_sets_done_icon(&joined),
+        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
         "focused completion must stay teal: {joined}"
+    );
+    assert!(
+        !joined.contains("--token quota_icon=") && !joined.contains(" quota_icon="),
+        "focused completion must clear white: {joined}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(!codex_log.exists(), "codex stub must stay idle");
@@ -2075,8 +2045,8 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
     assert!(!paint.is_empty(), "completion must publish: {calls}");
     let joined = paint.join("\n");
     assert!(
-        !joined.contains("quota_icon_done=") && !joined.contains("--token quota_icon_done="),
-        "nested extra Cursor tab has no brand icon to keep teal: {joined}"
+        joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
+        "working-set idle must stay teal even without a yellow twin: {joined}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
     assert!(!codex_log.exists(), "codex stub must stay idle");
@@ -2194,8 +2164,8 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
         &format!(
-            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042","quota_stack":"042990042","quota_nest_gap":"{}"}}}}]}}}}"#,
-            "\u{e1a0}", "\u{200b}\u{2800}"
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}}]}}}}"#,
+            "\u{e1a0}"
         ),
     );
 
@@ -2358,7 +2328,7 @@ fn opencode_indeterminate_event_removes_unconfirmed_quota() {
     original_four_untouched(state.path(), &codex_log);
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=5).contains(&calls.matches("agent list").count()),
+        (1..=2).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(calls.contains("pane read w1:p9"), "{calls}");
@@ -2422,7 +2392,7 @@ fn opencode_mismatched_event_pane_is_a_noop() {
     original_four_untouched(state.path(), &codex_log);
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=5).contains(&calls.matches("agent list").count()),
+        (1..=2).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -2504,7 +2474,9 @@ fn installing_one_agent_leaves_every_other_agent_untouched() {
 
     let sidebar = homes.sidebar();
     // Default layouts publish shared rows only — no per-agent brand copies.
-    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     for harness in AgentSelection::SUPPORTED {
@@ -2540,7 +2512,9 @@ fn installing_only_pi_adds_only_its_sidebar_style() {
         String::from_utf8_lossy(&output.stderr)
     );
     let sidebar = homes.sidebar();
-    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     for harness in AgentSelection::SUPPORTED {
@@ -2569,7 +2543,10 @@ fn uninstalling_one_agent_keeps_the_rest_working() {
 
     let sidebar = homes.sidebar();
     assert!(
-        sidebar_has_status_icon_rules(&sidebar) && !sidebar.contains("state_icon"),
+        sidebar.contains("$quota_icon")
+            && sidebar.contains("$quota_icon_working")
+            && sidebar.contains("$quota_icon_done")
+            && !sidebar.contains("state_icon"),
         "shared quota rows were lost: {sidebar}"
     );
     assert!(!sidebar.contains("grok ="), "grok survived: {sidebar}");
@@ -2637,7 +2614,9 @@ fn an_installer_can_narrow_the_selection_through_the_environment() {
     );
 
     let sidebar = homes.sidebar();
-    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     assert!(!sidebar.contains("claude ="), "{sidebar}");
@@ -2776,7 +2755,10 @@ fn a_saved_pre_muse_full_list_still_configures_when_omp_is_absent() {
     );
     let sidebar = homes.sidebar();
     assert!(
-        sidebar_has_status_icon_rules(&sidebar) && !sidebar.contains("state_icon"),
+        sidebar.contains("$quota_icon")
+            && sidebar.contains("$quota_icon_working")
+            && sidebar.contains("$quota_icon_done")
+            && !sidebar.contains("state_icon"),
         "a once-complete list must still write shared quota rows: {sidebar}"
     );
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
@@ -2832,7 +2814,9 @@ fn an_unusable_environment_selection_still_installs_everything() {
         .status
         .success());
     let sidebar = homes.sidebar();
-    assert!(sidebar_has_status_icon_rules(&sidebar), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
+    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     assert!(homes.claude_settings.exists());
@@ -2917,8 +2901,8 @@ fn flush_row_gap_is_persisted_across_a_repair() {
         .configure(&["--apply", "--row-gap", "1"])
         .status
         .success());
-    assert!(homes.sidebar().contains("row_gap = 0 # herdr-agent-quota"));
-    assert!(!homes.sidebar().contains("row_gap = 1"));
+    assert!(homes.sidebar().contains("row_gap = 1 # herdr-agent-quota"));
+    assert!(!homes.sidebar().contains("row_gap = 0"));
 }
 
 #[test]
@@ -3067,9 +3051,7 @@ fn sidebar_is_gauges(sidebar: &str) -> bool {
         && !tab_shares_row_with_provider_model(sidebar)
         && sidebar_has_token(sidebar, "$quota_provider_model")
         && !sidebar_has_token(sidebar, "$quota_provider")
-        && sidebar_has_token(sidebar, "$quota_model")
-        && sidebar_has_token(sidebar, "$quota_nest_gap")
-        && sidebar_has_token(sidebar, "$quota_share_week_normal")
+        && !sidebar_has_token(sidebar, "$quota_model")
         && sidebar.contains("$quota_context_normal")
         && sidebar.contains("$quota_week_normal")
 }
@@ -3267,7 +3249,7 @@ fn pi_codex_event_uses_only_the_proved_canonical_cache_and_reads_no_pane() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=5).contains(&calls.matches("agent list").count()),
+        (1..=2).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3333,8 +3315,7 @@ fn pi_codex_event_overlays_exact_session_context_and_cache_without_inventing_ttl
     assert!(calls.contains("--token quota_cache=cache 85.0%"), "{calls}");
     assert!(!calls.contains("quota_cache_ttl"), "{calls}");
     assert!(
-        calls.contains("quota_week_normal=7d 80%")
-            || calls.contains("quota_week_inline_normal=7d 80%"),
+        calls.contains("--token quota_week_inline_normal=7d 80%"),
         "{calls}"
     );
 }
@@ -3411,7 +3392,7 @@ fn pi_payg_event_clears_stale_quota_without_invoking_a_collector() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=5).contains(&calls.matches("agent list").count()),
+        (1..=2).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3505,7 +3486,7 @@ fn pi_different_account_clears_stale_quota_and_cannot_borrow_codex_cache() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap();
     assert!(
-        (1..=5).contains(&calls.matches("agent list").count()),
+        (1..=2).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3547,7 +3528,7 @@ fn pi_model_switch_updates_identity_and_removes_unconfirmed_quota() {
 
     let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
     assert!(
-        (1..=5).contains(&calls.matches("agent list").count()),
+        (1..=2).contains(&calls.matches("agent list").count()),
         "{calls}"
     );
     assert!(!calls.contains("pane read"), "{calls}");
@@ -3599,7 +3580,7 @@ fn an_opencode_pane_without_a_go_key_makes_no_request_but_shows_exact_identity()
         "exact OpenCode session stayed blank: {calls}"
     );
     assert!(
-        calls.contains("kimi-k2.5"),
+        calls.contains("--token quota_provider_model=OpenCode Go/kimi-k2.5"),
         "exact OpenCode identity was not published: {calls}"
     );
     assert!(

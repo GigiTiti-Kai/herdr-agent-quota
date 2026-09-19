@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 72] = [
+const QUOTA_ROW_MARKERS: [&str; 55] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -15,7 +15,6 @@ const QUOTA_ROW_MARKERS: [&str; 72] = [
     "$quota_icon_done",
     "$quota_group",
     "$quota_pad",
-    "$quota_nest_gap",
     "$quota_provider",
     "$quota_model",
     "$quota_provider_model",
@@ -64,22 +63,6 @@ const QUOTA_ROW_MARKERS: [&str; 72] = [
     "$quota_month_warning",
     "$quota_month_danger",
     "$quota_month_unknown",
-    "$quota_share_5h_normal",
-    "$quota_share_5h_warning",
-    "$quota_share_5h_danger",
-    "$quota_share_5h_unknown",
-    "$quota_share_week_normal",
-    "$quota_share_week_warning",
-    "$quota_share_week_danger",
-    "$quota_share_week_unknown",
-    "$quota_share_week_inline_normal",
-    "$quota_share_week_inline_warning",
-    "$quota_share_week_inline_danger",
-    "$quota_share_week_inline_unknown",
-    "$quota_share_month_normal",
-    "$quota_share_month_warning",
-    "$quota_share_month_danger",
-    "$quota_share_month_unknown",
 ];
 const ROW_GAP_MARKER: &str = "herdr-agent-quota";
 const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
@@ -514,10 +497,7 @@ fn rewrite_quota_sidebar(
         .and_then(|suffix| suffix.as_str())
         .is_some_and(|suffix| suffix.contains(ROW_GAP_MARKER));
     if !table.contains_key("row_gap") || managed_row_gap {
-        // Herdr's row_gap also splits nested vendor children. Keep panes
-        // packed and paint the user's 1-line gap with `$quota_nest_gap`.
-        let _ = row_gap;
-        let mut gap = Value::from(SidebarRowGap::FLUSH.as_i64());
+        let mut gap = Value::from(row_gap.as_i64());
         gap.decor_mut().set_suffix(format!(" # {ROW_GAP_MARKER}"));
         table.insert("row_gap", Item::Value(gap));
     }
@@ -987,38 +967,7 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
         Some(false),
     )));
     match layout {
-        SidebarLayout::Gauges => {
-            append_identity_row(rows);
-            // Filled only on a nested vendor head so a single Cursor/Grok pane
-            // keeps topic and context above its own 5h/7d/30d.
-            append_share_window_rows(rows, layout);
-            rows.push(Value::Array(styled_row(
-                "$quota_model",
-                Some(IDLE_ICON_COLOR),
-                Some(false),
-                Some(false),
-            )));
-            rows.push(Value::Array(styled_row(
-                "$quota_topic",
-                None,
-                Some(false),
-                Some(false),
-            )));
-            append_cache_error_and_context_rows(rows, layout);
-            append_window_rows(rows, layout);
-            append_pack_gap_row(rows);
-        }
-        SidebarLayout::Packed => {
-            append_identity_row(rows);
-            rows.push(Value::Array(styled_row(
-                "$quota_topic",
-                None,
-                Some(false),
-                Some(false),
-            )));
-            append_packed_quota_rows(rows);
-            append_pack_gap_row(rows);
-        }
+        SidebarLayout::Packed | SidebarLayout::Gauges => append_identity_row(rows),
         SidebarLayout::Stacked => {
             rows.push(Value::Array(identity_cells("$quota_provider", Some(true))));
             rows.push(Value::Array(styled_row(
@@ -1027,25 +976,18 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
                 Some(false),
                 Some(false),
             )));
-            rows.push(Value::Array(styled_row(
-                "$quota_topic",
-                None,
-                Some(false),
-                Some(false),
-            )));
-            append_stacked_quota_rows(rows, layout);
-            append_pack_gap_row(rows);
         }
     }
-}
-
-fn append_pack_gap_row(rows: &mut Array) {
     rows.push(Value::Array(styled_row(
-        "$quota_nest_gap",
+        "$quota_topic",
         None,
         Some(false),
         Some(false),
     )));
+    match layout {
+        SidebarLayout::Packed => append_packed_quota_rows(rows),
+        SidebarLayout::Stacked | SidebarLayout::Gauges => append_stacked_quota_rows(rows, layout),
+    }
 }
 
 fn append_identity_row(rows: &mut Array) {
@@ -1055,15 +997,31 @@ fn append_identity_row(rows: &mut Array) {
     )));
 }
 
-/// Brand icon, then the name.
+/// Brand icon in three mutually exclusive colours, then the name.
 ///
-/// Colour lives on `$quota_icon` via `rules` so the glyph stays the first
-/// identity token. A later `$quota_icon_done` twin on a Space-head row
-/// hang-indents one cell to the right. No `state_icon`: two circles on one
-/// row is what this replaces.
+/// Herdr collapses empty tokens, so only the published status twin shows. No
+/// `state_icon`: two circles on one row is what this replaces. Focus changes
+/// acknowledge only the old and new panes; unrelated green icons stay green.
 fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
     let mut row = Array::new();
-    row.push(identity_icon_token());
+    row.push(styled_token(
+        "$quota_icon",
+        Some(IDLE_ICON_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    row.push(styled_token(
+        "$quota_icon_working",
+        Some(WORKING_ICON_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    row.push(styled_token(
+        "$quota_icon_done",
+        Some(DONE_ICON_COLOR),
+        Some(false),
+        Some(false),
+    ));
     row.push(styled_token(
         name,
         Some(IDLE_ICON_COLOR),
@@ -1071,29 +1029,6 @@ fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
         Some(false),
     ));
     row
-}
-
-fn identity_icon_token() -> Value {
-    let mut value = InlineTable::new();
-    value.insert("token", Value::from("$quota_icon"));
-    value.insert("fg", Value::from(IDLE_ICON_COLOR));
-    value.insert("bold", Value::from(false));
-    value.insert("dim", Value::from(false));
-    let mut rules = Array::new();
-    rules.push(contains_fg_rule(crate::icons::DONE_TAG, DONE_ICON_COLOR));
-    rules.push(contains_fg_rule(
-        crate::icons::WORKING_TAG,
-        WORKING_ICON_COLOR,
-    ));
-    value.insert("rules", Value::Array(rules));
-    Value::InlineTable(value)
-}
-
-fn contains_fg_rule(contains: &str, fg: &str) -> Value {
-    let mut rule = InlineTable::new();
-    rule.insert("contains", Value::from(contains));
-    rule.insert("fg", Value::from(fg));
-    Value::InlineTable(rule)
 }
 
 fn append_packed_quota_rows(rows: &mut Array) {
@@ -1107,44 +1042,7 @@ fn append_packed_quota_rows(rows: &mut Array) {
     append_window_row(rows, palette);
 }
 
-fn append_share_window_rows(rows: &mut Array, layout: SidebarLayout) {
-    let palette = severity_palette(layout);
-    let mut five_hour = Array::new();
-    append_window_style_tokens(&mut five_hour, "quota_share_5h", palette);
-    rows.push(Value::Array(five_hour));
-    let mut week = Array::new();
-    append_window_style_tokens(&mut week, "quota_share_week_inline", palette);
-    append_window_style_tokens(&mut week, "quota_share_week", palette);
-    rows.push(Value::Array(week));
-    let mut month = Array::new();
-    append_window_style_tokens(&mut month, "quota_share_month", palette);
-    rows.push(Value::Array(month));
-}
-
-fn append_window_rows(rows: &mut Array, layout: SidebarLayout) {
-    let palette = severity_palette(layout);
-    let mut five_hour = Array::new();
-    append_window_style_tokens(&mut five_hour, "quota_5h", palette);
-    rows.push(Value::Array(five_hour));
-    // Both week style families live on this row so the existing publish
-    // choice (inline when 5h is empty, limits when 5h is present) still
-    // renders exactly one 7d line.
-    let mut week = Array::new();
-    append_window_style_tokens(&mut week, "quota_week_inline", palette);
-    append_window_style_tokens(&mut week, "quota_week", palette);
-    rows.push(Value::Array(week));
-    // Own row, unlike week: a scoped cap never folds onto the context row,
-    // it just renders or (far more often) does not. Fork-only: Claude is not
-    // login-scoped, so there is no `quota_share_week_scoped` twin.
-    let mut week_scoped = Array::new();
-    append_window_style_tokens(&mut week_scoped, "quota_week_scoped", palette);
-    rows.push(Value::Array(week_scoped));
-    let mut month = Array::new();
-    append_window_style_tokens(&mut month, "quota_month", palette);
-    rows.push(Value::Array(month));
-}
-
-fn append_cache_error_and_context_rows(rows: &mut Array, layout: SidebarLayout) {
+fn append_stacked_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     let palette = severity_palette(layout);
     match layout {
         // Herdr colours each token, not each row. Folding `no cached` into
@@ -1194,6 +1092,8 @@ fn append_cache_error_and_context_rows(rows: &mut Array, layout: SidebarLayout) 
         Some(false),
     )));
     match layout {
+        // Beside two coloured window rows, an uncoloured context row reads as
+        // an oversight rather than a decision.
         SidebarLayout::Gauges => {
             let mut context_row = Array::new();
             append_context_style_tokens(&mut context_row, palette);
@@ -1206,11 +1106,24 @@ fn append_cache_error_and_context_rows(rows: &mut Array, layout: SidebarLayout) 
             Some(false),
         ))),
     }
-}
-
-fn append_stacked_quota_rows(rows: &mut Array, layout: SidebarLayout) {
-    append_cache_error_and_context_rows(rows, layout);
-    append_window_rows(rows, layout);
+    let mut five_hour = Array::new();
+    append_window_style_tokens(&mut five_hour, "quota_5h", palette);
+    rows.push(Value::Array(five_hour));
+    // Both week style families live on this row so the existing publish
+    // choice (inline when 5h is empty, limits when 5h is present) still
+    // renders exactly one 7d line.
+    let mut week = Array::new();
+    append_window_style_tokens(&mut week, "quota_week_inline", palette);
+    append_window_style_tokens(&mut week, "quota_week", palette);
+    rows.push(Value::Array(week));
+    // Own row, unlike week: a scoped cap never folds onto the context row,
+    // it just renders or (far more often) does not.
+    let mut week_scoped = Array::new();
+    append_window_style_tokens(&mut week_scoped, "quota_week_scoped", palette);
+    rows.push(Value::Array(week_scoped));
+    let mut month = Array::new();
+    append_window_style_tokens(&mut month, "quota_month", palette);
+    rows.push(Value::Array(month));
 }
 
 /// Drop the tokens of every field the user turned off, then drop the rows
@@ -1277,18 +1190,12 @@ fn field_for_token(token: &str) -> Option<SidebarField> {
         | "$quota_context_normal"
         | "$quota_context_warning"
         | "$quota_context_danger" => Some(SidebarField::Context),
-        _ if token.starts_with("$quota_5h") || token.starts_with("$quota_share_5h") => {
-            Some(SidebarField::FiveHour)
-        }
+        _ if token.starts_with("$quota_5h") => Some(SidebarField::FiveHour),
         // Checked before the bare `$quota_week` prefix below, which would
         // otherwise also match `$quota_week_scoped_*` and hide the wrong row.
         _ if token.starts_with("$quota_week_scoped") => Some(SidebarField::WeekScoped),
-        _ if token.starts_with("$quota_week") || token.starts_with("$quota_share_week") => {
-            Some(SidebarField::Week)
-        }
-        _ if token.starts_with("$quota_month") || token.starts_with("$quota_share_month") => {
-            Some(SidebarField::Month)
-        }
+        _ if token.starts_with("$quota_week") => Some(SidebarField::Week),
+        _ if token.starts_with("$quota_month") => Some(SidebarField::Month),
         _ => None,
     }
 }
@@ -1658,18 +1565,12 @@ mod tests {
                     "native agent row duplicates provider/model:\n{updated}"
                 );
                 assert!(rows.iter().any(|row| row_contains_token(row, "$quota_icon")));
-                assert!(
-                    !rows
-                        .iter()
-                        .any(|row| row_contains_token(row, "$quota_icon_working")),
-                    "working colour is a rule on $quota_icon, not a later twin"
-                );
-                assert!(
-                    !rows
-                        .iter()
-                        .any(|row| row_contains_token(row, "$quota_icon_done")),
-                    "done colour is a rule on $quota_icon, not a later twin"
-                );
+                assert!(rows
+                    .iter()
+                    .any(|row| row_contains_token(row, "$quota_icon_working")));
+                assert!(rows
+                    .iter()
+                    .any(|row| row_contains_token(row, "$quota_icon_done")));
                 assert!(
                     !rows.iter().any(|row| {
                         row.as_array().is_some_and(|items| {
@@ -1750,14 +1651,8 @@ rows = [["state_icon", "agent"]]
         assert!(updated.contains("$quota_week"));
         assert!(updated.contains("$quota_group"));
         assert!(updated.contains("$quota_icon"));
-        assert!(
-            !updated.contains("$quota_icon_working"),
-            "working colour is a rule, not a twin token:\n{updated}"
-        );
-        assert!(
-            !updated.contains("$quota_icon_done"),
-            "done colour is a rule, not a twin token:\n{updated}"
-        );
+        assert!(updated.contains("$quota_icon_working"));
+        assert!(updated.contains("$quota_icon_done"));
         assert!(!updated.contains("state_icon") || updated.contains("machine")); // stock may remain elsewhere only if preserve
         assert!(!updated.contains("$quota_pad"));
         assert!(!updated.contains("\"workspace\""));
@@ -1960,7 +1855,9 @@ rows = [["state_icon", "agent"]]
         assert!(!rows
             .iter()
             .any(|row| row_contains_token(row, "$quota_provider")));
-        assert!(row_is_only_token(rows, "$quota_model"));
+        assert!(!rows
+            .iter()
+            .any(|row| row_contains_token(row, "$quota_model")));
         assert!(rows.iter().any(|row| {
             row_contains_token(row, "$quota_cache")
                 && row_contains_token(row, "$quota_cache_state")
@@ -1984,10 +1881,6 @@ rows = [["state_icon", "agent"]]
             row_contains_token(row, "$quota_week_normal")
                 && row_contains_token(row, "$quota_week_inline_normal")
                 && !row_contains_token(row, "$quota_5h_normal")
-        }));
-        assert!(rows.iter().any(|row| {
-            row_contains_token(row, "$quota_share_week_normal")
-                && row_contains_token(row, "$quota_share_week_inline_normal")
         }));
         assert_eq!(
             remove_quota_row(
@@ -2137,22 +2030,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "3d39be8499bab1d7a6e438203f07fd7f9ce5710b0ea033929b9ca4c9fb0d081c",
-                    "c5c344dba1af86e87c7b3d0fa7f2a7753ce6cbffb5e29b22dbeb7c95ebc1561d",
+                    "e4093ac77241ca545e93e4841b023a3762ac2420fc267e5b8370423724500256",
+                    "9db812a5e254c04ab2a268251999aeb33ba3e3cdd042d586f293346445f1677f",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "8172c07b95c1d5120692a3160c993f0fb0aab3914c6224aecba64f1b3879e207",
-                    "963624e8c434b0c0506a3d522663a7205dc73e0d057e124b2cb3395e8e2b5cf6",
+                    "3737b1ddef913b9eb5540cf7786d0112fd2ce6086f75c165bb6b92f0d4411cc5",
+                    "fcf1e39a22f857a555ae74c8206af3aa205bd0df566e0a69f453f453f74cf1a7",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "8172c07b95c1d5120692a3160c993f0fb0aab3914c6224aecba64f1b3879e207",
-                    "963624e8c434b0c0506a3d522663a7205dc73e0d057e124b2cb3395e8e2b5cf6",
+                    "3737b1ddef913b9eb5540cf7786d0112fd2ce6086f75c165bb6b92f0d4411cc5",
+                    "fcf1e39a22f857a555ae74c8206af3aa205bd0df566e0a69f453f453f74cf1a7",
                 ],
             ),
         ] {
@@ -2328,7 +2221,11 @@ rows = [["state_icon", "agent"]]
         );
         assert_eq!(
             configured_token_name(identity.get(1).unwrap()),
-            Some("$quota_provider_model")
+            Some("$quota_icon_working")
+        );
+        assert_eq!(
+            configured_token_name(identity.get(2).unwrap()),
+            Some("$quota_icon_done")
         );
         assert!(identity
             .iter()
@@ -2351,25 +2248,23 @@ rows = [["state_icon", "agent"]]
             idle.get("fg").and_then(Value::as_str),
             Some(IDLE_ICON_COLOR)
         );
-        let rules = idle.get("rules").and_then(Value::as_array).unwrap();
-        assert_eq!(rules.len(), 2);
-        let done = rules.get(0).unwrap().as_inline_table().unwrap();
-        assert_eq!(
-            done.get("contains").and_then(Value::as_str),
-            Some(crate::icons::DONE_TAG)
-        );
-        assert_eq!(
-            done.get("fg").and_then(Value::as_str),
-            Some(DONE_ICON_COLOR)
-        );
-        let working = rules.get(1).unwrap().as_inline_table().unwrap();
-        assert_eq!(
-            working.get("contains").and_then(Value::as_str),
-            Some(crate::icons::WORKING_TAG)
-        );
+        let working = identity
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_icon_working"))
+            .and_then(Value::as_inline_table)
+            .unwrap();
         assert_eq!(
             working.get("fg").and_then(Value::as_str),
             Some(WORKING_ICON_COLOR)
+        );
+        let done = identity
+            .iter()
+            .find(|item| configured_token_name(item) == Some("$quota_icon_done"))
+            .and_then(Value::as_inline_table)
+            .unwrap();
+        assert_eq!(
+            done.get("fg").and_then(Value::as_str),
+            Some(DONE_ICON_COLOR)
         );
     }
 
@@ -2663,7 +2558,7 @@ opencode = [["state_icon", "agent"]]
     }
 
     #[test]
-    fn plugin_owned_row_gap_stays_packed_so_nested_children_can_flush() {
+    fn plugin_owned_row_gap_follows_the_requested_spacing() {
         let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
         let flushed = add_quota_row_with(
             original,
@@ -2685,8 +2580,8 @@ opencode = [["state_icon", "agent"]]
             BrandColors::On,
         )
         .unwrap();
-        assert!(separated.contains("row_gap = 0 # herdr-agent-quota"));
-        assert!(!separated.contains("row_gap = 1"));
+        assert!(separated.contains("row_gap = 1 # herdr-agent-quota"));
+        assert!(!separated.contains("row_gap = 0"));
     }
 
     #[test]
@@ -3121,14 +3016,8 @@ mod field_tests {
         // it is how a broken pane is reported.
         assert!(bare.contains("$quota_group"), "{bare}");
         assert!(bare.contains("$quota_icon"), "{bare}");
-        assert!(
-            !bare.contains("$quota_icon_working"),
-            "working colour is a rule on $quota_icon:\n{bare}"
-        );
-        assert!(
-            !bare.contains("$quota_icon_done"),
-            "done colour is a rule on $quota_icon:\n{bare}"
-        );
+        assert!(bare.contains("$quota_icon_working"), "{bare}");
+        assert!(bare.contains("$quota_icon_done"), "{bare}");
         assert!(!bare.contains("state_icon"), "{bare}");
         assert!(!bare.contains("$quota_pad"), "{bare}");
         assert!(bare.contains("$quota_error"), "{bare}");
@@ -3244,8 +3133,6 @@ mod field_tests {
         );
         assert!(!windowless.contains("$quota_5h"), "{windowless}");
         assert!(!windowless.contains("$quota_week"), "{windowless}");
-        assert!(!windowless.contains("$quota_share_5h"), "{windowless}");
-        assert!(!windowless.contains("$quota_share_week"), "{windowless}");
         assert!(windowless.contains("$quota_context"), "{windowless}");
         assert!(windowless.contains("$quota_provider_model"), "{windowless}");
 

@@ -6,44 +6,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [1.6.1] - 2026-09-18
-
-### Fixed
-
-- Teal (unseen-done) brand icons no longer sit one cell to the right of idle
-  ones. Colour is a `rules` match on `$quota_icon` so the glyph stays the
-  first identity token; a later `$quota_icon_done` twin hang-indented under
-  the Space name. Working uses U+2061, not ZWNJ: ZWNJ joins the vendor PUA
-  glyph and the icon font then draws a yellow `?`.
-- Cursor quota follows a `cursor-agent login` account switch on macOS. The
-  CLI now stores that login in Keychain (`cursor-access-token` /
-  `cursor-user`) and no longer writes `auth.json`; the collector was falling
-  through to a stale desktop `state.vscdb` token. It now reads the CLI
-  Keychain item (after a one-time `--keychain-approve`) and does not borrow
-  the IDE token while `cli-config.json` still has `authInfo`.
-- Cursor sidebar model follows the CLI footer after a model switch:
-  `lastUsedModel` of `default` / `auto` uses `cli-config.json` instead of
-  staying labelled Auto.
-
-### Changed
-
-- Account quota windows (`5h` / `7d` / `30d`) appear on one pane per
-  login-scoped vendor in each Space (Grok, Codex, Devin, OpenCode, Cursor).
-  Extra tabs of that vendor in the same Space stay in the Agent panel with
-  their model, topic, and context; only the duplicate 5h/7d/30d rows are
-  omitted. The lexicographically first pane id in that Space keeps the
-  windows, so focus and working status do not move the shared row. A Grok
-  in another Space keeps its own windows. OpenCode and OpenCode Go are the
-  same group. Claude and Agy stay per-pane. On a wide sidebar, two or more
-  panes of the same vendor
-  in one Space nest: the head is the brand icon, vendor name, and quota;
-  every pane of that vendor still lists model, topic, and context. Extra
-  tabs have no icon and use the same Space indent as other agents, not an
-  extra nest. Narrow sidebars stay flat. Nested vendor children stay
-  flush even when the settings row gap is 1: Herdr's own `row_gap` would
-  also split those children, so the plugin packs the sidebar and paints
-  the blank after the last child (and after un-nested panes).
-
 ## [1.6.0] - 2026-09-17
 
 ### Changed
@@ -838,8 +800,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A popup dashboard pane, event-driven refresh, and a local snapshot cache that
   survives provider failures.
 
-[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.6.1...HEAD
-[1.6.1]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.6.0...v1.6.1
+[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.6.0...HEAD
 [1.6.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.5...v1.6.0
 [1.5.5]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.3...v1.5.4

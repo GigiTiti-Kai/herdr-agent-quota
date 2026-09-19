@@ -140,10 +140,8 @@ esac
             .lines()
             .map(str::to_owned)
             .collect();
-        // Refresh reads inventory; vendor-row overlay and Space-head publish
-        // each list again. None of those reads a pane.
-        let lists = calls.iter().filter(|call| *call == "agent list").count();
-        assert!((2..=4).contains(&lists), "{calls:?}");
+        // Refresh reads inventory once; publish lists again for Space heads.
+        assert_eq!(calls.iter().filter(|call| *call == "agent list").count(), 2);
         assert!(!calls.iter().any(|call| call == "pane read"));
         assert!(
             calls

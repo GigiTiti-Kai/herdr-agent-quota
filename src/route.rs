@@ -200,8 +200,6 @@ mod tests {
         AgentPane {
             pane_id: "w1:p9".to_string(),
             workspace_id: "w1".to_string(),
-            cwd: String::new(),
-            title: String::new(),
             harness,
             session: session_id.map(|value| crate::herdr::AgentSession {
                 kind: Some("id".to_string()),
