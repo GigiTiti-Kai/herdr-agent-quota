@@ -86,6 +86,23 @@ Keep the icon-colour change from v1.6.1 (`rules` on `$quota_icon` plus an
 invisible working/done suffix). It is the fix for teal icons sitting one cell
 right, and it is not part of either problem above.
 
+### Fork-local: the Space header follows Herdr's draw order (PR #5)
+
+This install runs `agent-order default`, so Herdr draws its own layout order
+and never the plugin's headroom-ranked view. Upstream elects the `$quota_group`
+head by lowest headroom regardless, which puts the header mid-Space whenever
+the first pane has more quota left than a later one. `dev` changes two things
+in `src/herdr.rs` and a sync must keep both:
+
+- `group_head_pane_ids` takes `rank_by_headroom`; off, the head is the first
+  pane in `agent list` order (ties under the quota view also fall back to that
+  order, not to `pane_id` text).
+- `list_agent_state` no longer sorts panes by `pane_id`; it keeps Herdr's order
+  with a seen-set dedup, because that order is what the panel draws.
+
+If upstream reworks head election, port the `default` branch rather than taking
+theirs.
+
 ## After a sync
 
 The plugin runs from `target/release/herdr-agent-quota` in this checkout, so a
