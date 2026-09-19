@@ -783,11 +783,10 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
         return Ok(());
     }
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-    let inventory = match list_agent_panes() {
-        Ok(all) if !all.is_empty() => all,
-        _ => panes.to_vec(),
-    };
-    let group_heads = group_head_pane_ids(&inventory, panes, &[], group_head_ranks_by_headroom());
+    // `report_icon_metadata` writes only `ICON_TOKEN_NAMES`, so head election
+    // here would be dead work (one `agent list` per focus event). Pass no
+    // heads; the `quota_group` it removes from `desired` is never reported.
+    let group_heads = BTreeMap::new();
     let mut reported = 0;
     let mut failed = Vec::new();
     for pane in panes {
@@ -1092,8 +1091,12 @@ fn collect_workspace_labels(value: &Value, labels: &mut BTreeMap<String, String>
 ///
 /// The header must sit on whichever pane Herdr draws first in the Space.
 /// `inventory` is Herdr's `agent list`, which walks workspaces → tabs → layout
-/// in the same order the Agent panel draws under Herdr's own spaces sort, so
-/// with `rank_by_headroom` off the head is simply the first pane listed.
+/// in the same order the Agent panel draws under Herdr's default `grouped`
+/// sort, so with `rank_by_headroom` off the head is simply the first pane
+/// listed. A client toggled to `priority` draws another order the plugin
+/// cannot observe (no API exposes `agent_panel_sort`), and panes whose agent
+/// maps to no known harness are drawn by Herdr but absent here; both put the
+/// header one row down and are accepted.
 /// Under the plugin's quota view Herdr sorts each Space by headroom (stable,
 /// so ties keep layout order), and the head is the tightest pane with the
 /// same tie-break. `publishing` / `tokens` overlay headroom for panes this
@@ -1157,7 +1160,10 @@ fn group_head_pane_ids(
 /// Whether Herdr's Agent panel is under this plugin's headroom-ranked view.
 ///
 /// Off (`agent-order default`) Herdr draws layout order, so the group header
-/// must follow that order, not the tightest pane.
+/// must follow that order, not the tightest pane. This reads the plugin's own
+/// preference, not the server: the two diverge after `configure` runs outside
+/// Herdr (no socket, view left in place) or until the startup hook re-applies
+/// the view after a server restart. The cost is a header one row off.
 fn group_head_ranks_by_headroom() -> bool {
     let cache = crate::cache::CacheStore::from_env().ok();
     crate::configure::resolved_agent_order(None, cache.as_ref()).is_quota()
