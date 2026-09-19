@@ -40,6 +40,52 @@ is reviewed. Ask Claude to run `fork/sync.sh` and report what changed.
 Upstream accepts contributions, but our Claude-usage-API work depends on an
 undocumented endpoint; keep it fork-local unless upstream asks for it.
 
+### v1.6.1 is rejected, and it cannot be skipped
+
+2026-09-19. v1.6.1 was merged, installed, looked at, and reverted. `dev` carries
+the merge and its revert; the resolved merge is kept on `fork/v1.6.1-merge`
+together with `fork/specs/2026-09-19-upstream-v1.6.1-merge.md`. `main` stays at
+v1.6.1.
+
+Two of its presentation changes are unwanted here:
+
+- A second tab of one login-scoped vendor in a Space loses cache, TTL and its own
+  5h/7d/30d rows. `strip_vendor_child_extras` removes them and no setting turns
+  them back on.
+- A Space member's logo gains `GROUP_MEMBER_INDENT`, which puts it two columns
+  right of every other row of that pane. Upstream's indent is correct for its own
+  default rows, where the logo is the first row after `$quota_group`. This install
+  keeps `state_text`, `terminal_title_stripped` and `$repo`/`$worktree` between
+  them, so the logo is already a continuation row and the pad overshoots.
+
+Nothing else in v1.6.1 reaches this machine: the backend work is Cursor Keychain
+reading (macOS) and Grok login-scoped quota. Claude and Codex collection is
+unchanged from v1.6.0.
+
+**A later release cannot be taken without v1.6.1.** Upstream's history is linear,
+so v1.6.2 and everything after it sit on top of those commits; `--ff-only` to a
+newer tag brings them along. Do not try to cherry-pick around it.
+
+Take the next release the normal way, then undo the two behaviours fork-locally.
+Both are small and both are load-bearing on one function each:
+
+- `src/herdr.rs::shares_login_quota` — return `false`. That empties
+  `vendor_nesting`, so every pane stays `VendorRow::Flat`: no head/child roles, no
+  `promote_shared_quota`, no `strip_vendor_child_extras`, and
+  `mark_one_quota_row_per_vendor` returns early. The `$quota_share_*` rows
+  `configure` writes stay empty and collapse.
+- `src/herdr.rs::apply_group_and_icon` — drop the two `member` uses
+  (`GROUP_MEMBER_INDENT` on the glyph, `indent_token` on a child's
+  `quota_model`). Better, and upstreamable: apply the pad only when the plugin's
+  first cell would land on row 0 once the empty `$quota_group` collapses — that is,
+  only when no preserved user row sits between them. The plugin already reads
+  Herdr's config on every publish (`configure::herdr::sidebar_width`), so the row
+  order costs no extra read.
+
+Keep the icon-colour change from v1.6.1 (`rules` on `$quota_icon` plus an
+invisible working/done suffix). It is the fix for teal icons sitting one cell
+right, and it is not part of either problem above.
+
 ## After a sync
 
 The plugin runs from `target/release/herdr-agent-quota` in this checkout, so a
