@@ -218,16 +218,17 @@ fn balance_row(
     } else {
         Severity::Normal
     };
+    // 割合は推測の満タン（初回観測・チャージ時の残高）が分母なので文字では出さない。
+    // 実額だけ見せ、バーと色は減り具合の目安に使う
     let text = match gauge_cells(shape, "bal") {
         Some(cells) => format!(
-            "{:<width$} {} {:>3}% {}",
+            "{:<width$} {} {}",
             "bal",
             meter(left, cells),
-            left,
             usd(value),
             width = GAUGE_LABEL_WIDTH
         ),
-        None => format!("bal {left}% {}", usd(value)),
+        None => format!("bal {}", usd(value)),
     };
     (text, Some(severity))
 }
@@ -377,7 +378,7 @@ mod tests {
         summary(dir.path(), "2026-09-24");
         balance(dir.path(), "ok", 7.2, 10.0);
         let values = overlaid(dir.path(), packed());
-        assert_eq!(values.quota_5h, "bal 72% $7.20");
+        assert_eq!(values.quota_5h, "bal $7.20");
         assert_eq!(values.quota_week, "day $0.21 · mon $3.40");
         assert_eq!(values.quota_week_scoped, "ses $0.050");
         assert_eq!(values.quota_month, "");
@@ -400,7 +401,7 @@ mod tests {
             values.quota_5h
         );
         assert!(
-            values.quota_5h.ends_with(" 72% $7.20"),
+            values.quota_5h.ends_with(" $7.20") && !values.quota_5h.contains('%'),
             "{}",
             values.quota_5h
         );

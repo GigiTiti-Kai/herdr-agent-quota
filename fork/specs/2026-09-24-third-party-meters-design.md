@@ -124,8 +124,9 @@ claude ─→ 中継（キーを持つ唯一のプロセス）─→ DeepSeek / 
 
 ### 4. statusLine 2 行目（dotfiles `claude/statusline.js`）
 
-- `CLAUDE_BILLING_BACKEND` がある時は、5h / 7d の代わりに `bal 72% $7.20 │ day $0.21 │ mon $3.40 │ ses $0.05` を出す。
+- `CLAUDE_BILLING_BACKEND` がある時は、5h / 7d の代わりに `bal ━━━━━━━ $7.20 │ day $0.21 │ mon $3.40 │ ses $0.05` を出す。
   `ses` は payload の `session_id` で summary から引く
+- 2026-09-24 変更: 割合（%）は文字で出さない。分母の `full` が推測値なので、実額 `$` だけを見せ、バーと色は減り具合の目安に残す。
 - OAuth の usage API（Claude サブスク）は呼ばない
 
 ### 5. 取れない時の表示
