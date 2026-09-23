@@ -771,15 +771,27 @@ fn resolved_pane_tokens(
                         }
                     }
                 }
+                let session_id = pane.session.as_ref().and_then(|session| session.id());
                 tokens_for_loaded_snapshot(
                     provider,
                     snapshot.as_ref(),
                     usable,
                     now,
-                    pane.session.as_ref().and_then(|session| session.id()),
+                    session_id,
                     row,
                 )
-                .map(|values| PaneQuotaUpdate::Replace(Box::new(values)))
+                .map(|mut values| {
+                    apply_metered(
+                        cache.root(),
+                        crate::metered::billing_dir().as_deref(),
+                        provider,
+                        session_id,
+                        &mut values,
+                        now,
+                        row.shape,
+                    );
+                    PaneQuotaUpdate::Replace(Box::new(values))
+                })
             } else {
                 // Not one of the original four, so it is never fetched by the
                 // provider list: this pane resolved to it, so this pane pays
@@ -816,6 +828,30 @@ fn resolved_pane_tokens(
         identity,
         context,
     }))
+}
+
+/// The one place a pane is recognised as a Claude Code session running a
+/// DeepSeek / OpenRouter model: its session was bound by the statusLine hook
+/// (`CLAUDE_BILLING_BACKEND`). Its Claude windows mean nothing there, so the
+/// same three slots carry balance and spend instead (`crate::metered`).
+fn apply_metered(
+    state_root: &std::path::Path,
+    billing_dir: Option<&std::path::Path>,
+    provider: Provider,
+    session_id: Option<&str>,
+    values: &mut MetadataTokens,
+    now: u64,
+    shape: crate::presentation::SidebarShape,
+) {
+    if provider != Provider::Claude {
+        return;
+    }
+    let Some(session_id) = session_id else {
+        return;
+    };
+    if let Some(backend) = crate::metered::session_backend(state_root, session_id) {
+        crate::metered::overlay(values, backend, session_id, billing_dir, now, shape);
+    }
 }
 
 /// Quota for an omp pane, from omp's own usage layer.
@@ -2147,6 +2183,69 @@ mod tests {
                 matches!(update, Some(PaneQuotaUpdate::Replace(values)) if values.quota_week == expected)
             );
         }
+    }
+
+    #[test]
+    fn only_a_claude_session_bound_to_a_billing_backend_gets_the_metered_rows() {
+        let state = tempdir().unwrap();
+        let billing = tempdir().unwrap();
+        crate::metered::record_session(state.path(), "ds", crate::metered::Backend::DeepSeek, 100)
+            .unwrap();
+        let claude_rows = || {
+            let mut values = MetadataTokens::unavailable(Provider::Claude, "x");
+            values.quota_5h = "5h 10%".to_string();
+            values
+        };
+        let shape = crate::presentation::SidebarShape::default();
+
+        let mut bound = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            Some("ds"),
+            &mut bound,
+            100,
+            shape,
+        );
+        assert_eq!(bound.quota_5h, "bal ?");
+        assert_eq!(bound.quota_provider, "DeepSeek");
+
+        let mut unbound = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            Some("other"),
+            &mut unbound,
+            100,
+            shape,
+        );
+        assert_eq!(unbound.quota_5h, "5h 10%");
+
+        let mut codex = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Codex,
+            Some("ds"),
+            &mut codex,
+            100,
+            shape,
+        );
+        assert_eq!(codex.quota_5h, "5h 10%");
+
+        let mut no_session = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            None,
+            &mut no_session,
+            100,
+            shape,
+        );
+        assert_eq!(no_session.quota_5h, "5h 10%");
     }
 
     #[test]

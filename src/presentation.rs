@@ -20,7 +20,7 @@ const MIN_METER_CELLS: usize = 4;
 const METER_FILLED: char = '\u{25b0}';
 const METER_EMPTY: char = '\u{25b1}';
 /// Align `cx`, `5h`, `7d`, and `30d` without inventing period aliases.
-const GAUGE_LABEL_WIDTH: usize = 3;
+pub(crate) const GAUGE_LABEL_WIDTH: usize = 3;
 const GAUGE_CONTEXT_LABEL: &str = "cx";
 /// How many meter cells a window row can afford at `sidebar_width` columns,
 /// or `None` when the row should render through its existing non-gauge shape
@@ -99,7 +99,7 @@ impl From<SidebarLayout> for SidebarShape {
 /// A meter that agrees with the integer printed beside it: only 0
 /// draws an empty bar and only 100 draws a full one, so a window with quota
 /// left never reads as spent.
-fn meter(printed: u32, cells: usize) -> String {
+pub(crate) fn meter(printed: u32, cells: usize) -> String {
     let filled = (f64::from(printed) * cells as f64 / 100.0).round() as usize;
     let filled = if (1..=99).contains(&printed) {
         filled.clamp(1, cells - 1)
@@ -114,7 +114,7 @@ fn meter(printed: u32, cells: usize) -> String {
 /// How many meter cells a row labelled `label` draws, or `None` when it keeps
 /// its existing non-gauge shape: another layout, a sidebar too narrow for a
 /// bar, or a label that would not fit the label column.
-fn gauge_cells(shape: SidebarShape, label: &str) -> Option<usize> {
+pub(crate) fn gauge_cells(shape: SidebarShape, label: &str) -> Option<usize> {
     match shape.layout {
         SidebarLayout::Packed | SidebarLayout::Stacked => None,
         SidebarLayout::Gauges => shape
@@ -386,9 +386,9 @@ fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
 
 /// Below this content width the logo already names the vendor, so the
 /// identity label keeps only the model (radar-style narrow reading).
-const NARROW_IDENTITY_CONTENT_WIDTH: usize = 22;
+pub(crate) const NARROW_IDENTITY_CONTENT_WIDTH: usize = 22;
 
-fn provider_model_label(provider: &str, model: &str, content_width: usize) -> String {
+pub(crate) fn provider_model_label(provider: &str, model: &str, content_width: usize) -> String {
     if model.is_empty() {
         return provider.to_string();
     }
