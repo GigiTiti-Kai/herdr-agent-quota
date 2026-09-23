@@ -500,20 +500,17 @@ fn observe_session_dir(session_dir: &Path, session_id: &str) -> Option<LocalSess
         .and_then(|signals| {
             parse_local_session(&signals, updates.as_deref(), usage.as_ref(), session_id)
         });
-    if observation
-        .as_ref()
-        .is_none_or(|observation| observation.model.is_none())
-    {
-        if let Some(model) = summary_json.as_ref().and_then(parse_summary_model) {
-            match &mut observation {
-                Some(observation) => observation.model = Some(model),
-                None => {
-                    observation = Some(LocalSessionObservation {
-                        model: Some(model),
-                        context: None,
-                        summary: None,
-                    });
-                }
+    // summary.json の current_model_id が今のモデル。/model で切り替えても
+    // signals.json の primaryModelId は最初のモデルのまま残るので、こちらを優先する
+    if let Some(model) = summary_json.as_ref().and_then(parse_summary_model) {
+        match &mut observation {
+            Some(observation) => observation.model = Some(model),
+            None => {
+                observation = Some(LocalSessionObservation {
+                    model: Some(model),
+                    context: None,
+                    summary: None,
+                });
             }
         }
     }
@@ -980,6 +977,29 @@ mod tests {
         );
         assert_eq!(files.len(), 1);
         assert!(files[0].1.ends_with("sessions/cwd/session-1"));
+    }
+
+    #[test]
+    fn a_model_switched_mid_session_shows_the_current_model() {
+        // /model で 4.6 → 4.7 に替えた実セッションの形（2026-09-24 実測）。
+        // primaryModelId は最初のモデルのまま残り、summary.json だけが今のモデルを持つ
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions/cwd/session-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("signals.json"),
+            r#"{"contextWindowUsage":63,"primaryModelId":"grok-4.6","modelsUsed":["grok-4.6","grok-4.7"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("summary.json"),
+            r#"{"current_model_id":"grok-4.7"}"#,
+        )
+        .unwrap();
+        let mut snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 1);
+        enrich_local_sessions_at(&mut snapshot, directory.path(), &["session-1".to_string()]);
+        assert_eq!(snapshot.session_models["session-1"], "grok-4.7");
+        assert_eq!(snapshot.model.as_deref(), Some("grok-4.7"));
     }
 
     #[test]
