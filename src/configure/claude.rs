@@ -68,17 +68,46 @@ pub fn uninstall_at(settings: &Path, state: &Path) -> Result<()> {
     CONFIG.uninstall(settings, state)
 }
 
+/// The session this statusLine renders for, when its launcher (`claude-ds`,
+/// `claude-or`) says the model behind it is billed by DeepSeek / OpenRouter.
+fn billing_binding<'a>(
+    backend: Option<&str>,
+    payload: &'a Value,
+) -> Option<(crate::metered::Backend, &'a str)> {
+    let backend = crate::metered::Backend::parse(backend?)?;
+    let session_id = payload.get("session_id").and_then(Value::as_str)?;
+    Some((backend, session_id))
+}
+
+/// Bind the session to its billing backend, or drop a binding left by an
+/// earlier `claude-ds` / `claude-or` run of the same session.
+fn sync_binding(state_root: &Path, backend: Option<&str>, payload: &Value, now_unix: u64) {
+    if let Some((backend, session_id)) = billing_binding(backend, payload) {
+        let _ = crate::metered::record_session(state_root, session_id, backend, now_unix);
+    } else if let Some(session_id) = payload.get("session_id").and_then(Value::as_str) {
+        let _ = crate::metered::forget_session(state_root, session_id);
+    }
+}
+
 pub fn run_statusline_hook() -> Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let mut pace = None;
+    let backend = std::env::var("CLAUDE_BILLING_BACKEND").ok();
     if let Ok(value) = serde_json::from_slice::<Value>(&input) {
         let now_unix = CacheStore::now_unix();
+        let binding = billing_binding(backend.as_deref(), &value);
         if let Ok(snapshot) = parse_statusline(&value, now_unix) {
-            pace = pace_segment(&snapshot.windows, now_unix);
+            // A Claude 5h pace means nothing to a DeepSeek / OpenRouter session.
+            if binding.is_none() {
+                pace = pace_segment(&snapshot.windows, now_unix);
+            }
             if let Ok(cache) = CacheStore::from_env() {
                 let _ = cache.save_statusline_observation(Provider::Claude, snapshot, &value);
             }
+        }
+        if let Ok(cache) = CacheStore::from_env() {
+            sync_binding(cache.root(), backend.as_deref(), &value, now_unix);
         }
     }
     let cache = CacheStore::from_env()?;
@@ -127,6 +156,38 @@ fn append_pace(mut stdout: Vec<u8>, pace: Option<&str>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launcher_backend_binds_the_payload_session() {
+        let payload = serde_json::json!({"session_id": "sX"});
+        assert_eq!(
+            billing_binding(Some("deepseek"), &payload),
+            Some((crate::metered::Backend::DeepSeek, "sX"))
+        );
+        assert_eq!(billing_binding(Some("claude"), &payload), None);
+        assert_eq!(billing_binding(None, &payload), None);
+        assert_eq!(
+            billing_binding(Some("openrouter"), &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_session_resumed_without_a_backend_loses_its_binding() {
+        let state = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({"session_id": "sX"});
+        sync_binding(state.path(), Some("deepseek"), &payload, 100);
+        assert_eq!(
+            crate::metered::session_backend(state.path(), "sX", 100),
+            Some(crate::metered::Backend::DeepSeek)
+        );
+        // 同じ session を素の claude で --resume した
+        sync_binding(state.path(), None, &payload, 200);
+        assert_eq!(
+            crate::metered::session_backend(state.path(), "sX", 200),
+            None
+        );
+    }
 
     #[test]
     fn pace_joins_the_last_status_line_and_keeps_the_trailing_newline() {

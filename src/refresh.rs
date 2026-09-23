@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -297,6 +298,14 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
         return false;
     };
     let session_id = pane.session.as_ref().and_then(|session| session.id());
+    // 第三者モデルのペインは Claude の窓を表示していない。窓の期限切れで
+    // 取り直しに入れると、関係ない Claude usage API を叩き続ける（429 の元）
+    if target.billing == Provider::Claude
+        && session_id
+            .is_some_and(|id| crate::metered::session_backend(cache.root(), id, now).is_some())
+    {
+        return false;
+    }
     if snapshot.displayed_quota_has_expired(session_id, now) {
         return true;
     }
@@ -771,15 +780,27 @@ fn resolved_pane_tokens(
                         }
                     }
                 }
+                let session_id = pane.session.as_ref().and_then(|session| session.id());
                 tokens_for_loaded_snapshot(
                     provider,
                     snapshot.as_ref(),
                     usable,
                     now,
-                    pane.session.as_ref().and_then(|session| session.id()),
+                    session_id,
                     row,
                 )
-                .map(|values| PaneQuotaUpdate::Replace(Box::new(values)))
+                .map(|mut values| {
+                    apply_metered(
+                        cache.root(),
+                        crate::metered::billing_dir().as_deref(),
+                        provider,
+                        session_id,
+                        &mut values,
+                        now,
+                        row.shape,
+                    );
+                    PaneQuotaUpdate::Replace(Box::new(values))
+                })
             } else {
                 // Not one of the original four, so it is never fetched by the
                 // provider list: this pane resolved to it, so this pane pays
@@ -816,6 +837,30 @@ fn resolved_pane_tokens(
         identity,
         context,
     }))
+}
+
+/// The one place a pane is recognised as a Claude Code session running a
+/// DeepSeek / OpenRouter model: its session was bound by the statusLine hook
+/// (`CLAUDE_BILLING_BACKEND`). Its Claude windows mean nothing there, so the
+/// same three slots carry balance and spend instead (`crate::metered`).
+fn apply_metered(
+    state_root: &std::path::Path,
+    billing_dir: Option<&std::path::Path>,
+    provider: Provider,
+    session_id: Option<&str>,
+    values: &mut MetadataTokens,
+    now: u64,
+    shape: crate::presentation::SidebarShape,
+) {
+    if provider != Provider::Claude {
+        return;
+    }
+    let Some(session_id) = session_id else {
+        return;
+    };
+    if let Some(backend) = crate::metered::session_backend(state_root, session_id, now) {
+        crate::metered::overlay(values, backend, session_id, billing_dir, now, shape);
+    }
 }
 
 /// Quota for an omp pane, from omp's own usage layer.
@@ -1528,9 +1573,23 @@ fn is_working_status(status: &str) -> bool {
     status.eq_ignore_ascii_case("working")
 }
 
+/// Linux names a running binary that was replaced on disk `<path> (deleted)`.
+/// The new build sits at `<path>`; checking the suffixed name finds nothing,
+/// so a watcher started before a rebuild would never restart.
+fn live_exe_path(path: PathBuf) -> PathBuf {
+    match path
+        .to_str()
+        .and_then(|text| text.strip_suffix(" (deleted)"))
+    {
+        Some(live) => PathBuf::from(live),
+        None => path,
+    }
+}
+
 fn current_exe_modified() -> Option<SystemTime> {
     std::env::current_exe()
         .ok()
+        .map(live_exe_path)
         .and_then(|path| std::fs::metadata(path).ok())
         .and_then(|meta| meta.modified().ok())
 }
@@ -1540,7 +1599,7 @@ fn watch_binary_is_newer(started: SystemTime, modified: Option<SystemTime>) -> b
 }
 
 fn reexec_watch(server: Option<&WatchHerdrEnvironment>, interval_seconds: u64) -> Result<()> {
-    let executable = std::env::current_exe().context("resolve plugin executable")?;
+    let executable = live_exe_path(std::env::current_exe().context("resolve plugin executable")?);
     let mut command = Command::new(executable);
     command.args([
         "watch",
@@ -2014,6 +2073,52 @@ mod tests {
     }
 
     #[test]
+    fn a_metered_pane_is_not_pulled_in_by_its_claude_windows() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
+        // 5h は 1_000 で切れている。素の Claude ペインなら取り直しの対象
+        snapshot.session_windows.insert(
+            "s1".to_string(),
+            vec![window(WindowKind::FiveHour, 40.0, 1_000)],
+        );
+        cache.save(&snapshot).unwrap();
+        let panes = [test_pane_with_session("claude-ds", Harness::Claude, "s1")];
+        let pass = |cache: &CacheStore| {
+            watch_pass_ids(
+                cache,
+                &panes,
+                &Provider::ALL,
+                &[],
+                &[],
+                &mut BTreeMap::new(),
+                1_001,
+            )
+        };
+        assert!(pass(&cache).contains(&"claude-ds".to_string()));
+
+        crate::metered::record_session(
+            cache.root(),
+            "s1",
+            crate::metered::Backend::DeepSeek,
+            1_001,
+        )
+        .unwrap();
+        assert!(!pass(&cache).contains(&"claude-ds".to_string()));
+    }
+
+    #[test]
+    fn a_replaced_binary_is_found_at_its_path_not_the_deleted_inode() {
+        assert_eq!(
+            live_exe_path(PathBuf::from(
+                "/x/target/release/herdr-agent-quota (deleted)"
+            )),
+            PathBuf::from("/x/target/release/herdr-agent-quota")
+        );
+        assert_eq!(live_exe_path(PathBuf::from("/x/q")), PathBuf::from("/x/q"));
+    }
+
+    #[test]
     fn an_idle_pane_already_showing_the_cached_windows_stays_out_of_the_pass() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
@@ -2147,6 +2252,69 @@ mod tests {
                 matches!(update, Some(PaneQuotaUpdate::Replace(values)) if values.quota_week == expected)
             );
         }
+    }
+
+    #[test]
+    fn only_a_claude_session_bound_to_a_billing_backend_gets_the_metered_rows() {
+        let state = tempdir().unwrap();
+        let billing = tempdir().unwrap();
+        crate::metered::record_session(state.path(), "ds", crate::metered::Backend::DeepSeek, 100)
+            .unwrap();
+        let claude_rows = || {
+            let mut values = MetadataTokens::unavailable(Provider::Claude, "x");
+            values.quota_5h = "5h 10%".to_string();
+            values
+        };
+        let shape = crate::presentation::SidebarShape::default();
+
+        let mut bound = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            Some("ds"),
+            &mut bound,
+            100,
+            shape,
+        );
+        assert_eq!(bound.quota_5h, "bal ?");
+        assert_eq!(bound.quota_provider, "DeepSeek");
+
+        let mut unbound = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            Some("other"),
+            &mut unbound,
+            100,
+            shape,
+        );
+        assert_eq!(unbound.quota_5h, "5h 10%");
+
+        let mut codex = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Codex,
+            Some("ds"),
+            &mut codex,
+            100,
+            shape,
+        );
+        assert_eq!(codex.quota_5h, "5h 10%");
+
+        let mut no_session = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            None,
+            &mut no_session,
+            100,
+            shape,
+        );
+        assert_eq!(no_session.quota_5h, "5h 10%");
     }
 
     #[test]
