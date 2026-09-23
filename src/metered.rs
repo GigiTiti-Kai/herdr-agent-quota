@@ -121,6 +121,7 @@ pub fn billing_dir() -> Option<PathBuf> {
 struct Summary {
     day: String,
     day_usd: f64,
+    day_unpriced: u64,
     month: String,
     month_usd: f64,
     sessions: BTreeMap<String, SessionCost>,
@@ -250,6 +251,11 @@ pub fn overlay(
         dir.and_then(|dir| read_json(&dir.join(format!("balance-{}.json", backend.key()))));
     let today = jst_day(now);
     let this_month = today.get(..7).unwrap_or_default();
+    let day_unpriced = if summary.day == today {
+        summary.day_unpriced
+    } else {
+        0
+    };
     let (day, month, month_unpriced) = (
         if summary.day == today {
             summary.day_usd
@@ -284,7 +290,7 @@ pub fn overlay(
     values.quota_week = format!(
         "day {}{} · mon {}{}",
         usd(day),
-        flag(month_unpriced),
+        flag(day_unpriced),
         usd(month),
         flag(month_unpriced)
     );
@@ -456,12 +462,27 @@ mod tests {
         write(
             dir.path(),
             "summary-deepseek.json",
-            r#"{"day":"2026-09-24","day_usd":0.21,"month":"2026-09","month_usd":3.4,
+            r#"{"day":"2026-09-24","day_usd":0.21,"day_unpriced":1,"month":"2026-09","month_usd":3.4,
             "sessions":{"sX":{"usd":0.05,"unpriced":1,"last":1}},"unpriced":2}"#,
         );
         let values = overlaid(dir.path(), packed());
         assert_eq!(values.quota_week, "day $0.21+? · mon $3.40+?");
         assert_eq!(values.quota_week_scoped, "ses $0.050+?");
+    }
+
+    #[test]
+    fn the_day_row_is_flagged_only_by_todays_unpriced_responses() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "summary-deepseek.json",
+            r#"{"day":"2026-09-24","day_usd":0.21,"day_unpriced":0,"month":"2026-09","month_usd":3.4,
+            "sessions":{},"unpriced":2}"#,
+        );
+        assert_eq!(
+            overlaid(dir.path(), packed()).quota_week,
+            "day $0.21 · mon $3.40+?"
+        );
     }
 
     #[test]

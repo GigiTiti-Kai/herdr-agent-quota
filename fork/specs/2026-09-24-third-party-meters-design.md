@@ -71,9 +71,9 @@ claude ─→ 中継（キーを持つ唯一のプロセス）─→ DeepSeek / 
   リクエストの `X-Claude-Code-Session-Id`、モデルは応答の `model`
   - openrouter: `usage.cost` をそのまま使う
   - deepseek: 単価表 × トークン数。peak / off-peak は応答を受けた時刻（UTC）で決める
-  - 単価表に無いモデル・`cost` が無い応答は `usd: null` として記録し、summary の `unpriced` を 1 増やす
+  - 単価表に無いモデル・`cost` が無い応答は `usd: null` として記録し、summary の `unpriced`（今月）と `day_unpriced`（今日）を 1 増やす。`+?` は day 行なら `day_unpriced`、mon 行なら `unpriced` で付ける
 - **ledger の1行**: `{"ts", "backend", "session", "model", "input", "cache_read", "cache_write", "output", "usd"}`
-- **summary**（backend ごと）: `{"backend", "day", "day_usd", "month", "month_usd", "sessions": {"<id>": {"usd", "last"}}, "unpriced", "updated_at"}`。
+- **summary**（backend ごと）: `{"backend", "day", "day_usd", "day_unpriced", "month", "month_usd", "sessions": {"<id>": {"usd", "last"}}, "unpriced", "updated_at"}`。
   `day` / `month` は日本時間の日付と月。日付が変わった最初の書き込みで 0 から数え直す。`sessions` は最終更新から 7 日経ったものを消す
 - **残高**: 起動時と以降 60 秒ごと。`balance-<backend>.json` の `fetched_at` が 60 秒以内なら取りに行かない（同時に動く中継どうしで取り合わない）
   - `{"status": "ok"|"error"|"key_expired", "balance", "full", "currency", "fetched_at", "last_ok_at"}`
