@@ -26,7 +26,12 @@ Claude Code のハーネスで DeepSeek（`claude-ds`）や OpenRouter（`claude
   中継（`bin/claude-or-proxy.py`）だけが stdin で受け取って持つ。statusLine の collector は `claude` の子なので、
   キーを使って残高を取ることはできない。→ **残高取得と計量は中継が担う**
 - **セッション ID**: Claude Code は毎リクエストに `X-Claude-Code-Session-Id` ヘッダを付ける
-  （`claude-cli/2.1.280`、claude-ds・claude-or の両方で確認）。中継だけでセッション別に計上できる
+  （`claude-cli/2.1.280`、claude-ds・claude-or の両方で確認）。中継だけでセッション別に計上できる。
+  値は transcript のファイル名と一致した（`~/.claude/projects/-tmp/558c8887-….jsonl` と
+  `a6269144-….jsonl`）。statusLine payload の `session_id` と、プラグインが `session_models` 等の key に
+  使っている ID も同じ transcript ID なので、中継・collector・サイドバーが同じ ID で突き合わせられる
+- **ai-billing の読み取り権限**: 機械アカウント `wsl-agents` の token で `bws-register --list` が
+  `OPENROUTER_MANAGEMENT_KEY` を列挙した（2026-09-24）。権限は読み取りのみに戻し済み
 - **OpenRouter の金額**: 応答の `message_delta.usage.cost` に実額（USD）が入る（例 `0.000797286`）。単価表は要らない
 - **DeepSeek の金額**: `usage` は `input_tokens` / `cache_read_input_tokens` / `output_tokens` だけ。
   単価表で計算する。単価（USD / 1M tokens、2026-09-19 公開の公式ページ）:
@@ -93,16 +98,29 @@ claude ─→ 中継（キーを持つ唯一のプロセス）─→ DeepSeek / 
 
 ### 3. サイドバー（herdr-agent-quota）
 
-- collector（`claude-statusline`）は env の `CLAUDE_BILLING_BACKEND` を見て、payload の `session_id` を
-  その backend に結びつけて cache に保存する（新しい optional フィールド。無ければ今の動作）
+- collector（`claude-statusline`、`src/configure/claude.rs:71`）は env の `CLAUDE_BILLING_BACKEND` を見て、
+  payload の `session_id` をその backend に結びつけて claude の cache に保存する（新しい optional フィールド
+  `session_backends`。無ければ今の動作）
+- **結びつけを判定する場所は `route.rs::resolve_with_identity` の `Harness::Claude` 分岐だけにする**。
+  今はここで全 Claude ペインが `Resolution::Subscription(Claude)`・`identity: None` になり、provider 表示・行の組み立て・
+  Space 見出し（`$quota_group`）がすべてこの結果から決まる。pane の session ID が `session_backends` にあれば:
+  - `identity` を `PaneIdentity { provider: "DeepSeek" | "OpenRouter", model }` にする
+  - Resolution は新しい `Resolution::Metered(backend)` にする。`refresh.rs` の quota 分岐（今 `Subscription` /
+    `NoSubscription` / `Indeterminate` を振り分けている所、`src/refresh.rs:801` 付近）で、`Metered` は
+    `summary` / `balance` から tokens を作る
+  - `presentation.rs` に backend 判定の `if` を散らさない。見出しと行が同じ判定から切り替わるようにするため
 - 結びついたセッションのペインでは:
   - Claude の 5h / 7d / Fab の行を出さない
   - 既存の 3 つの枠（5h・7d・週スコープ）を流用して、`bal` / `day · mon` / `ses` を出す。herdr 側のトークン名とテンプレートは変えない
+  - 行ごとの severity はそれぞれ独立に決める。今は 7d の行の見た目が 5h の枠の中身に依存している
+    （`src/herdr.rs:1529 week_style_base`）ので、`bal` の状態が `day · mon` の色に漏れないようにする
   - `bal` は残り割合のゲージ（燃料計の向き。Claude の行は使った割合なので向きが逆になる点に注意）。
     残り 20% 未満で warning、10% 未満で danger
-  - provider 表示は `Claude` でなく `DeepSeek` / `OpenRouter`
+  - `cache` / `ttl` / `context` の行は今のまま出す（statusLine と transcript から来るので第三者モデルでも意味がある）
 - `summary` と `balance` は mtime が変わった時だけ読み直す。`day` / `month` が今日・今月でなければ 0 と表示する
 - statusLine 末尾の Claude 5h の pace も付けない
+- 結びつけは statusLine が走った時に作られるので、起動してから最初に statusLine が描かれるまでの間は
+  Claude の行が出る（許容する。どれだけの間出るかは実装時に確かめる）
 
 ### 4. statusLine 2 行目（dotfiles `claude/statusline.js`）
 
