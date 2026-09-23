@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -297,6 +298,14 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
         return false;
     };
     let session_id = pane.session.as_ref().and_then(|session| session.id());
+    // 第三者モデルのペインは Claude の窓を表示していない。窓の期限切れで
+    // 取り直しに入れると、関係ない Claude usage API を叩き続ける（429 の元）
+    if target.billing == Provider::Claude
+        && session_id
+            .is_some_and(|id| crate::metered::session_backend(cache.root(), id, now).is_some())
+    {
+        return false;
+    }
     if snapshot.displayed_quota_has_expired(session_id, now) {
         return true;
     }
@@ -849,7 +858,7 @@ fn apply_metered(
     let Some(session_id) = session_id else {
         return;
     };
-    if let Some(backend) = crate::metered::session_backend(state_root, session_id) {
+    if let Some(backend) = crate::metered::session_backend(state_root, session_id, now) {
         crate::metered::overlay(values, backend, session_id, billing_dir, now, shape);
     }
 }
@@ -1564,9 +1573,23 @@ fn is_working_status(status: &str) -> bool {
     status.eq_ignore_ascii_case("working")
 }
 
+/// Linux names a running binary that was replaced on disk `<path> (deleted)`.
+/// The new build sits at `<path>`; checking the suffixed name finds nothing,
+/// so a watcher started before a rebuild would never restart.
+fn live_exe_path(path: PathBuf) -> PathBuf {
+    match path
+        .to_str()
+        .and_then(|text| text.strip_suffix(" (deleted)"))
+    {
+        Some(live) => PathBuf::from(live),
+        None => path,
+    }
+}
+
 fn current_exe_modified() -> Option<SystemTime> {
     std::env::current_exe()
         .ok()
+        .map(live_exe_path)
         .and_then(|path| std::fs::metadata(path).ok())
         .and_then(|meta| meta.modified().ok())
 }
@@ -1576,7 +1599,7 @@ fn watch_binary_is_newer(started: SystemTime, modified: Option<SystemTime>) -> b
 }
 
 fn reexec_watch(server: Option<&WatchHerdrEnvironment>, interval_seconds: u64) -> Result<()> {
-    let executable = std::env::current_exe().context("resolve plugin executable")?;
+    let executable = live_exe_path(std::env::current_exe().context("resolve plugin executable")?);
     let mut command = Command::new(executable);
     command.args([
         "watch",
@@ -2047,6 +2070,52 @@ mod tests {
             1_001,
         );
         assert!(affected.contains(&"claude-idle".to_string()));
+    }
+
+    #[test]
+    fn a_metered_pane_is_not_pulled_in_by_its_claude_windows() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
+        // 5h は 1_000 で切れている。素の Claude ペインなら取り直しの対象
+        snapshot.session_windows.insert(
+            "s1".to_string(),
+            vec![window(WindowKind::FiveHour, 40.0, 1_000)],
+        );
+        cache.save(&snapshot).unwrap();
+        let panes = [test_pane_with_session("claude-ds", Harness::Claude, "s1")];
+        let pass = |cache: &CacheStore| {
+            watch_pass_ids(
+                cache,
+                &panes,
+                &Provider::ALL,
+                &[],
+                &[],
+                &mut BTreeMap::new(),
+                1_001,
+            )
+        };
+        assert!(pass(&cache).contains(&"claude-ds".to_string()));
+
+        crate::metered::record_session(
+            cache.root(),
+            "s1",
+            crate::metered::Backend::DeepSeek,
+            1_001,
+        )
+        .unwrap();
+        assert!(!pass(&cache).contains(&"claude-ds".to_string()));
+    }
+
+    #[test]
+    fn a_replaced_binary_is_found_at_its_path_not_the_deleted_inode() {
+        assert_eq!(
+            live_exe_path(PathBuf::from(
+                "/x/target/release/herdr-agent-quota (deleted)"
+            )),
+            PathBuf::from("/x/target/release/herdr-agent-quota")
+        );
+        assert_eq!(live_exe_path(PathBuf::from("/x/q")), PathBuf::from("/x/q"));
     }
 
     #[test]

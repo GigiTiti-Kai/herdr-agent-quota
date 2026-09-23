@@ -78,15 +78,33 @@ pub fn record_session(
     map.retain(|_, binding| now.saturating_sub(binding.seen) < SESSION_TTL_SECONDS);
     map.insert(session_id.to_string(), Binding { backend, seen: now });
     std::fs::create_dir_all(state_root).context("create plugin state directory")?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec(&map)?).context("write session backends")?;
-    std::fs::rename(&temporary, &path).context("replace session backends")
+    write_bindings(&path, &map)
 }
 
-pub fn session_backend(state_root: &Path, session_id: &str) -> Option<Backend> {
+pub fn session_backend(state_root: &Path, session_id: &str, now: u64) -> Option<Backend> {
     read_json::<BTreeMap<String, Binding>>(&state_root.join(SESSION_FILE))?
         .remove(session_id)
+        .filter(|binding| now.saturating_sub(binding.seen) < SESSION_TTL_SECONDS)
         .map(|binding| binding.backend)
+}
+
+/// 同じ session が素の claude で `--resume` された時に、前の backend を外す。
+/// statusLine は毎回呼ばれるので、束縛が無ければファイルに触れない。
+pub fn forget_session(state_root: &Path, session_id: &str) -> Result<()> {
+    let path = state_root.join(SESSION_FILE);
+    let Some(mut map) = read_json::<BTreeMap<String, Binding>>(&path) else {
+        return Ok(());
+    };
+    if map.remove(session_id).is_none() {
+        return Ok(());
+    }
+    write_bindings(&path, &map)
+}
+
+fn write_bindings(path: &Path, map: &BTreeMap<String, Binding>) -> Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec(map)?).context("write session backends")?;
+    std::fs::rename(&temporary, path).context("replace session backends")
 }
 
 /// 中継と statusline.js と同じ置き場
@@ -280,6 +298,8 @@ pub fn overlay(
     values.quota_month_severity = None;
     // Claude の低残量通知と headroom 並びに第三者モデルの残高を混ぜない
     values.quota_headroom = None;
+    // Claude の usage API の失敗は、このペインの数字とは関係ない
+    values.quota_error = None;
 }
 
 #[cfg(test)]
@@ -448,9 +468,42 @@ mod tests {
         let dir = tempdir().unwrap();
         record_session(dir.path(), "old", Backend::OpenRouter, NOW - 8 * 86_400).unwrap();
         record_session(dir.path(), "sX", Backend::DeepSeek, NOW).unwrap();
-        assert_eq!(session_backend(dir.path(), "sX"), Some(Backend::DeepSeek));
-        assert_eq!(session_backend(dir.path(), "old"), None);
-        assert_eq!(session_backend(dir.path(), "never"), None);
+        assert_eq!(
+            session_backend(dir.path(), "sX", NOW),
+            Some(Backend::DeepSeek)
+        );
+        assert_eq!(session_backend(dir.path(), "old", NOW), None);
+        assert_eq!(session_backend(dir.path(), "never", NOW), None);
+    }
+
+    #[test]
+    fn a_binding_expires_on_read_and_can_be_forgotten() {
+        let dir = tempdir().unwrap();
+        record_session(dir.path(), "sX", Backend::DeepSeek, NOW).unwrap();
+        // 書き込みが止まったまま 7 日経ったものは、ファイルに残っていても効かない
+        assert_eq!(session_backend(dir.path(), "sX", NOW + 8 * 86_400), None);
+        forget_session(dir.path(), "sX").unwrap();
+        assert_eq!(session_backend(dir.path(), "sX", NOW), None);
+        // 無いものを忘れても失敗しない（ファイルも作らない）
+        let empty = tempdir().unwrap();
+        forget_session(empty.path(), "sX").unwrap();
+        assert!(!empty.path().join(SESSION_FILE).exists());
+    }
+
+    #[test]
+    fn a_claude_error_does_not_survive_on_a_metered_row() {
+        let dir = tempdir().unwrap();
+        let mut values = base();
+        values.quota_error = Some("usage 429".to_string());
+        overlay(
+            &mut values,
+            Backend::DeepSeek,
+            "sX",
+            Some(dir.path()),
+            NOW,
+            packed(),
+        );
+        assert_eq!(values.quota_error, None);
     }
 
     #[test]

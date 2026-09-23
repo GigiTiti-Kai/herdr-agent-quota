@@ -79,6 +79,16 @@ fn billing_binding<'a>(
     Some((backend, session_id))
 }
 
+/// Bind the session to its billing backend, or drop a binding left by an
+/// earlier `claude-ds` / `claude-or` run of the same session.
+fn sync_binding(state_root: &Path, backend: Option<&str>, payload: &Value, now_unix: u64) {
+    if let Some((backend, session_id)) = billing_binding(backend, payload) {
+        let _ = crate::metered::record_session(state_root, session_id, backend, now_unix);
+    } else if let Some(session_id) = payload.get("session_id").and_then(Value::as_str) {
+        let _ = crate::metered::forget_session(state_root, session_id);
+    }
+}
+
 pub fn run_statusline_hook() -> Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
@@ -96,8 +106,8 @@ pub fn run_statusline_hook() -> Result<()> {
                 let _ = cache.save_statusline_observation(Provider::Claude, snapshot, &value);
             }
         }
-        if let (Some((backend, session_id)), Ok(cache)) = (binding, CacheStore::from_env()) {
-            let _ = crate::metered::record_session(cache.root(), session_id, backend, now_unix);
+        if let Ok(cache) = CacheStore::from_env() {
+            sync_binding(cache.root(), backend.as_deref(), &value, now_unix);
         }
     }
     let cache = CacheStore::from_env()?;
@@ -158,6 +168,23 @@ mod tests {
         assert_eq!(billing_binding(None, &payload), None);
         assert_eq!(
             billing_binding(Some("openrouter"), &serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_session_resumed_without_a_backend_loses_its_binding() {
+        let state = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({"session_id": "sX"});
+        sync_binding(state.path(), Some("deepseek"), &payload, 100);
+        assert_eq!(
+            crate::metered::session_backend(state.path(), "sX", 100),
+            Some(crate::metered::Backend::DeepSeek)
+        );
+        // 同じ session を素の claude で --resume した
+        sync_binding(state.path(), None, &payload, 200);
+        assert_eq!(
+            crate::metered::session_backend(state.path(), "sX", 200),
             None
         );
     }
