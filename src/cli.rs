@@ -85,7 +85,7 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["check", "apply"])]
         uninstall: bool,
         /// Agents to configure: all, claude, codex, grok, agy, opencode, pi,
-        /// omp, devin, muse, cursor. Repeat or comma-separate to pick several. Defaults to
+        /// omp, devin, muse, cursor, hermes. Repeat or comma-separate to pick several. Defaults to
         /// every supported agent (or $HERDR_AGENT_QUOTA_AGENTS when set), so
         /// `--uninstall` alone still removes everything this plugin installed.
         #[arg(long, value_delimiter = ',')]
@@ -140,6 +140,9 @@ pub enum Command {
     /// Cursor CLI afterAgentResponse/stop/preCompact hook. Cursor invokes this;
     /// not for manual use.
     CursorHooks,
+    /// Republish the Hermes pane this process runs in. The Hermes bridge
+    /// plugin invokes this; not for manual use.
+    HermesNotify,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -186,6 +189,7 @@ pub enum AgentSelection {
     Devin,
     Muse,
     Cursor,
+    Hermes,
 }
 
 /// How quota tokens are arranged in Herdr's agent sidebar.
@@ -817,7 +821,7 @@ impl AgentSelection {
     /// New agents are appended, never inserted, so a saved complete list from
     /// an earlier build is a proper prefix of this array and can still mean
     /// "everything on" after a provider is added.
-    pub const SUPPORTED: [Harness; 10] = [
+    pub const SUPPORTED: [Harness; 11] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Grok,
@@ -828,6 +832,7 @@ impl AgentSelection {
         Harness::Devin,
         Harness::Muse,
         Harness::Cursor,
+        Harness::Hermes,
     ];
 
     /// Length of the first complete list the settings pane persisted.
@@ -854,6 +859,7 @@ impl AgentSelection {
             Self::Devin => Some(Harness::Devin),
             Self::Muse => Some(Harness::Muse),
             Self::Cursor => Some(Harness::Cursor),
+            Self::Hermes => Some(Harness::Hermes),
         }
     }
 
@@ -869,6 +875,7 @@ impl AgentSelection {
             Harness::Devin => "devin",
             Harness::Muse => "muse",
             Harness::Cursor => "cursor",
+            Harness::Hermes => "hermes",
         }
     }
 
@@ -945,6 +952,7 @@ impl AgentSelection {
             "devin" => Some(Self::Devin),
             "muse" => Some(Self::Muse),
             "cursor" => Some(Self::Cursor),
+            "hermes" => Some(Self::Hermes),
             _ => None,
         }
     }
@@ -1226,7 +1234,7 @@ mod tests {
             AgentSelection::as_cli_list(pre_muse),
             "claude,codex,grok,agy,opencode,pi,omp,devin"
         );
-        let pre_cursor = &AgentSelection::SUPPORTED[..AgentSelection::SUPPORTED.len() - 1];
+        let pre_cursor = &AgentSelection::SUPPORTED[..9];
         assert_eq!(
             AgentSelection::as_stored_list(pre_cursor),
             "only,claude,codex,grok,agy,opencode,pi,omp,devin,muse"

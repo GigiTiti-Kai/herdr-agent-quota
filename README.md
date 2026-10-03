@@ -73,7 +73,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Fields | Provider, topic, model, context, short/long/monthly quota on by default; cache and TTL optional |
 | Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
 | Low quota alert | Off or a threshold from 1% to 100% |
-| Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor |
+| Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor, Hermes |
 
 Use arrows or Space to edit, `a` to apply, and `q` to close.
 Installer options are also available through `./install.sh --help`.
@@ -92,6 +92,7 @@ Installer options are also available through `./install.sh --help`.
 | OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
 | Pi | Canonical Codex quota | Only when the recorded account matches |
 | OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
+| Hermes Agent | A bridge plugin inside Hermes | ChatGPT/Codex sessions of the default profile only: the running session reports the limits of the key it holds. Other providers show provider, model, and topic without quota |
 
 The Claude Code status line keeps the user's own statusLine output and appends
 a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
@@ -106,12 +107,24 @@ come from the identified session when available. `ttl≈` marks an estimated
 prompt-cache lifetime, not a guaranteed expiry. Topic extraction uses the
 named pane's visible screen for most agents and preserves the last topic when
 it scrolls away. Cursor and Grok use the generated session title from local
-session metadata instead; Muse uses the last prompt in its transcript.
+session metadata instead; Muse uses the last prompt in its transcript, and
+Hermes its session title.
 
 All supported working agents participate in one background watcher. Requests
 are debounced for 60 seconds, including a final refresh after a turn settles.
 OMP additionally retains its own five-minute usage cache. Idle panes sharing a
 verified quota source receive the same reading.
+
+Hermes is the exception to the watcher: its quota is never fetched by this
+plugin. Installing for Hermes adds a small Hermes plugin
+(`~/.hermes/plugins/herdr-agent-quota`) and enables it with
+`hermes plugins enable`, which also loads it into Hermes processes that are
+already running. Inside Hermes it asks Hermes's own usage fetcher about the
+key the live session holds, at most once a minute per session, and hands the 5h and 7d
+percentages to the sidebar through a private file that holds no token or
+account name. A `/model` or account switch clears the bars within a few
+seconds, also while the pane is idle; they return only for a ChatGPT/Codex
+route.
 
 Native Codex, Grok, Devin, Muse, and Cursor collectors follow the plugin's current login,
 not separate accounts for each pane. Claude/Agy do not report a reliable serving
@@ -127,6 +140,7 @@ turn failures into zero usage.
 | Session data is missing | Run `herdr integration status`; load missing integrations before restarting the affected agent |
 | Claude/Agy quota is missing | Send a turn so the session's StatusLine produces an observation |
 | OMP quota is missing | Check `omp usage --json --redact --provider <id>` |
+| Hermes quota is missing | Expected unless the session runs ChatGPT/Codex in the default profile inside a Herdr pane. Check `hermes plugins list` for `herdr-agent-quota`, then send a turn. Another CLI's quota is never borrowed |
 | Devin quota is missing | Check the CLI login and `DEVIN_CREDENTIALS_FILE` if customized |
 | Muse quota is missing | Run `muse login` (API-key logins have no subscription quota); check `MUSE_AUTH_PATH` if customized. On macOS, a `storage: "keychain"` login also needs a one-time Keychain approval: run `herdr-agent-quota refresh --provider muse --keychain-approve` and click **Always Allow** |
 | Cursor quota is missing | Run `cursor login`, or sign in to the Cursor desktop app; check `CURSOR_AUTH_FILE` if customized |

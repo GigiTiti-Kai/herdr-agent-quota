@@ -1316,6 +1316,13 @@ fn display_topic(pane: &AgentPane) -> String {
     truncate_topic(topic)
 }
 
+/// Quota window rows only: bars and the headroom they sort by, not identity.
+pub(crate) fn quota_rows_present(tokens: &BTreeMap<String, String>) -> bool {
+    QUOTA_WINDOW_TOKEN_NAMES
+        .into_iter()
+        .any(|name| tokens.contains_key(name))
+}
+
 pub(crate) fn plugin_quota_present(tokens: &BTreeMap<String, String>) -> bool {
     METADATA_TOKEN_NAMES
         .into_iter()

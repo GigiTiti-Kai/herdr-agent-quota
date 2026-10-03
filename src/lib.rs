@@ -13,6 +13,7 @@ pub mod dashboard;
 pub mod herdr;
 #[path = "herdr.rs"]
 mod herdr_base;
+pub mod hermes;
 pub mod omp;
 pub mod opencode;
 pub mod pi;

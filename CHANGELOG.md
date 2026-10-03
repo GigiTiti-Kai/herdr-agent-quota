@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Hermes Agent panes: vendor icon, Space grouping, topic, and the session's
+  current provider and model from Hermes's `state.db`, followed across
+  `/model` switches.
+- Hermes quota for ChatGPT/Codex sessions of the default profile, through a
+  Hermes plugin that `configure` installs and enables. The running session
+  reports the limits of the key it holds; any provider, endpoint, or account
+  switch clears them at once. Other providers show no quota, and another
+  CLI's quota is never borrowed.
+
 ## [1.6.0] - 2026-09-17
 
 ### Changed

@@ -4,6 +4,7 @@ pub mod cursor;
 pub mod font;
 pub mod grok;
 pub mod herdr;
+pub mod hermes;
 mod integration;
 mod statusline;
 
@@ -63,6 +64,9 @@ pub fn run(
         }
         if agents.contains(&Harness::Cursor) {
             cursor::uninstall()?;
+        }
+        if agents.contains(&Harness::Hermes) {
+            hermes::uninstall()?;
         }
         // The rows on disk were written from these settings, so uninstall
         // needs them to recognise its own work and restore the backup.
@@ -158,6 +162,9 @@ pub fn run(
         if agents.contains(&Harness::Cursor) {
             cursor::apply()?;
         }
+        if agents.contains(&Harness::Hermes) {
+            hermes::apply()?;
+        }
         integration::report_missing(agents);
     } else {
         let cache = CacheStore::from_env().ok();
@@ -183,6 +190,9 @@ pub fn run(
         }
         if agents.contains(&Harness::Cursor) {
             cursor::check()?;
+        }
+        if agents.contains(&Harness::Hermes) {
+            hermes::check()?;
         }
         integration::report_missing(agents);
     }

@@ -33,6 +33,11 @@ pub enum Provider {
     /// Cursor Agent CLI's included monthly pool, read from DashboardService.
     /// A 1:1 harness→billing mapping refreshed through `--provider all`.
     Cursor,
+    /// Account limits a live Hermes session reported about its own credential
+    /// through the bridge plugin (`src/providers/hermes.rs`). Session-local:
+    /// never fetched by this plugin, never cached, never part of a provider
+    /// refresh, and never the Codex CLI's login.
+    Hermes,
 }
 
 /// Quota collector identity. The original four keep the historical
@@ -71,6 +76,7 @@ impl Provider {
             Self::Devin => "Devin",
             Self::Muse => "Muse",
             Self::Cursor => "Cursor",
+            Self::Hermes => "Hermes",
         }
     }
 
@@ -87,6 +93,7 @@ impl Provider {
             Self::Devin => "devin-cli-billing",
             Self::Muse => "muse-code-subscription",
             Self::Cursor => "cursor-dashboard-usage",
+            Self::Hermes => "hermes-bridge",
         }
     }
 }
@@ -106,6 +113,7 @@ pub enum Harness {
     Devin,
     Muse,
     Cursor,
+    Hermes,
 }
 
 impl Harness {
@@ -123,6 +131,7 @@ impl Harness {
             "devin" | "devin-cli" => Some(Self::Devin),
             "muse" | "muse-code" => Some(Self::Muse),
             "cursor" | "cursor-agent" | "cursor-cli" => Some(Self::Cursor),
+            "hermes" | "hermes-agent" => Some(Self::Hermes),
             _ => None,
         }
     }
@@ -138,7 +147,7 @@ impl Harness {
             Self::Devin => Some(Provider::Devin),
             Self::Muse => Some(Provider::Muse),
             Self::Cursor => Some(Provider::Cursor),
-            Self::OpenCode | Self::Pi | Self::Omp => None,
+            Self::OpenCode | Self::Pi | Self::Omp | Self::Hermes => None,
         }
     }
 
@@ -968,6 +977,7 @@ impl ProviderSnapshot {
             | Provider::Agy
             | Provider::OpenCodeGo
             | Provider::Omp
+            | Provider::Hermes
             | Provider::Devin
             | Provider::Muse => {
                 window_in(&live, WindowKind::FiveHour).or_else(|| long_window(&live))
@@ -1425,6 +1435,20 @@ mod tests {
             assert_ne!(target.cache_identity(), original.cache_identity());
             assert!(!target.cache_identity().contains(provider.source()));
         }
+    }
+
+    /// Hermes is a harness with no collector this plugin can run: only the
+    /// live session knows its credential, so `Provider::Hermes` is never part
+    /// of a provider refresh and has no billing target to cache under.
+    #[test]
+    fn hermes_is_a_harness_without_a_quota_collector() {
+        for name in ["hermes", "hermes-agent"] {
+            assert_eq!(Harness::from_agent_name(name), Some(Harness::Hermes));
+            assert_eq!(Harness::billing_for_agent(name), None);
+        }
+        assert!(!Provider::ALL.contains(&Provider::Hermes));
+        assert!(!Provider::SCOPED.contains(&Provider::Hermes));
+        assert!("hermes".parse::<Provider>().is_err());
     }
 
     #[test]
