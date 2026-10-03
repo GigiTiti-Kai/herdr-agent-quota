@@ -280,7 +280,8 @@ class RealHermes(unittest.TestCase):
         reset = int(time.time()) + 3600
 
         def answer(request):
-            requests.append((str(request.url), request.headers.get("authorization") == f"Bearer {KEY_A}"))
+            bearer = {f"Bearer {KEY_A}": "A", f"Bearer {KEY_B}": "B"}
+            requests.append((str(request.url), bearer.get(request.headers.get("authorization"), "other")))
             return httpx.Response(200, json={"plan_type": "plus", "rate_limit": {
                 "primary_window": {"used_percent": 12, "limit_window_seconds": 18000, "reset_at": reset},
                 "secondary_window": {"used_percent": 34, "limit_window_seconds": 604800, "reset_at": reset},
@@ -299,7 +300,7 @@ class RealHermes(unittest.TestCase):
         self.assertEqual(self.state.observed[-1], (SESSION, True))
         filled = wait_for(lambda: (record() or {}).get("quota") and record())
         self.assertIsNotNone(filled, "no quota reached the mailbox")
-        self.assertEqual(requests, [("https://chatgpt.com/backend-api/wham/usage", True)])
+        self.assertEqual(requests, [("https://chatgpt.com/backend-api/wham/usage", "A")])
         self.assertEqual(filled["quota"]["epoch"], filled["route"]["epoch"])
         self.assertEqual(filled["quota"]["identity"], filled["route"]["identity"])
         self.assertEqual(filled["quota"]["windows"], [
@@ -315,9 +316,15 @@ class RealHermes(unittest.TestCase):
         switch_model(agent, "gpt-5.5", "openai-codex", api_key=KEY_B, base_url=CODEX_BASE, api_mode="codex_responses")
         moved = wait_for(lambda: (record() or {}).get("route", {}).get("epoch") == 2 and record())
         self.assertIsNotNone(moved, "the poller did not follow a key change on an idle session")
-        self.assertIsNone(moved["quota"])
         self.assertTrue(moved["route"]["supported"])
         self.assertNotEqual(moved["route"]["identity"], self.state.first_identity)
+        # A credential never asked before is asked at once, with its own key; A's reading
+        # never carries over into the new epoch.
+        refilled = wait_for(lambda: (record() or {}).get("quota") and record())
+        self.assertIsNotNone(refilled, "the new credential was not asked")
+        self.assertEqual((refilled["quota"]["epoch"], refilled["quota"]["identity"]),
+                         (2, refilled["route"]["identity"]))
+        self.assertEqual([who for _url, who in self.state.requests], ["A", "B"])
 
         # Not Anthropic: its SDK is an optional extra here, and Hermes answers a switch to it by
         # starting a dependency install (which the read-only mounts refuse).
@@ -329,7 +336,7 @@ class RealHermes(unittest.TestCase):
         self.assertIsNone(other["route"]["identity"])
         self.assertIsNone(other["quota"])
         self.assertEqual(len(self.state.observed), hooks_before, "no hook fired; the poller did this")
-        self.assertEqual(len(self.state.requests), 1, "nothing was asked for the new routes")
+        self.assertEqual(len(self.state.requests), 2, "nothing was asked for the unsupported route")
 
     def test_6_the_real_finalizer_releases_the_mailbox(self):
         from hermes_cli.lifecycle import finalize_session

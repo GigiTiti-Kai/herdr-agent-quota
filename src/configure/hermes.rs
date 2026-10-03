@@ -58,7 +58,10 @@ pub fn uninstall() -> Result<()> {
     let cache = CacheStore::from_env()?;
     match default_home() {
         Some(home) => uninstall_at(&home, cache.root(), &hermes_bin()),
-        None => remove_mailbox(cache.root()),
+        None => {
+            remove_mailbox(cache.root());
+            Ok(())
+        }
     }
 }
 
@@ -93,6 +96,13 @@ fn installed(directory: &Path) -> bool {
 
 pub fn apply_at(home: &Path, state: &Path, executable: &Path, hermes: &OsString) -> Result<()> {
     let directory = plugin_dir(home);
+    if is_symlink(&directory) {
+        println!(
+            "Preserved symlinked Hermes plugin at {}; the quota bridge was not installed.",
+            directory.display()
+        );
+        return Ok(());
+    }
     if directory.join("__init__.py").exists() && !installed(&directory) {
         println!(
             "Preserved user-owned Hermes plugin at {}; the quota bridge was not installed.",
@@ -136,9 +146,10 @@ pub fn apply_at(home: &Path, state: &Path, executable: &Path, hermes: &OsString)
 }
 
 pub fn uninstall_at(home: &Path, state: &Path, hermes: &OsString) -> Result<()> {
-    remove_mailbox(state)?;
     let directory = plugin_dir(home);
-    if !installed(&directory) {
+    // A symlink points at somebody's checkout; nothing in it is ours to delete.
+    if is_symlink(&directory) || !installed(&directory) {
+        remove_mailbox(state);
         return Ok(());
     }
     // Never `hermes plugins remove`: it deletes the whole directory, including
@@ -155,15 +166,26 @@ pub fn uninstall_at(home: &Path, state: &Path, hermes: &OsString) -> Result<()> 
     let _ = fs::remove_dir_all(directory.join("__pycache__"));
     // Not recursive: anything the user added beside our files stays.
     let _ = fs::remove_dir(&directory);
+    // After the disable: a bridge Hermes has just unloaded no longer writes here.
+    // Leftovers are harmless (the reader needs a live lock) and must not stop the
+    // rest of the uninstall.
+    remove_mailbox(state);
     Ok(())
 }
 
-fn remove_mailbox(state: &Path) -> Result<()> {
-    match fs::remove_dir_all(state.join(MAILBOX_DIR)) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(error).context("remove Hermes bridge mailbox")
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+fn remove_mailbox(state: &Path) {
+    let mailbox = state.join(MAILBOX_DIR);
+    if let Err(error) = fs::remove_dir_all(&mailbox) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            println!(
+                "Left the Hermes bridge mailbox at {}: {error}",
+                mailbox.display()
+            );
         }
-        _ => Ok(()),
     }
 }
 
@@ -386,6 +408,24 @@ mod tests {
             uninstall_at(&fixture.home(), &fixture.state(), &hermes).unwrap();
             assert_eq!(fixture.calls().len(), calls.len());
         }
+    }
+
+    /// A developer's symlink to a checkout is neither written into nor emptied.
+    #[test]
+    fn a_symlinked_plugin_directory_is_left_alone() {
+        let fixture = Fixture::new();
+        let checkout = fixture.root.path().join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(checkout.join("__init__.py"), INIT_PY).unwrap();
+        fs::write(checkout.join("plugin.yaml"), MANIFEST).unwrap();
+        fs::create_dir_all(fixture.home().join("plugins")).unwrap();
+        std::os::unix::fs::symlink(&checkout, fixture.plugin()).unwrap();
+        let hermes = fixture.hermes(0);
+        fixture.apply(&hermes);
+        assert!(!checkout.join("bridge.json").exists());
+        uninstall_at(&fixture.home(), &fixture.state(), &hermes).unwrap();
+        assert!(checkout.join("__init__.py").exists() && checkout.join("plugin.yaml").exists());
+        assert!(fixture.calls().is_empty());
     }
 
     #[test]

@@ -69,6 +69,9 @@ NOTIFY_MIN_INTERVAL_SECONDS = 2.0
 NOTIFY_CHILD_SECONDS = 15.0
 # Ticks an untracked agent is tolerated before its session is forgotten (about a minute).
 MISSING_TICKS_BEFORE_DROP = 30
+# Credentials one session remembers a debounce for. A pool rarely holds more; past this the
+# memory is dropped, which only lets an old entry be asked once more.
+MAX_REMEMBERED_ATTEMPTS = 16
 MAX_BRIDGE_CONFIG_BYTES = 4096
 PRUNE_AFTER_SECONDS = 60 * 60.0
 
@@ -235,6 +238,7 @@ class _Session:
     __slots__ = (
         "session_id", "lock_fd", "epoch", "signature", "model", "quota", "wants_fetch",
         "next_fetch_at", "failures", "fetch_token", "fetch_started", "missing_ticks", "written_at",
+        "attempts",
     )
 
     def __init__(self, session_id, lock_fd):
@@ -251,6 +255,7 @@ class _Session:
         self.fetch_started = 0.0
         self.missing_ticks = 0
         self.written_at = 0.0
+        self.attempts = {}  # identity -> (next_fetch_at, failures) of credentials not in use
 
 
 class Bridge:
@@ -274,6 +279,7 @@ class Bridge:
         # Never written anywhere: identities from two processes are not comparable, and a
         # mailbox identity cannot be linked back to a token.
         self._hmac_key = secrets.token_bytes(32)
+        self._pid = os.getpid()
         self._lock = threading.RLock()
         self._sessions = {}
         self._fetch_in_flight = None
@@ -317,6 +323,10 @@ class Bridge:
 
     def close(self):
         """Unload or process exit: stop the poller and release every mailbox."""
+        if os.getpid() != self._pid:
+            # A forked child inherits the atexit hook, and maybe a lock held mid-tick. The
+            # mailbox belongs to the parent, which is still running.
+            return
         with self._lock:
             if self._closed:
                 return
@@ -336,6 +346,19 @@ class Bridge:
             signature, model, _secret = read_route(agent, self._hmac_key)
             session.missing_ticks = 0
         if signature != session.signature:
+            # Debounce and backoff belong to the credential that was asked, not the session:
+            # a pool that moves on to a fresh entry is asked about it at once, and coming back
+            # to an entry that was failing does not reset that entry's wait.
+            old = session.signature.identity if session.signature is not None else None
+            if signature.identity != old:
+                if old is not None:
+                    session.attempts[old] = (session.next_fetch_at, session.failures)
+                if signature.identity is not None:
+                    session.next_fetch_at, session.failures = session.attempts.pop(
+                        signature.identity, (0.0, 0)
+                    )
+                if len(session.attempts) > MAX_REMEMBERED_ATTEMPTS:
+                    session.attempts.clear()
             # A new epoch: whatever was known about the previous credential is gone before
             # anything is fetched for the new one.
             session.epoch += 1

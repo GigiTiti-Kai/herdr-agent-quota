@@ -253,6 +253,24 @@ class MailboxTests(BridgeCase):
         self.bridge.tick()
         self.assertEqual(len(self.notified), nudges + 1)
 
+    def test_a_new_credential_is_asked_at_once_but_a_returning_one_keeps_its_debounce(self):
+        self.answer = None  # every attempt fails, so the backoff for KEY_A grows
+        self.bridge.observe("s1")
+        self.bridge.tick()
+        self.advance(bridge_module.DEBOUNCE_SECONDS * 2 + 1)
+        self.bridge.observe("s1", activity=True)
+        self.bridge.tick()
+        self.assertEqual(self.fetched, [(CODEX_BASE, KEY_A)] * 2)
+        self.answer = WEEK
+        self.agents["s1"].set_key(KEY_B)  # the pool moved on, maybe because A ran out
+        self.bridge.tick()
+        self.assertEqual(self.fetched[-1], (CODEX_BASE, KEY_B))
+        self.assertEqual(self.record()["quota"]["windows"], WEEK)
+        self.agents["s1"].set_key(KEY_A)  # back to A inside A's backoff
+        self.bridge.tick()
+        self.assertEqual(len(self.fetched), 3, "A is still backing off")
+        self.assertIsNone(self.record()["quota"])
+
     def test_a_credential_rotation_drops_the_quota_before_anything_is_fetched(self):
         self.bridge.observe("s1")
         self.bridge.tick()
@@ -265,13 +283,10 @@ class MailboxTests(BridgeCase):
         self.assertEqual(rotated["route"]["provider"], "openai-codex")
         self.assertNotEqual(rotated["route"]["identity"], old["route"]["identity"])
         self.assertIsNone(rotated["quota"])
-        # Still inside the debounce: unknown stays unknown rather than refetching at once.
-        self.bridge.tick()
-        self.assertIsNone(self.record()["quota"])
-        self.assertEqual(len(self.fetched), 1)
-        self.advance(60)
+        # The new credential has never been asked, so the first tick asks about it.
         self.bridge.tick()
         fresh = self.record()
+        self.assertEqual(len(self.fetched), 2)
         self.assertEqual(self.fetched[-1], (CODEX_BASE, KEY_B))
         self.assertEqual(fresh["quota"]["epoch"], 2)
         self.assertEqual(fresh["quota"]["identity"], fresh["route"]["identity"])
@@ -281,7 +296,7 @@ class MailboxTests(BridgeCase):
         self.bridge.observe("s1")
         self.bridge.tick()
         self.agents["s1"].set_key(KEY_B, entry_id="entry-1")
-        self.bridge.tick()
+        self.bridge.observe("s1")
         record = self.record()
         self.assertEqual(record["route"]["epoch"], 2)
         self.assertIsNone(record["quota"])
@@ -360,6 +375,19 @@ class MailboxTests(BridgeCase):
         self.bridge.close()
         self.assertEqual(os.listdir(self.dir), [])
         self.bridge.observe("s1")  # after unload nothing is tracked again
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_a_forked_child_exiting_leaves_the_parents_mailbox_alone(self):
+        self.bridge.observe("s1")
+        pid = os.fork()
+        if pid == 0:  # the child: its atexit hook runs close(); exit without unittest's teardown
+            try:
+                self.bridge.close()
+            finally:
+                os._exit(0)
+        os.waitpid(pid, 0)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["s1.json", "s1.lock"])
+        self.bridge.close()
         self.assertEqual(os.listdir(self.dir), [])
 
     def test_the_lock_is_held_for_as_long_as_the_producer_tracks_the_session(self):
@@ -549,7 +577,11 @@ class PollerThreadTests(BridgeCase):
         while self.record()["route"]["epoch"] != 2 and time.time() < deadline:
             time.sleep(0.01)
         self.assertEqual(self.record()["route"]["epoch"], 2)
-        self.assertIsNone(self.record()["quota"])
+        # A's reading is gone; the only quota this epoch may carry is B's own.
+        quota = self.record()["quota"]
+        if quota is not None:
+            self.assertEqual((quota["epoch"], quota["identity"]), (2, self.record()["route"]["identity"]))
+            self.assertEqual(self.fetched[-1], (CODEX_BASE, KEY_B))
         self.bridge.close()
         poller.join(10)
         self.assertFalse(poller.is_alive())
