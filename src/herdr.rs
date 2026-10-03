@@ -14,8 +14,9 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 38] = [
+const METADATA_TOKEN_NAMES: [&str; 39] = [
     "quota_group",
+    "quota_group_gap",
     "quota_pad",
     "quota_icon",
     "quota_icon_working",
@@ -132,8 +133,9 @@ const CONTEXT_TOKEN_NAMES: [&str; 4] = [
 /// Values that must reach the pane in the *same* report that changed them,
 /// even when the budget is tight: the identity, the live diagnostics, and the
 /// inline week variants, whose styling flips as soon as a 5h window appears.
-const ROWS_THAT_MUST_NOT_LAG: [&str; 17] = [
+const ROWS_THAT_MUST_NOT_LAG: [&str; 18] = [
     "quota_group",
+    "quota_group_gap",
     "quota_icon",
     "quota_provider",
     "quota_model",
@@ -990,7 +992,10 @@ fn sync_sibling_group_headers(
             .get("quota_group")
             .filter(|value| !value.is_empty())
             .cloned();
-        if want == have {
+        // The gap row comes and goes with the header.
+        let gap_matches = sibling.tokens.get(GROUP_GAP_TOKEN).map(String::as_str)
+            == want.as_ref().map(|_| GROUP_GAP);
+        if want == have && gap_matches {
             continue;
         }
         if pane_is_scrolled(executable, &sibling.pane_id) {
@@ -1010,8 +1015,10 @@ fn sync_sibling_group_headers(
             .args(["--ttl-ms", METADATA_TTL_MS]);
         if let Some(label) = &want {
             command.args(["--token", &format!("quota_group={label}")]);
+            command.args(["--token", &format!("{GROUP_GAP_TOKEN}={GROUP_GAP}")]);
         } else {
             command.args(["--clear-token", "quota_group"]);
+            command.args(["--clear-token", GROUP_GAP_TOKEN]);
         }
         let output = command.output().context("report group header to Herdr")?;
         if !output.status.success() {
@@ -1233,11 +1240,11 @@ fn apply_group_and_icon(
     group_heads: &BTreeMap<String, String>,
     workspace_labels: &BTreeMap<String, String>,
 ) {
-    let mark = crate::icons::for_harness(pane.harness);
+    let mark = crate::icons::sidebar_mark(pane.harness);
     let active = pane.icon_status().icon_token();
     for token in ICON_TOKEN_NAMES {
         if token == active {
-            desired.insert(token.to_string(), mark.to_string());
+            desired.insert(token.to_string(), mark.clone());
         } else {
             desired.remove(token);
         }
@@ -1247,10 +1254,19 @@ fn apply_group_and_icon(
     // report clears it. Blind preserve is what left `ifs` on two panes.
     if let Some(label) = group_label_for(pane, group_heads, workspace_labels) {
         desired.insert("quota_group".to_string(), label);
+        desired.insert(GROUP_GAP_TOKEN.to_string(), GROUP_GAP.to_string());
     } else {
         desired.remove("quota_group");
+        desired.remove(GROUP_GAP_TOKEN);
     }
 }
+
+/// The blank row between a Space header and the icon under it, which the
+/// enlarged mark draws up into. Every other icon has the `row_gap` blank
+/// above it already. A whitespace value is dropped by Herdr, so the row holds
+/// one U+2800 (see [`crate::icons::SIDEBAR_RESERVE`]).
+const GROUP_GAP_TOKEN: &str = "quota_group_gap";
+const GROUP_GAP: &str = "\u{2800}";
 
 fn desired_tokens(
     values: &MetadataTokens,
@@ -1817,13 +1833,20 @@ mod tests {
             head_desired.get("quota_group").map(String::as_str),
             Some("ifs")
         );
+        assert_eq!(
+            head_desired.get(GROUP_GAP_TOKEN).map(String::as_str),
+            Some(GROUP_GAP),
+            "the header gets the blank row the icon below it draws into"
+        );
 
         let mut sibling_desired = sibling.tokens.clone();
+        sibling_desired.insert(GROUP_GAP_TOKEN.to_string(), GROUP_GAP.to_string());
         apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &labels);
         assert!(!sibling_desired.contains_key("quota_group"));
+        assert!(!sibling_desired.contains_key(GROUP_GAP_TOKEN));
         assert_eq!(
             sibling_desired.get("quota_icon").map(String::as_str),
-            Some(crate::icons::for_harness(sibling.harness)),
+            Some(crate::icons::sidebar_mark(sibling.harness).as_str()),
             "member logo stays bare: Herdr indents by row index, so the logo \
              row is already hang-indented on heads and members alike"
         );
@@ -1855,7 +1878,7 @@ mod tests {
         assert_eq!(heads.get("w1").map(String::as_str), Some("w1:p2"));
         assert_eq!(
             head_desired.get("quota_icon").map(String::as_str),
-            Some(crate::icons::for_harness(head.harness)),
+            Some(crate::icons::sidebar_mark(head.harness).as_str()),
             "head logo stays bare; Herdr hang-indents the row"
         );
 
@@ -1872,7 +1895,7 @@ mod tests {
             working_desired
                 .get("quota_icon_working")
                 .map(String::as_str),
-            Some(crate::icons::for_harness(working.harness)),
+            Some(crate::icons::sidebar_mark(working.harness).as_str()),
             "working panes publish the yellow brand icon"
         );
         assert!(!working_desired.contains_key("quota_icon"));

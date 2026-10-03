@@ -7,13 +7,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 55] = [
+const QUOTA_ROW_MARKERS: [&str; 56] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
     "$quota_icon_working",
     "$quota_icon_done",
     "$quota_group",
+    "$quota_group_gap",
     "$quota_pad",
     "$quota_provider",
     "$quota_model",
@@ -580,20 +581,19 @@ fn build_managed_rows(
     let user_count = preserved.len();
     let mut updated_rows = preserved;
     append_quota_rows(&mut updated_rows, layout);
-    // Keep `$quota_group` first so Space aggregation stays the head row;
-    // user-owned extras (pane/git/other plugins) sit directly under it.
+    // Keep `$quota_group` first so Space aggregation stays the head row, then
+    // its gap, then the icon row: the enlarged icon draws up into the row
+    // above it, which must be blank (the gap, or `row_gap` when there is no
+    // header). User-owned extras (pane/git/other plugins) follow the icon.
     if user_count > 0 {
         let mut reordered = Array::new();
-        reordered.push(
-            updated_rows
-                .get(user_count)
-                .expect("group header follows preserved rows")
-                .clone(),
-        );
+        for index in user_count..user_count + HEAD_QUOTA_ROWS {
+            reordered.push(updated_rows.get(index).expect("head quota row").clone());
+        }
         for index in 0..user_count {
             reordered.push(updated_rows.get(index).expect("preserved row").clone());
         }
-        for index in (user_count + 1)..updated_rows.len() {
+        for index in (user_count + HEAD_QUOTA_ROWS)..updated_rows.len() {
             reordered.push(updated_rows.get(index).expect("quota row").clone());
         }
         updated_rows = reordered;
@@ -956,6 +956,10 @@ fn is_standalone_agent_row(row: &Array) -> bool {
     row.len() == 1 && row.get(0).and_then(Value::as_str) == Some("agent")
 }
 
+/// `$quota_group`, `$quota_group_gap`, and the row carrying `$quota_icon*`:
+/// the first rows [`append_quota_rows`] writes, in every layout.
+const HEAD_QUOTA_ROWS: usize = 3;
+
 fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     // Group header first: empty on non-head panes so Herdr collapses the row.
     // The stock machine/workspace/tab identity is omitted on purpose — the
@@ -965,6 +969,13 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
         "$quota_group",
         None,
         Some(true),
+        Some(false),
+    )));
+    // Published only beside a header: the blank the enlarged icon draws into.
+    rows.push(Value::Array(styled_row(
+        "$quota_group_gap",
+        None,
+        Some(false),
         Some(false),
     )));
     match layout {
@@ -1516,7 +1527,7 @@ mod tests {
                 let agents = &parsed["ui"]["sidebar"]["agents"];
                 let shared = agents["rows"].as_array().unwrap();
                 assert_eq!(
-                    shared.get(1).unwrap().to_string().trim(),
+                    shared.get(HEAD_QUOTA_ROWS).unwrap().to_string().trim(),
                     custom.to_string()
                 );
                 // Takeover installs shared rows only; brand-on no longer
@@ -1639,7 +1650,12 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(row_is_only_token(provider, "$quota_group"));
-        assert_eq!(token_names(provider.get(1).unwrap()), ["agent"]);
+        assert_eq!(token_names(provider.get(1).unwrap()), ["$quota_group_gap"]);
+        assert!(row_contains_token(provider.get(2).unwrap(), "$quota_icon"));
+        assert_eq!(
+            token_names(provider.get(HEAD_QUOTA_ROWS).unwrap()),
+            ["agent"]
+        );
         assert_eq!(add_quota_row(&updated).unwrap(), updated);
     }
 
@@ -1789,7 +1805,7 @@ rows = [["state_icon", "agent"]]
             .iter()
             .position(|row| row_contains_token(row, "$quota_topic"))
             .unwrap();
-        assert_eq!(group_index + 1, identity_index);
+        assert_eq!(group_index + 2, identity_index, "the gap row sits between");
         assert_eq!(identity_index, provider_index);
         assert_eq!(provider_index + 1, model_index);
         assert_eq!(model_index + 1, topic_index);
@@ -2032,22 +2048,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "e4093ac77241ca545e93e4841b023a3762ac2420fc267e5b8370423724500256",
-                    "9db812a5e254c04ab2a268251999aeb33ba3e3cdd042d586f293346445f1677f",
+                    "caa0e56ca29d6c7dc47023bac0e41262510a1194c074ea3e21cde244b4b78745",
+                    "97b3d87b6ba39cf831f8ac083f94cce6ce968e52f147d9928dc8baedda816bed",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "3737b1ddef913b9eb5540cf7786d0112fd2ce6086f75c165bb6b92f0d4411cc5",
-                    "fcf1e39a22f857a555ae74c8206af3aa205bd0df566e0a69f453f453f74cf1a7",
+                    "2effe7bc7c6d750c941e862c67b514ae70678bbaab6953f49b8ba6e69f4d80f1",
+                    "e93023080873ecb19f7141bbb12112fef1e7762938669d0be32bc4a697c234e3",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "3737b1ddef913b9eb5540cf7786d0112fd2ce6086f75c165bb6b92f0d4411cc5",
-                    "fcf1e39a22f857a555ae74c8206af3aa205bd0df566e0a69f453f453f74cf1a7",
+                    "2effe7bc7c6d750c941e862c67b514ae70678bbaab6953f49b8ba6e69f4d80f1",
+                    "e93023080873ecb19f7141bbb12112fef1e7762938669d0be32bc4a697c234e3",
                 ],
             ),
         ] {

@@ -26,10 +26,36 @@ pub fn for_harness(harness: Harness) -> &'static str {
     }
 }
 
+/// Three cells the sidebar reserves after the mark.
+///
+/// The terminal draws the mark larger than one cell (WezTerm's fallback font
+/// `scale`), and only lets a glyph spill into blanks in its own attribute run,
+/// so the blanks travel inside the token value. Herdr trims both ends of every
+/// value, so the run ends on U+2800 BRAILLE PATTERN BLANK: not whitespace, one
+/// cell wide, no ink. A terminal without a Braille-capable font shows a box
+/// in that cell, and copying the sidebar copies it.
+pub const SIDEBAR_RESERVE: &str = "  \u{2800}";
+
+/// The value published for a harness's `$quota_icon*` token: mark plus room.
+pub fn sidebar_mark(harness: Harness) -> String {
+    format!("{}{SIDEBAR_RESERVE}", for_harness(harness))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::AgentSelection;
+
+    /// Four cells survive Herdr's trim: the mark, two blanks, U+2800.
+    #[test]
+    fn the_published_mark_keeps_its_reserved_cells_through_a_trim() {
+        for harness in AgentSelection::SUPPORTED {
+            let value = sidebar_mark(harness);
+            assert_eq!(value.trim(), value, "{harness:?}");
+            assert_eq!(value.chars().count(), 4, "{harness:?}");
+            assert!(value.starts_with(for_harness(harness)));
+        }
+    }
 
     #[test]
     fn every_supported_harness_has_a_one_cell_mark() {
