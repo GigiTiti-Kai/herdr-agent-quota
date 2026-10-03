@@ -971,7 +971,8 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
         Some(true),
         Some(false),
     )));
-    // Published only beside a header: the blank the enlarged icon draws into.
+    // A blank row on every pane: the enlarged icon draws up into it, and it
+    // keeps the icon row a continuation row (same indent) on heads and members.
     rows.push(Value::Array(styled_row(
         "$quota_group_gap",
         None,
