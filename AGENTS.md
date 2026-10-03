@@ -54,7 +54,7 @@ Concretely, this means:
 |---|---|---|
 | `startup` | Herdr's `[[startup]]` hook | No |
 | `refresh` | manual action, `startup` | No |
-| `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON`, and never a Pi, omp, Muse, or Cursor pane — their transcripts carry the evidence |
+| `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON`, and never a Pi, omp, Muse, Cursor, or Hermes pane — their transcripts or session rows carry the evidence |
 | `focus` | `pane.focused`, `workspace.focused`, `tab.focused` | No |
 | `watch` | detached from a working status event | No (agent metadata only) |
 
@@ -71,7 +71,7 @@ every time they press Enter. Budget accordingly.
 
 The working event starts one global `watch` pulse. It calls `herdr agent list`
 once per configured interval for every supported harness, including Pi, OMP,
-OpenCode, Muse, and Cursor. Event-spawned watchers defer their first poll. They resolve local
+OpenCode, Muse, Cursor, and Hermes. Event-spawned watchers defer their first poll. They resolve local
 billing targets, refresh active/settling targets, and publish to siblings with
 the same target without reading terminal output. A finishing target stays in
 the pass until the 60-second debounce has elapsed. The interval defaults to
@@ -222,6 +222,72 @@ session start, so an already-running pane must be restarted. Do not install a
 Cursor `statusLine` — that setting replaces the native CLI footer. Cursor publishes no prompt-cache lifetime, so there is
 no TTL. Cache identity is `sha256("cursor\0" || token)`.
 
+## Hermes quota comes from inside the Hermes process, or not at all
+
+Hermes Agent runs any provider, and `/model` changes it mid-session. The
+identity evidence is the session's row in `<hermes home>/state.db`
+(`HERMES_HOME`, else `~/.hermes`): open it read-only and select only `model`,
+`billing_provider`, `model_config`, `title`. Never read `messages`, and never
+open `auth.json`. `billing_mode` is not a key — one provider carries several.
+
+That row names a provider, not an account. Hermes keeps the serving credential
+in memory and can rotate between pooled credentials mid-session; nothing on
+disk identifies it, and `hermes usage` reports the credential a *new* session
+would pick. So this plugin has no Hermes collector. `route` returns
+`Indeterminate` for every Hermes pane, and the only quota a Hermes pane can
+show is the one its own process published:
+
+- **The bridge** (`assets/hermes/herdr-agent-quota/`, installed by
+  `src/configure/hermes.rs` into the default profile's `plugins/`). It is a
+  Hermes plugin. Inside the Hermes process it reads the live agent's provider,
+  endpoint, and key together, asks Hermes's own `fetch_account_usage` about
+  exactly that key, and writes `hermes-bridge/<session id>.json` in this
+  plugin's state directory. No token, email, credential label, or provider
+  payload is written: the account is an HMAC under a key that never leaves the
+  process.
+- **`openai-codex` over `https://chatgpt.com/backend-api` only.** Every other
+  route is written as unsupported with no quota. Do not widen this by asking
+  another credential: Hermes's Anthropic fetcher ignores the key it is handed.
+- **Epochs.** Any change of provider, endpoint, pool entry, or key bumps the
+  epoch and drops the quota before anything is fetched. An answer that arrives
+  for an older epoch is discarded. `src/providers/hermes.rs` shows a quota
+  only when schema, session, pane, profile, provider, epoch, and identity all
+  match, the timestamps are not in the future, and the producer still holds
+  `<session id>.lock`. A dead Hermes process therefore shows nothing. A live
+  one whose poller died is caught by the route check instead: every look at
+  the live agent re-stamps `route.observed_at` at most every 30 seconds,
+  without a sidebar nudge, and the reader drops a route older than 120
+  seconds. The fetch age is separate and does not expire the quota.
+- **Never fill a Hermes pane from the Codex, Claude, Grok, or Agy collectors**
+  because the provider or model name looks alike. Bars that match no valid
+  mailbox record are stale; `event`, a full refresh, and the watcher's
+  `hermes_pane_is_stale` remove them.
+- **Idle `/model`.** No Hermes hook fires for it. The bridge's two-second
+  poller sees the route change and runs `herdr-agent-quota hermes-notify`,
+  which republishes that one pane. It does not read the pane, start a watcher,
+  or save the Herdr connection. `hermes_pane_is_stale` is the fallback while a
+  watcher is alive.
+- **`_live_agents` is the only private Hermes surface.** The plugin manager's
+  `_cli_ref.agent` and `tui_gateway.server._sessions`. If either moves
+  upstream the bridge finds no agent and writes no quota.
+- **Enabling is not passive.** Hermes plugins are opt-in. `configure` runs
+  `hermes plugins enable herdr-agent-quota` once (the `.enabled` marker), and
+  that command also asks running Hermes processes to load the plugin. Both
+  `enable` and `disable` submit the new selection to Hermes's package manager
+  (`sync_venv` under its install lock) before saving it.
+  Uninstall runs `hermes plugins disable` and then deletes only the files it
+  installed. Never `hermes plugins remove`: that deletes the whole plugin
+  directory, including what the user put beside our files. Hermes's
+  `config.yaml` then keeps the name under `plugins.disabled`; this plugin
+  does not edit that file.
+
+Do not run a Hermes interpreter on the host to test the bridge. Its bootstrap
+syncs dependencies and rewrites the real launchers when it can write.
+`tests/hermes_plugin/real_hermes_sandbox.sh` mounts Hermes read-only without a
+network; `tests/hermes_plugin/test_real_hermes.py` refuses to start anywhere
+else. That test is `#[ignore]`d in `tests/hermes_plugin.rs` because it needs a
+local Hermes install and bubblewrap.
+
 ## Herdr state this plugin owns outside a pane
 
 Two things reach past the pane metadata, and both are global to the Herdr
@@ -346,7 +412,7 @@ Wiring the new name is not enough. Also:
    `ProviderSelection`, the fetch path, and a cache identity. If Herdr has
    no integration for it, `integration_id` returns `None` (Agy, Muse).
 5. If its own transcript is the evidence, `event` must not read the pane
-   (Pi, omp, Muse, Cursor).
+   (Pi, omp, Muse, Cursor, Hermes).
 6. Tests that name agents must walk `SUPPORTED`, not a copied list. A copied
    list is how Muse missed the watcher-alive check and the "installs
    everything" sidebar assertions.

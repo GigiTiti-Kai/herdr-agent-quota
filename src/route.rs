@@ -24,6 +24,9 @@ pub struct ResolvedPane {
     /// subscription is paying; this says which of omp's accounts, and where to
     /// ask omp about it.
     pub omp: Option<crate::omp::OmpEvidence>,
+    /// Present only for a Hermes pane whose session row was read. Its title
+    /// is the pane's topic.
+    pub hermes: Option<crate::hermes::HermesSession>,
 }
 
 pub fn resolve_with_identity(pane: &AgentPane) -> ResolvedPane {
@@ -58,12 +61,58 @@ pub fn resolve_with_identity(pane: &AgentPane) -> ResolvedPane {
                 pane.session.as_ref().and_then(|session| session.path()),
             )
         }
+        Harness::Hermes => {
+            return resolve_hermes_with_identity(
+                pane.session.as_ref().and_then(|session| session.id()),
+                crate::hermes::home_from_env(),
+            )
+        }
     };
     ResolvedPane {
         resolution,
         identity: None,
         context: None,
         omp: None,
+        hermes: None,
+    }
+}
+
+/// A Hermes pane shows what its session row says right now, so a `/model`
+/// switch is followed by the next resolve without any provider call.
+///
+/// It never resolves to a subscription. The row names a provider, but Hermes
+/// records no serving credential, so no account's quota can be attributed to
+/// the pane: not another CLI's login, and not the one `hermes usage` would
+/// pick for a new session. `Indeterminate` clears any bars the pane carries.
+pub(crate) fn resolve_hermes_with_identity(
+    session_id: Option<&str>,
+    home: Option<std::path::PathBuf>,
+) -> ResolvedPane {
+    let Some(session) = session_id
+        .filter(|id| !id.is_empty())
+        .zip(home)
+        .and_then(|(id, home)| crate::hermes::lookup(&home, id))
+    else {
+        return indeterminate_pane();
+    };
+    // Hermes uses Pi's provider ids for the subscriptions the sidebar has a
+    // name for. A row that names no single provider is shown as Hermes.
+    let identity = match &session.provider_id {
+        Some(provider_id) => pi_identity(&crate::pi::SessionEvidence {
+            provider_id: provider_id.clone(),
+            model_id: session.model.clone(),
+        }),
+        None => Some(PaneIdentity {
+            provider: "Hermes".to_string(),
+            model: session.model.clone().unwrap_or_default(),
+        }),
+    };
+    ResolvedPane {
+        resolution: Resolution::Indeterminate,
+        identity,
+        context: None,
+        omp: None,
+        hermes: Some(session),
     }
 }
 
@@ -75,6 +124,7 @@ fn resolve_omp_with_identity(session_path: Option<&str>) -> ResolvedPane {
         identity: route.session.as_ref().and_then(pi_identity),
         context: route.context,
         omp: route.evidence,
+        hermes: None,
     }
 }
 
@@ -93,6 +143,7 @@ fn resolve_pi_with_identity(
         identity: route.session.as_ref().and_then(pi_identity),
         context: route.context,
         omp: None,
+        hermes: None,
     }
 }
 
@@ -151,6 +202,7 @@ fn resolve_opencode_with_identity(
         identity,
         context,
         omp: None,
+        hermes: None,
     }
 }
 
@@ -160,6 +212,7 @@ fn indeterminate_pane() -> ResolvedPane {
         identity: None,
         context: None,
         omp: None,
+        hermes: None,
     }
 }
 
@@ -699,5 +752,104 @@ mod tests {
             .resolution,
             Resolution::Indeterminate
         );
+    }
+
+    fn resolve_hermes(rows: &[(&str, &str, &str, &str, &str)], session_id: &str) -> ResolvedPane {
+        let dir = tempdir().unwrap();
+        crate::hermes::write_fixture_db(dir.path(), rows);
+        resolve_hermes_with_identity(Some(session_id), Some(dir.path().to_path_buf()))
+    }
+
+    fn shown(resolved: &ResolvedPane) -> (&str, &str) {
+        let identity = resolved.identity.as_ref().expect("identity");
+        (identity.provider.as_str(), identity.model.as_str())
+    }
+
+    /// Two Hermes panes are two session rows, each with its own provider and
+    /// model. Neither is a subscription: a GPT model in Hermes is not the
+    /// Codex CLI's login, and Hermes does not record which of its own
+    /// credentials serves the session.
+    #[test]
+    fn hermes_panes_show_their_own_session_and_never_resolve_to_a_subscription() {
+        let rows = [
+            ("s-codex", "model-a", "openai-codex", "", "Fix the build"),
+            ("s-claude", "model-c", "anthropic", "", ""),
+            ("s-grok", "model-g", "xai-oauth", "", ""),
+            ("s-router", "model-r", "openrouter", "", ""),
+            (
+                "s-split",
+                "model-b",
+                "openai-codex",
+                r#"{"provider":"anthropic"}"#,
+                "",
+            ),
+        ];
+        for (session_id, expected) in [
+            ("s-codex", ("Codex", "model-a")),
+            ("s-claude", ("Claude", "model-c")),
+            ("s-grok", ("Grok", "model-g")),
+            ("s-router", ("openrouter", "model-r")),
+            ("s-split", ("Hermes", "model-b")),
+        ] {
+            let resolved = resolve_hermes(&rows, session_id);
+            assert_eq!(shown(&resolved), expected);
+            assert_eq!(
+                resolved.resolution,
+                Resolution::Indeterminate,
+                "{session_id}"
+            );
+        }
+        assert_eq!(
+            resolve_hermes(&rows, "s-codex")
+                .hermes
+                .and_then(|session| session.title)
+                .as_deref(),
+            Some("Fix the build")
+        );
+        // Through the harness dispatch: no route to any collector's target.
+        assert_eq!(
+            resolve(&pane(Harness::Hermes, Some("s-codex"))),
+            Resolution::Indeterminate
+        );
+    }
+
+    /// `/model` rewrites the session row, and the next resolve shows it.
+    #[test]
+    fn a_hermes_model_switch_is_followed_from_the_session_row() {
+        let dir = tempdir().unwrap();
+        let resolve = |row| {
+            crate::hermes::write_fixture_db(dir.path(), &[row]);
+            resolve_hermes_with_identity(Some("s1"), Some(dir.path().to_path_buf()))
+        };
+        assert_eq!(
+            shown(&resolve(("s1", "model-a", "openai-codex", "", ""))),
+            ("Codex", "model-a")
+        );
+        assert_eq!(
+            shown(&resolve(("s1", "model-b", "openai-codex", "", ""))),
+            ("Codex", "model-b")
+        );
+        assert_eq!(
+            shown(&resolve(("s1", "model-c", "anthropic", "", ""))),
+            ("Claude", "model-c")
+        );
+    }
+
+    #[test]
+    fn a_hermes_session_that_cannot_be_read_has_no_identity() {
+        let rows = [("s1", "model-a", "openai-codex", "", "")];
+        let missing = resolve_hermes(&rows, "s-absent");
+        assert_eq!(missing.resolution, Resolution::Indeterminate);
+        assert!(missing.identity.is_none() && missing.hermes.is_none());
+        let dir = tempdir().unwrap();
+        for (session_id, home) in [
+            (None, Some(dir.path().to_path_buf())),
+            (Some("s1"), None),
+            (Some("s1"), Some(dir.path().to_path_buf())),
+        ] {
+            assert!(resolve_hermes_with_identity(session_id, home)
+                .identity
+                .is_none());
+        }
     }
 }

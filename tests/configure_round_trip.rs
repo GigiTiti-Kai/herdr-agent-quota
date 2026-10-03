@@ -2442,6 +2442,15 @@ impl AgentHomes {
             .env("AGY_SETTINGS_FILE", &self.agy_settings)
             .env("GROK_HOME", &self.grok_home)
             .env("CURSOR_HOOKS_FILE", &self.cursor_hooks)
+            // Never the developer's own Hermes: an absent home installs nothing.
+            .env(
+                "HERMES_HOME",
+                self.state.parent().unwrap().join("hermes-home"),
+            )
+            .env(
+                "HERDR_AGENT_QUOTA_HERMES_BIN",
+                self.state.join("hermes-absent"),
+            )
             .env("HERDR_BIN_PATH", self.state.join("herdr-absent"))
             .output()
             .unwrap()

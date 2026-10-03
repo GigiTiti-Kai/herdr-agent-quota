@@ -265,6 +265,14 @@ fn watch_pass_ids(
             continue;
         }
         let row = *style.get_or_insert_with(|| publish_row(cache));
+        if pane.harness == Harness::Hermes {
+            // Never a cached target; staleness is against its session row and
+            // its bridge mailbox.
+            if hermes_pane_is_stale(cache, pane, now, row) {
+                affected.push(pane.pane_id.clone());
+            }
+            continue;
+        }
         if cached_quota_is_stale(cache, pane, now, row) {
             affected.push(pane.pane_id.clone());
         }
@@ -308,6 +316,72 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
         row.fields,
     );
     crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape)
+}
+
+/// True when an idle Hermes pane shows something its evidence no longer
+/// supports: another model or provider than its session row names, quota bars
+/// with no live bridge reading behind them, or bars that differ from that
+/// reading.
+///
+/// Hermes has no hook after `/model`, and Herdr sends no event for it. The
+/// bridge plugin nudges this plugin when it sees a change; this check is what
+/// catches the same change from a watcher pass when the nudge did not land.
+/// It is one read-only row lookup and one small file read, no provider call.
+fn hermes_pane_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: RowStyle) -> bool {
+    pane.harness == Harness::Hermes
+        && hermes_resolved_is_stale(cache, pane, &route::resolve_with_identity(pane), now, row)
+}
+
+fn hermes_resolved_is_stale(
+    cache: &CacheStore,
+    pane: &AgentPane,
+    resolved: &route::ResolvedPane,
+    now: u64,
+    row: RowStyle,
+) -> bool {
+    if resolved
+        .identity
+        .as_ref()
+        .is_some_and(|identity| identity_has_drifted(pane, identity))
+    {
+        return true;
+    }
+    let bridged = resolved
+        .hermes
+        .as_ref()
+        .and_then(|session| hermes_bridge_tokens(cache, pane, session, now, row));
+    match bridged {
+        Some(values) => crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape),
+        // Without a reading every bar on a Hermes pane is left over: from an
+        // earlier credential, an earlier provider, or another harness.
+        None => crate::herdr::quota_rows_present(&pane.tokens),
+    }
+}
+
+/// What the bridge mailbox says the credential serving this pane's session
+/// has left, or `None` when any link in that proof is missing.
+fn hermes_bridge_tokens(
+    cache: &CacheStore,
+    pane: &AgentPane,
+    session: &crate::hermes::HermesSession,
+    now: u64,
+    row: RowStyle,
+) -> Option<MetadataTokens> {
+    let snapshot = crate::providers::hermes::load(
+        cache.root(),
+        &pane.pane_id,
+        pane.session.as_ref().and_then(|session| session.id())?,
+        session.provider_id.as_deref()?,
+        now,
+    )?;
+    tokens_for_provider(Some(&snapshot), now, None, row)
+}
+
+fn identity_has_drifted(pane: &AgentPane, identity: &crate::herdr::PaneIdentity) -> bool {
+    let shown = |name: &str| pane.tokens.get(name).map(String::as_str);
+    shown("quota_model").unwrap_or_default() != identity.model
+        // A narrow sidebar publishes the model alone.
+        || shown("quota_provider").is_some_and(|provider| provider != identity.provider)
 }
 
 fn wait_for_watch_tick(
@@ -464,11 +538,12 @@ pub fn event() -> Result<()> {
     // current returns the finisher and would skip teal for every completion.
     // `handle_named_pane` folds the working set into status before publish.
     // Pi's and omp's exact session files carry the routing evidence, and
-    // Muse/Cursor transcripts record the prompt itself. Reading their panes
-    // would add a visible repaint without improving attribution or the topic.
+    // Muse/Cursor transcripts record the prompt itself; Hermes keeps a session
+    // title. Reading their panes would add a visible repaint without improving
+    // attribution or the topic.
     let topic_pane = (!matches!(
         harness,
-        Harness::Pi | Harness::Omp | Harness::Muse | Harness::Cursor
+        Harness::Pi | Harness::Omp | Harness::Muse | Harness::Cursor | Harness::Hermes
     ))
     .then_some(pane_id);
     let result = handle_named_pane(
@@ -659,6 +734,40 @@ fn handle_named_pane(
         return Ok(());
     }
     WatchHerdrEnvironment::current().save(cache)?;
+    publish_named_pane(cache, pane, topic_pane, working_event)
+}
+
+/// Republish the one Hermes pane this process runs in.
+///
+/// The bridge plugin inside Hermes calls this when the session's credential,
+/// provider, model, or quota reading changed, which is how a `/model` switch
+/// made while idle reaches the sidebar without waiting for a turn. It reads
+/// no pane and fetches nothing. It runs in the pane's environment, not the
+/// server's, so it never records a Herdr connection and never starts a
+/// watcher.
+pub fn hermes_notify() -> Result<()> {
+    let Some(pane_id) = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(());
+    };
+    if !AgentSelection::from_args_or_env(&[]).contains(&Harness::Hermes) {
+        return Ok(());
+    }
+    let cache = CacheStore::from_env()?;
+    let Some(pane) = named_pane(&pane_id, Harness::Hermes)? else {
+        return Ok(());
+    };
+    publish_named_pane(&cache, pane, None, false)
+}
+
+fn publish_named_pane(
+    cache: &CacheStore,
+    pane: AgentPane,
+    topic_pane: Option<&str>,
+    working_event: bool,
+) -> Result<()> {
     let mut panes = [pane];
     apply_icon_attention(&mut panes, cache, None, false, working_event)?;
     if topic_pane == Some(panes[0].pane_id.as_str()) {
@@ -722,14 +831,15 @@ fn publish_row(cache: &CacheStore) -> RowStyle {
     }
 }
 
-/// Muse last prompt and Cursor/Grok generated session titles are the same
-/// evidence other harnesses read off the screen, so they are also that pane's
-/// topic. Codex keeps a screen topic and stores the thread preview separately.
+/// Muse last prompt and Cursor/Grok/Hermes generated session titles are the
+/// same evidence other harnesses read off the screen, so they are also that
+/// pane's topic. Codex keeps a screen topic and stores the thread preview
+/// separately.
 fn apply_session_summary(pane: &mut AgentPane, summary: &str) {
     pane.session_summary = summary.to_string();
     if matches!(
         pane.harness,
-        Harness::Muse | Harness::Cursor | Harness::Grok
+        Harness::Muse | Harness::Cursor | Harness::Grok | Harness::Hermes
     ) {
         pane.topic = summary.to_string();
     }
@@ -748,8 +858,19 @@ fn resolved_pane_tokens(
         identity,
         context,
         omp,
+        hermes,
     } = resolved;
+    // An untitled session keeps whatever topic the pane already had.
+    if let Some(title) = hermes.as_ref().and_then(|session| session.title.as_deref()) {
+        apply_session_summary(pane, title);
+    }
+    // A Hermes pane never resolves to a subscription of this plugin's. The
+    // only quota it can show is the one its own live session handed over.
+    let bridged = hermes
+        .as_ref()
+        .and_then(|session| hermes_bridge_tokens(cache, pane, session, now, row));
     let mut quota = match resolution {
+        _ if bridged.is_some() => bridged.map(|values| PaneQuotaUpdate::Replace(Box::new(values))),
         Resolution::Subscription(target)
             if target.credential_scope == CredentialScope::OMP_STORE =>
         {
@@ -1086,7 +1207,7 @@ fn refresh_provider(
         Provider::Claude | Provider::Agy => load_statusline_snapshot(cache, provider),
         // OpenCode Go is fetched for a resolved pane, never through the
         // provider list; see `fetch_opencode_go`.
-        Provider::OpenCodeGo | Provider::Omp => Err(anyhow::anyhow!(
+        Provider::OpenCodeGo | Provider::Omp | Provider::Hermes => Err(anyhow::anyhow!(
             "scoped providers are refreshed per resolved pane, not through --provider"
         )),
     };
@@ -1228,7 +1349,7 @@ fn current_account_gate(provider: Provider) -> (Option<String>, Option<u64>) {
                 .map(|key| crate::providers::credential_id(&key)),
             None,
         ),
-        Provider::Claude | Provider::Agy | Provider::Omp => (None, None),
+        Provider::Claude | Provider::Agy | Provider::Omp | Provider::Hermes => (None, None),
     }
 }
 
@@ -2963,5 +3084,256 @@ mod tests {
             !has_stale_done_icon(&pane),
             "unfocused idle+done_token stays until focus"
         );
+    }
+
+    /// The identity half of the idle-switch check compares what the pane
+    /// shows with what the session row names, and nothing else.
+    #[test]
+    fn an_idle_hermes_pane_is_stale_when_its_identity_moved() {
+        let identity = crate::herdr::PaneIdentity {
+            provider: "Codex".to_string(),
+            model: "model-b".to_string(),
+        };
+        let mut pane = test_pane("w1:p1", Harness::Hermes);
+        assert!(identity_has_drifted(&pane, &identity), "never published");
+        pane.tokens
+            .insert("quota_model".to_string(), "model-a".to_string());
+        pane.tokens
+            .insert("quota_provider".to_string(), "Codex".to_string());
+        assert!(identity_has_drifted(&pane, &identity), "model switched");
+        pane.tokens
+            .insert("quota_model".to_string(), "model-b".to_string());
+        assert!(!identity_has_drifted(&pane, &identity));
+        pane.tokens
+            .insert("quota_provider".to_string(), "Grok".to_string());
+        assert!(identity_has_drifted(&pane, &identity), "provider switched");
+        // A narrow sidebar publishes no provider token.
+        pane.tokens.remove("quota_provider");
+        assert!(!identity_has_drifted(&pane, &identity));
+    }
+
+    #[cfg(unix)]
+    mod hermes_bridge {
+        use super::*;
+        use crate::providers::hermes::testing::{record, write};
+        use std::path::Path;
+
+        const NOW: u64 = 2_000;
+
+        /// A Hermes pane carrying bars a confirmed provider left behind:
+        /// another harness ran in it before, or an earlier credential did.
+        fn pane_with_bars() -> AgentPane {
+            let mut pane = test_pane_with_session("w1:p1", Harness::Hermes, "s1");
+            for (name, value) in [
+                ("quota_provider", "Codex"),
+                ("quota_model", "model-a"),
+                ("quota_5h_normal", "5h 10% 1h"),
+                ("quota_week_normal", "7d 20% 3d"),
+                ("quota_headroom", "080"),
+            ] {
+                pane.tokens.insert(name.to_string(), value.to_string());
+            }
+            pane
+        }
+
+        fn hermes_home(provider: &str, model: &str) -> tempfile::TempDir {
+            let home = tempdir().unwrap();
+            crate::hermes::write_fixture_db(home.path(), &[("s1", model, provider, "", "")]);
+            home
+        }
+
+        fn resolved(pane: &AgentPane, home: &Path) -> route::ResolvedPane {
+            route::resolve_hermes_with_identity(
+                pane.session.as_ref().and_then(|session| session.id()),
+                Some(home.to_path_buf()),
+            )
+        }
+
+        fn published(cache: &CacheStore, pane: &mut AgentPane, home: &Path) -> PaneTokens {
+            let resolved = resolved(pane, home);
+            resolved_pane_tokens(cache, pane, resolved, NOW, RowStyle::default(), true)
+                .unwrap()
+                .expect("a pane carrying plugin rows is always rewritten")
+        }
+
+        fn week_row(tokens: &PaneTokens) -> Option<String> {
+            match &tokens.quota {
+                PaneQuotaUpdate::Replace(values) => Some(values.quota_week.clone()),
+                PaneQuotaUpdate::Clear => None,
+                PaneQuotaUpdate::Preserve => panic!("a Hermes pane with rows is never preserved"),
+            }
+        }
+
+        /// Without a bridge reading no quota is attributable to a Hermes
+        /// pane, whatever provider its row names: bars already on the pane
+        /// are removed, the model stays, and nothing is fetched or cached.
+        #[test]
+        fn a_hermes_pane_without_a_bridge_reading_never_keeps_or_gains_bars() {
+            for (model, provider, shown) in [
+                ("model-a", "openai-codex", "Codex"),
+                ("model-c", "anthropic", "Claude"),
+                ("model-g", "xai-oauth", "Grok"),
+            ] {
+                let state = tempdir().unwrap();
+                let cache = CacheStore::new(state.path());
+                let home = hermes_home(provider, model);
+                let mut pane = pane_with_bars();
+                let tokens = published(&cache, &mut pane, home.path());
+                assert_eq!(week_row(&tokens), None, "{provider}");
+                let identity = tokens.identity.expect("identity");
+                assert_eq!(
+                    (identity.provider.as_str(), identity.model.as_str()),
+                    (shown, model)
+                );
+                assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+            }
+        }
+
+        /// A session that cannot be looked up is not a reason to keep the
+        /// last provider's numbers on screen — even with a bridge record.
+        #[test]
+        fn an_unreadable_hermes_session_drops_the_previous_providers_bars() {
+            let state = tempdir().unwrap();
+            let cache = CacheStore::new(state.path());
+            let _producer = write(state.path(), "s1", &record("w1:p1", "s1", 40.0));
+            let home = tempdir().unwrap();
+            // No database at all, then a database without this session.
+            for write_other_row in [false, true] {
+                if write_other_row {
+                    crate::hermes::write_fixture_db(
+                        home.path(),
+                        &[("other", "model-a", "openai-codex", "", "")],
+                    );
+                }
+                let mut pane = pane_with_bars();
+                let tokens = published(&cache, &mut pane, home.path());
+                assert_eq!(week_row(&tokens), None);
+                assert!(tokens.identity.is_none());
+            }
+            let mut pane = pane_with_bars();
+            pane.session = None;
+            let tokens = published(&cache, &mut pane, home.path());
+            assert_eq!(week_row(&tokens), None);
+        }
+
+        /// The bars of a Hermes pane are its own live session's reading, shown
+        /// under the provider the session row names, and gone the moment any
+        /// link in the proof breaks.
+        #[test]
+        fn a_live_bridge_reading_is_the_only_quota_a_hermes_pane_shows() {
+            let state = tempdir().unwrap();
+            let cache = CacheStore::new(state.path());
+            let home = hermes_home("openai-codex", "model-a");
+            let producer = write(state.path(), "s1", &record("w1:p1", "s1", 40.0));
+
+            let mut pane = pane_with_bars();
+            let tokens = published(&cache, &mut pane, home.path());
+            let row = week_row(&tokens).expect("the session's own reading");
+            assert!(row.starts_with("7d 60%"), "{row}");
+            let PaneQuotaUpdate::Replace(values) = &tokens.quota else {
+                unreachable!()
+            };
+            // The stale 5h bar from the previous occupant is not carried over.
+            assert!(values.quota_5h.is_empty());
+            assert_eq!(values.quota_provider, "Hermes");
+            let identity = tokens.identity.as_ref().expect("identity");
+            assert_eq!(identity.provider, "Codex");
+            // Nothing is copied into this plugin's cache, least of all under Codex.
+            assert_eq!(cache.load(Provider::Codex).unwrap(), None);
+            assert_eq!(cache.load(Provider::Hermes).unwrap(), None);
+
+            // Another pane showing the same session id (resumed elsewhere).
+            let mut elsewhere = pane_with_bars();
+            elsewhere.pane_id = "w1:p2".to_string();
+            assert_eq!(
+                week_row(&published(&cache, &mut elsewhere, home.path())),
+                None
+            );
+
+            // `/model` moved the session to another provider; the producer has
+            // not rewritten its record yet.
+            let switched = hermes_home("anthropic", "model-c");
+            let mut pane = pane_with_bars();
+            let tokens = published(&cache, &mut pane, switched.path());
+            assert_eq!(week_row(&tokens), None);
+            assert_eq!(tokens.identity.expect("identity").provider, "Claude");
+
+            // The producer rotated its credential: a new epoch, no quota yet.
+            let mut rotated = record("w1:p1", "s1", 40.0);
+            rotated["route"]["epoch"] = serde_json::json!(4);
+            drop(producer);
+            let producer = write(state.path(), "s1", &rotated);
+            let mut pane = pane_with_bars();
+            assert_eq!(week_row(&published(&cache, &mut pane, home.path())), None);
+            rotated["quota"] = serde_json::Value::Null;
+            drop(producer);
+            let producer = write(state.path(), "s1", &rotated);
+            let mut pane = pane_with_bars();
+            assert_eq!(week_row(&published(&cache, &mut pane, home.path())), None);
+
+            // Hermes exited: the record is still there, its producer is not.
+            drop(producer);
+            let producer = write(state.path(), "s1", &record("w1:p1", "s1", 40.0));
+            let mut pane = pane_with_bars();
+            assert!(week_row(&published(&cache, &mut pane, home.path())).is_some());
+            drop(producer);
+            let mut pane = pane_with_bars();
+            assert_eq!(week_row(&published(&cache, &mut pane, home.path())), None);
+        }
+
+        /// The watcher must clear bars nothing vouches for, publish a reading
+        /// the pane does not show yet, and leave a pane that already shows
+        /// its reading alone — or it would undo what the bridge nudge wrote.
+        #[test]
+        fn an_idle_hermes_pane_is_stale_exactly_when_it_disagrees_with_its_bridge() {
+            let state = tempdir().unwrap();
+            let cache = CacheStore::new(state.path());
+            let home = hermes_home("openai-codex", "model-a");
+            let row = publish_row(&cache);
+            let stale = |pane: &AgentPane| {
+                hermes_resolved_is_stale(&cache, pane, &resolved(pane, home.path()), NOW, row)
+            };
+
+            // Bars with no reading behind them.
+            assert!(stale(&pane_with_bars()));
+            let mut bare = pane_with_bars();
+            for name in ["quota_5h_normal", "quota_week_normal", "quota_headroom"] {
+                bare.tokens.remove(name);
+            }
+            assert!(!stale(&bare), "identity only, and nothing to show");
+
+            // A reading arrives: the bare pane must pick it up, and the pane
+            // with someone else's bars must be rewritten.
+            let producer = write(state.path(), "s1", &record("w1:p1", "s1", 40.0));
+            assert!(stale(&bare));
+            assert!(stale(&pane_with_bars()));
+
+            // A pane already showing exactly that reading is left alone.
+            let session = resolved(&bare, home.path()).hermes.expect("session row");
+            let values = hermes_bridge_tokens(&cache, &bare, &session, NOW, row).expect("reading");
+            let mut current = bare.clone();
+            // With no 5h window the weekly row is published under its
+            // inline name.
+            current.tokens.insert(
+                "quota_week_inline_normal".to_string(),
+                values.quota_week.clone(),
+            );
+            current.tokens.insert(
+                "quota_headroom".to_string(),
+                format!("{:03}", values.quota_headroom.unwrap()),
+            );
+            assert!(!stale(&current));
+
+            // The reading moves, or its producer goes away.
+            drop(producer);
+            assert!(stale(&current), "the producer is gone");
+            let _producer = write(state.path(), "s1", &record("w1:p1", "s1", 55.0));
+            assert!(stale(&current), "the reading changed");
+
+            // Another harness never takes this path, whatever it carries.
+            let mut claude = pane_with_bars();
+            claude.harness = Harness::Claude;
+            assert!(!hermes_pane_is_stale(&cache, &claude, NOW, row));
+        }
     }
 }

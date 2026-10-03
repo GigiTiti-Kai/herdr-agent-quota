@@ -65,7 +65,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Fields | 默认开启提供方、主题、模型、上下文、短期／长期／月度额度；cache 与 TTL 可选 |
 | Agent order | 按 Space 分组，组内剩余额度最少优先（默认）；或使用 Herdr 自己的排序 |
 | Low quota alert | 关闭，或设置 1%–100% 的提醒阈值 |
-| Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor |
+| Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor、Hermes |
 
 方向键或空格修改，`a` 应用，`q` 关闭。脚本配置选项见 `./install.sh --help`。
 
@@ -83,6 +83,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
 | Pi | 规范 Codex collector 的额度 | 仅在记录的账号一致时复用 |
 | OMP | `omp usage --json --provider <id>` | usage 账号与会话 credential pin 一致 |
+| Hermes Agent | Hermes 进程内的 bridge 插件 | 仅限默认 profile 的 ChatGPT/Codex 会话：由运行中的会话报告它所持密钥的额度。其他 provider 只显示 provider、模型和主题，不显示额度 |
 
 Claude Code 状态栏保留用户自己的 statusLine 输出，并在末尾追加当前生效额度窗口的
 消耗节奏，例如 `⏱ 5h ↓12%`：已用额度减去窗口已过去的时间比例，单位为百分点。
@@ -93,10 +94,17 @@ Claude Code 状态栏保留用户自己的 statusLine 输出，并在末尾追�
 额度窗口保留上游定义。模型、上下文和缓存数据优先来自已识别的会话。
 `ttl≈` 表示估算的提示词缓存寿命，不保证实际过期时间。
 主题提取只读取事件点名窗格的可见屏幕；内容滚走后保留已有主题。Cursor 和 Grok
-使用本地会话元数据里的生成标题；Muse 使用 transcript 中的最后一条提示。
+使用本地会话元数据里的生成标题；Muse 使用 transcript 中的最后一条提示，Hermes 使用会话标题。
 
 所有受支持的工作中 agent 共用一个后台 watcher，请求间隔至少 60 秒，并在回合结束后
 完成收尾刷新。OMP 另有自身的五分钟 usage 缓存。共享已确认额度来源的闲置窗格会收到同一读数。
+
+Hermes 不走 watcher：本插件从不自行获取它的额度。为 Hermes 安装时会写入一个小的
+Hermes 插件（`~/.hermes/plugins/herdr-agent-quota`），并用 `hermes plugins enable`
+启用；该命令也会让已在运行的 Hermes 进程加载它。插件在 Hermes 进程内向 Hermes 自身的
+usage 获取逻辑查询当前会话所持的密钥，每个会话最多每分钟一次，再通过一个不含 token 和账号名的
+私有文件把 5h、7d 百分比交给侧栏。`/model` 或账号切换会在几秒内清除额度条，窗格闲置时
+也一样；只有 ChatGPT/Codex 路由才会重新显示。
 
 原生 Codex、Grok、Devin、Muse、Cursor collector 跟随插件的当前登录，不为每个窗格分别识别账号。
 Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
@@ -110,6 +118,7 @@ Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
 | 缺少会话数据 | 运行 `herdr integration status`，安装缺失项后重启对应 agent |
 | Claude/Agy 缺少额度 | 发送一轮消息，让该会话的 StatusLine 产生观测 |
 | OMP 缺少额度 | 检查 `omp usage --json --redact --provider <id>` |
+| Hermes 缺少额度 | 除非会话在 Herdr 窗格内以默认 profile 运行 ChatGPT/Codex，否则属于预期。用 `hermes plugins list` 确认 `herdr-agent-quota` 已启用，然后发送一轮消息。不会借用其他 CLI 的额度 |
 | Devin 缺少额度 | 检查 CLI 登录；使用自定义路径时检查 `DEVIN_CREDENTIALS_FILE` |
 | Muse 缺少额度 | 运行 `muse login`（API key 登录没有订阅额度）；使用自定义路径时检查 `MUSE_AUTH_PATH`。macOS 上 `storage: "keychain"` 登录还需一次性 Keychain 授权：运行 `herdr-agent-quota refresh --provider muse --keychain-approve`，并点击 **Always Allow** |
 | Cursor 缺少额度 | 运行 `cursor login`，或登录 Cursor 桌面端；使用自定义路径时检查 `CURSOR_AUTH_FILE` |
