@@ -14,8 +14,9 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 38] = [
+const METADATA_TOKEN_NAMES: [&str; 39] = [
     "quota_group",
+    "quota_group_gap",
     "quota_pad",
     "quota_icon",
     "quota_icon_working",
@@ -132,8 +133,9 @@ const CONTEXT_TOKEN_NAMES: [&str; 4] = [
 /// Values that must reach the pane in the *same* report that changed them,
 /// even when the budget is tight: the identity, the live diagnostics, and the
 /// inline week variants, whose styling flips as soon as a 5h window appears.
-const ROWS_THAT_MUST_NOT_LAG: [&str; 17] = [
+const ROWS_THAT_MUST_NOT_LAG: [&str; 18] = [
     "quota_group",
+    "quota_group_gap",
     "quota_icon",
     "quota_provider",
     "quota_model",
@@ -1233,11 +1235,11 @@ fn apply_group_and_icon(
     group_heads: &BTreeMap<String, String>,
     workspace_labels: &BTreeMap<String, String>,
 ) {
-    let mark = crate::icons::for_harness(pane.harness);
+    let mark = crate::icons::sidebar_mark(pane.harness);
     let active = pane.icon_status().icon_token();
     for token in ICON_TOKEN_NAMES {
         if token == active {
-            desired.insert(token.to_string(), mark.to_string());
+            desired.insert(token.to_string(), mark.clone());
         } else {
             desired.remove(token);
         }
@@ -1245,12 +1247,24 @@ fn apply_group_and_icon(
     desired.remove("quota_pad");
     // Never preserve a previous header: non-heads must omit the token so the
     // report clears it. Blind preserve is what left `ifs` on two panes.
+    // On every pane, header or not: see `GROUP_GAP_TOKEN`.
+    desired.insert(GROUP_GAP_TOKEN.to_string(), GROUP_GAP.to_string());
     if let Some(label) = group_label_for(pane, group_heads, workspace_labels) {
         desired.insert("quota_group".to_string(), label);
     } else {
         desired.remove("quota_group");
     }
 }
+
+/// The blank row above the icon, which the enlarged mark draws up into.
+///
+/// Every pane carries it, not only a Space head. Herdr drops empty rows first
+/// and then indents row 0 by one column and every later row by three; a member
+/// without the gap would have its icon on row 0, two columns left of the
+/// head's. A whitespace value is dropped by Herdr, so the row holds one U+2800
+/// (see [`crate::icons::SIDEBAR_RESERVE`]).
+const GROUP_GAP_TOKEN: &str = "quota_group_gap";
+const GROUP_GAP: &str = "\u{2800}";
 
 fn desired_tokens(
     values: &MetadataTokens,
@@ -1817,15 +1831,25 @@ mod tests {
             head_desired.get("quota_group").map(String::as_str),
             Some("ifs")
         );
+        assert_eq!(
+            head_desired.get(GROUP_GAP_TOKEN).map(String::as_str),
+            Some(GROUP_GAP),
+            "the blank row between the header and the icon it draws into"
+        );
 
         let mut sibling_desired = sibling.tokens.clone();
         apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &labels);
         assert!(!sibling_desired.contains_key("quota_group"));
         assert_eq!(
+            sibling_desired.get(GROUP_GAP_TOKEN).map(String::as_str),
+            Some(GROUP_GAP),
+            "a member keeps the gap too: Herdr indents by row index after \
+             dropping empty rows, so without it a member's icon row is row 0"
+        );
+        assert_eq!(
             sibling_desired.get("quota_icon").map(String::as_str),
-            Some(crate::icons::for_harness(sibling.harness)),
-            "member logo stays bare: Herdr indents by row index, so the logo \
-             row is already hang-indented on heads and members alike"
+            Some(crate::icons::sidebar_mark(sibling.harness).as_str()),
+            "no member indent baked into the mark"
         );
         assert!(
             !sibling_desired.contains_key("quota_pad"),
@@ -1855,8 +1879,8 @@ mod tests {
         assert_eq!(heads.get("w1").map(String::as_str), Some("w1:p2"));
         assert_eq!(
             head_desired.get("quota_icon").map(String::as_str),
-            Some(crate::icons::for_harness(head.harness)),
-            "head logo stays bare; Herdr hang-indents the row"
+            Some(crate::icons::sidebar_mark(head.harness).as_str()),
+            "no head indent baked into the mark; Herdr hang-indents the row"
         );
 
         // Brand icon colour follows agent_status: working publishes the
@@ -1872,7 +1896,7 @@ mod tests {
             working_desired
                 .get("quota_icon_working")
                 .map(String::as_str),
-            Some(crate::icons::for_harness(working.harness)),
+            Some(crate::icons::sidebar_mark(working.harness).as_str()),
             "working panes publish the yellow brand icon"
         );
         assert!(!working_desired.contains_key("quota_icon"));
@@ -1926,6 +1950,69 @@ mod tests {
             "idle + leftover done token must not restore teal"
         );
         assert!(!stale_desired.contains_key("quota_icon_done"));
+    }
+
+    /// Every icon state, focused or not, head or member, publishes the mark
+    /// with its reserved cells and the gap row; what Herdr hands back compares
+    /// equal, and a pane an older build published is rewritten once.
+    #[test]
+    fn the_reserved_icon_and_gap_compare_as_published() {
+        let pane = |id: &str, status: AgentStatus, focused: bool| AgentPane {
+            pane_id: id.to_string(),
+            workspace_id: "w1".to_string(),
+            harness: Harness::Hermes,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status,
+            focused,
+        };
+        let heads = BTreeMap::from([("w1".to_string(), "w1:p1".to_string())]);
+        let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
+        let mark = crate::icons::sidebar_mark(Harness::Hermes);
+        for id in ["w1:p1", "w1:p2"] {
+            for status in [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done] {
+                for focused in [false, true] {
+                    let mut current = pane(id, status, focused);
+                    let mut desired = BTreeMap::new();
+                    apply_group_and_icon(&mut desired, &current, &heads, &labels);
+                    let icons = ICON_TOKEN_NAMES
+                        .into_iter()
+                        .filter_map(|name| desired.get(name))
+                        .collect::<Vec<_>>();
+                    assert_eq!(icons, [&mark], "{id} {status:?} focused={focused}");
+                    assert_eq!(
+                        desired.get(GROUP_GAP_TOKEN).map(String::as_str),
+                        Some(GROUP_GAP)
+                    );
+                    assert_eq!(desired.contains_key("quota_group"), id == "w1:p1");
+
+                    // Herdr returns the values unchanged (U+2800 survives its
+                    // trim), so the next pass writes nothing.
+                    current.tokens = desired.clone();
+                    let mut again = current.tokens.clone();
+                    apply_group_and_icon(&mut again, &current, &heads, &labels);
+                    assert!(metadata_matches(&current.tokens, &again));
+                    assert!(icon_tokens_match(&current.tokens, &again));
+                }
+            }
+        }
+
+        // A pane published by an older build: bare mark, no gap.
+        let mut old = pane("w1:p2", AgentStatus::Idle, false);
+        old.tokens = BTreeMap::from([(
+            "quota_icon".to_string(),
+            crate::icons::for_harness(Harness::Hermes).to_string(),
+        )]);
+        let mut desired = old.tokens.clone();
+        apply_group_and_icon(&mut desired, &old, &heads, &labels);
+        assert!(!metadata_matches(&old.tokens, &desired));
+        assert!(!icon_tokens_match(&old.tokens, &desired));
+        let names = metadata_report_names(&old, &desired);
+        assert!(names.contains(&GROUP_GAP_TOKEN) && names.contains(&"quota_icon"));
+        assert!(METADATA_TOKEN_NAMES.contains(&GROUP_GAP_TOKEN));
+        assert!(ROWS_THAT_MUST_NOT_LAG.contains(&GROUP_GAP_TOKEN));
     }
 
     #[test]
