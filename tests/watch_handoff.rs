@@ -93,6 +93,7 @@ printf '%s\n' '{"result":{"agents":[]}}'
     assert!(status.is_some_and(|status| status.success()),
         "watcher kept polling the old incompatible Herdr client instead of adopting startup's environment");
     assert!(fs::read_to_string(log).unwrap().lines().count() > before);
+    remove_state_after_watchers_stop(dir);
 }
 
 #[test]
@@ -114,6 +115,7 @@ fn every_supported_working_harness_keeps_the_watcher_alive() {
             .env("MUSE_AUTH_PATH", dir.path().join("absent"))
             .env("CURSOR_AUTH_FILE", dir.path().join("absent"))
             .env("CURSOR_STATE_DB", dir.path().join("absent"))
+            .env("CLAUDE_CREDENTIALS_FILE", dir.path().join("absent"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -158,12 +160,14 @@ printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","agent":"codex","agent_st
             .env_remove("HERDR_AGENT_QUOTA_AGENTS")
             .env("HERDR_AGENT_QUOTA_AGENT_ORDER", "default")
             .env("HERDR_BIN_PATH", &herdr)
+            .env("HERDR_SOCKET_PATH", dir.path().join("test.sock"))
             .env("CODEX_BIN_PATH", dir.path().join("absent"))
             .env("GROK_AUTH_FILE", dir.path().join("absent"))
             .env("DEVIN_CREDENTIALS_FILE", dir.path().join("absent"))
             .env("MUSE_AUTH_PATH", dir.path().join("absent"))
             .env("CURSOR_AUTH_FILE", dir.path().join("absent"))
             .env("CURSOR_STATE_DB", dir.path().join("absent"))
+            .env("CLAUDE_CREDENTIALS_FILE", dir.path().join("absent"))
             .env("TEST_LOG", &log)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -207,4 +211,24 @@ printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","agent":"codex","agent_st
             60
         )
         .unwrap());
+    remove_state_after_watchers_stop(dir);
+}
+
+/// `startup` / `event` が起こした watcher を止めてから state を消す。
+/// 走っている watcher の目の前で消すと、その周回の書き込みがディレクトリを
+/// 作り直し、watcher が最大 1 時間 /tmp に残る（2026-09-24、10 回中 2 回）。
+/// turn.lock を持ったまま消すので、遅れて起きた watcher も入れない。
+fn remove_state_after_watchers_stop(dir: tempfile::TempDir) {
+    let cache = herdr_agent_quota::cache::CacheStore::new(dir.path());
+    cache.stop_turn_watchers().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let lock = loop {
+        if let Some(lock) = cache.try_lock_named("turn.lock").unwrap() {
+            break lock;
+        }
+        assert!(Instant::now() < deadline, "watcher did not stop");
+        thread::sleep(Duration::from_millis(10));
+    };
+    dir.close().unwrap();
+    drop(lock);
 }

@@ -20,7 +20,7 @@ const MIN_METER_CELLS: usize = 4;
 const METER_FILLED: char = '\u{25b0}';
 const METER_EMPTY: char = '\u{25b1}';
 /// Align `cx`, `5h`, `7d`, and `30d` without inventing period aliases.
-const GAUGE_LABEL_WIDTH: usize = 3;
+pub(crate) const GAUGE_LABEL_WIDTH: usize = 3;
 const GAUGE_CONTEXT_LABEL: &str = "cx";
 /// How many meter cells a window row can afford at `sidebar_width` columns,
 /// or `None` when the row should render through its existing non-gauge shape
@@ -99,7 +99,7 @@ impl From<SidebarLayout> for SidebarShape {
 /// A meter that agrees with the integer printed beside it: only 0
 /// draws an empty bar and only 100 draws a full one, so a window with quota
 /// left never reads as spent.
-fn meter(printed: u32, cells: usize) -> String {
+pub(crate) fn meter(printed: u32, cells: usize) -> String {
     let filled = (f64::from(printed) * cells as f64 / 100.0).round() as usize;
     let filled = if (1..=99).contains(&printed) {
         filled.clamp(1, cells - 1)
@@ -114,7 +114,7 @@ fn meter(printed: u32, cells: usize) -> String {
 /// How many meter cells a row labelled `label` draws, or `None` when it keeps
 /// its existing non-gauge shape: another layout, a sidebar too narrow for a
 /// bar, or a label that would not fit the label column.
-fn gauge_cells(shape: SidebarShape, label: &str) -> Option<usize> {
+pub(crate) fn gauge_cells(shape: SidebarShape, label: &str) -> Option<usize> {
     match shape.layout {
         SidebarLayout::Packed | SidebarLayout::Stacked => None,
         SidebarLayout::Gauges => shape
@@ -139,6 +139,11 @@ pub struct MetadataTokens {
     pub quota_5h_severity: Option<Severity>,
     pub quota_week: String,
     pub quota_week_severity: Option<Severity>,
+    /// A model-scoped weekly cap (`Fab 92% 3d`), when the account has one.
+    /// Absent far more often than present: not every account or model has a
+    /// scoped cap, so this stays empty rather than showing a stale value.
+    pub quota_week_scoped: String,
+    pub quota_week_scoped_severity: Option<Severity>,
     pub quota_month: String,
     pub quota_month_severity: Option<Severity>,
     pub quota_context: String,
@@ -257,6 +262,7 @@ impl MetadataTokens {
         let style = row.percent;
         let shape = row.shape;
         let fields = row.fields;
+        let all_windows = windows;
         let live = live_windows(windows, now_unix);
         let windows = live.as_slice();
         let quota_provider = snapshot.provider.display_name().to_string();
@@ -267,6 +273,7 @@ impl MetadataTokens {
             shape.content_width > 0 && shape.content_width < NARROW_IDENTITY_CONTENT_WIDTH;
         let five_hour = window_in(windows, WindowKind::FiveHour);
         let weekly = window_in(windows, WindowKind::Weekly);
+        let weekly_scoped = window_in(windows, WindowKind::WeeklyScoped);
         let monthly = window_in(windows, WindowKind::Monthly);
         Self {
             quota_provider_model,
@@ -278,13 +285,22 @@ impl MetadataTokens {
             quota_model,
             quota_5h_severity: five_hour.map(|window| Severity::for_window(window, now_unix)),
             quota_5h: five_hour
+                .or_else(|| window_in(all_windows, WindowKind::FiveHour))
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_week: weekly
+                .or_else(|| window_in(all_windows, WindowKind::Weekly))
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_week_severity: weekly.map(|window| Severity::for_window(window, now_unix)),
+            quota_week_scoped: weekly_scoped
+                .or_else(|| window_in(all_windows, WindowKind::WeeklyScoped))
+                .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
+                .unwrap_or_default(),
+            quota_week_scoped_severity: weekly_scoped
+                .map(|window| Severity::for_window(window, now_unix)),
             quota_month: monthly
+                .or_else(|| window_in(all_windows, WindowKind::Monthly))
                 .map(|window| compact_window_parts(window, now_unix, style, shape).rendered())
                 .unwrap_or_default(),
             quota_month_severity: monthly.map(|window| Severity::for_window(window, now_unix)),
@@ -311,6 +327,8 @@ impl MetadataTokens {
             quota_5h_severity: None,
             quota_week: String::new(),
             quota_week_severity: None,
+            quota_week_scoped: String::new(),
+            quota_week_scoped_severity: None,
             quota_month: String::new(),
             quota_month_severity: None,
             quota_context: String::new(),
@@ -352,6 +370,10 @@ fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
             .then(|| window_in(windows, WindowKind::Weekly))
             .flatten(),
         fields
+            .contains(SidebarField::WeekScoped)
+            .then(|| window_in(windows, WindowKind::WeeklyScoped))
+            .flatten(),
+        fields
             .contains(SidebarField::Month)
             .then(|| window_in(windows, WindowKind::Monthly))
             .flatten(),
@@ -364,9 +386,9 @@ fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
 
 /// Below this content width the logo already names the vendor, so the
 /// identity label keeps only the model (radar-style narrow reading).
-const NARROW_IDENTITY_CONTENT_WIDTH: usize = 22;
+pub(crate) const NARROW_IDENTITY_CONTENT_WIDTH: usize = 22;
 
-fn provider_model_label(provider: &str, model: &str, content_width: usize) -> String {
+pub(crate) fn provider_model_label(provider: &str, model: &str, content_width: usize) -> String {
     if model.is_empty() {
         return provider.to_string();
     }
@@ -376,9 +398,10 @@ fn provider_model_label(provider: &str, model: &str, content_width: usize) -> St
     format!("{provider}/{model}")
 }
 
-/// Every window the collector reported, including a monthly one. The sidebar
-/// publishes 5h, 7d, and 30d as separate tokens; a 30d value must never be
-/// folded into a weekly one.
+/// Every window the collector reported, including a monthly one and a
+/// model-scoped weekly one. The sidebar publishes 5h, 7d, the scoped 7d and
+/// 30d as separate tokens; neither a scoped nor a 30d value may ever be folded
+/// into the account-wide weekly one.
 pub fn dashboard_summary(
     snapshot: &ProviderSnapshot,
     now_unix: u64,
@@ -390,6 +413,7 @@ pub fn dashboard_summary(
         &[
             WindowKind::FiveHour,
             WindowKind::Weekly,
+            WindowKind::WeeklyScoped,
             WindowKind::Monthly,
         ],
         now_unix,
@@ -567,6 +591,19 @@ fn compact_window_parts(
     shape: SidebarShape,
 ) -> WindowParts {
     let label = window.display_label();
+    if !window.is_current(now_unix) {
+        let cells = gauge_cells(shape, label);
+        return WindowParts {
+            label: if cells.is_some() {
+                format!("{label:<width$}", width = GAUGE_LABEL_WIDTH)
+            } else {
+                label.to_string()
+            },
+            percent: if cells.is_some() { "  --" } else { "--" }.to_string(),
+            eta: String::new(),
+            meter: cells.map(|cells| meter(0, cells)),
+        };
+    }
     let percent = style.percent_of(window);
     let eta = window
         .resets_at
@@ -662,10 +699,13 @@ fn format_ttl(seconds: u64) -> String {
 /// Spending pace for the Claude Code status line: quota consumed versus how
 /// much of the window's clock has run, in percentage points.
 ///
-/// Paces against the binding window — the 5h/7d window with the least
-/// remaining quota, the same rule as [`headroom`], because whichever limit
-/// runs out first is the one the pace has to respect — and names it
-/// (`5h`/`7d`) so a weekly pace is never mistaken for a five-hour one. The
+/// Paces against the binding window — the 5h/7d/scoped-weekly window with the
+/// least remaining quota, unfiltered by the sidebar's [`FieldSet`], unlike
+/// [`headroom`], because whichever limit runs out first is the one the pace
+/// has to respect whether or not its row is switched on — and names it by
+/// its [`UsageWindow::display_label`] (`5h`/`7d`, or a scoped window's own
+/// model name) so a weekly pace is never mistaken for a five-hour one, and a
+/// model-scoped weekly is never mistaken for the account-wide one. The
 /// binding window is chosen *before* asking whether it can be paced: if it
 /// cannot, nothing is rendered rather than pacing the looser window, which
 /// would put a confident arrow on the wrong budget. `↓` means slow down
@@ -680,7 +720,12 @@ pub fn pace_segment(windows: &[UsageWindow], now_unix: u64) -> Option<String> {
     const MIN_ELAPSED_FRACTION: f64 = 0.05;
     let window = windows
         .iter()
-        .filter(|window| matches!(window.kind, WindowKind::FiveHour | WindowKind::Weekly))
+        .filter(|window| {
+            matches!(
+                window.kind,
+                WindowKind::FiveHour | WindowKind::Weekly | WindowKind::WeeklyScoped
+            )
+        })
         // `min_by` keeps the first of equals, and 5h is parsed first.
         .min_by(|a, b| a.remaining_percent.total_cmp(&b.remaining_percent))?;
     let remaining = window
@@ -702,7 +747,7 @@ pub fn pace_segment(windows: &[UsageWindow], now_unix: u64) -> Option<String> {
     } else {
         format!("↑{}%", (-delta).round())
     };
-    Some(format!("⏱ {} {pace}", window.kind.label()))
+    Some(format!("⏱ {} {pace}", window.display_label()))
 }
 
 #[cfg(test)]
@@ -813,6 +858,57 @@ mod tests {
 
     fn window(kind: WindowKind, used: f64, reset: u64) -> UsageWindow {
         UsageWindow::new(kind, used, Some(ResetAt::from_unix_seconds(reset))).unwrap()
+    }
+
+    fn scoped_window(used: f64) -> UsageWindow {
+        UsageWindow::new(WindowKind::WeeklyScoped, used, None)
+            .unwrap()
+            .with_source_window("Fab", None)
+    }
+
+    #[test]
+    fn the_scoped_weekly_window_gets_its_own_token() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 40.0, 3_600),
+                window(WindowKind::Weekly, 75.0, 183_600),
+                scoped_window(92.0),
+            ],
+            0,
+        );
+        // `Used` style so the plan's percentages (92%, 75%) show literally,
+        // and to prove `style` is threaded into the scoped token like every
+        // other window rather than hardcoded.
+        let tokens = MetadataTokens::from_snapshot_for_session(
+            &snapshot,
+            0,
+            None,
+            PercentStyle::Used,
+            SidebarShape::default(),
+        );
+        // The row names its model instead of reading 7d a second time.
+        assert!(tokens.quota_week_scoped.contains("Fab"));
+        assert!(tokens.quota_week_scoped.contains("92%"));
+        // The account-wide weekly is untouched by the scoped one.
+        assert!(tokens.quota_week.contains("75%"));
+    }
+
+    #[test]
+    fn headroom_counts_the_scoped_weekly_window() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::Weekly, 60.0, 183_600),
+                scoped_window(92.0),
+            ],
+            0,
+        );
+        // 8 points left on Fable is tighter than the 40 left on the weekly.
+        assert_eq!(
+            MetadataTokens::from_snapshot(&snapshot, 0).quota_headroom,
+            Some(8)
+        );
     }
 
     /// A monthly-only plan (Grok billed monthly, a Go plan with no weekly
@@ -1050,6 +1146,31 @@ mod tests {
         );
         assert!(!summary.contains('\u{25b0}'));
         assert!(!summary.contains('\u{25b1}'));
+    }
+
+    /// `dashboard_summary` lists its window kinds explicitly, so a new kind is
+    /// silently omitted rather than failing to compile. The scoped row is on
+    /// the sidebar; the dashboard claims to be the surface with room for a
+    /// collector's *full* window set, so it has to carry it too.
+    #[test]
+    fn the_dashboard_lists_the_scoped_weekly_window_between_7d_and_30d() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 58.0, 14_820),
+                window(WindowKind::Weekly, 27.0, 183_600),
+                window(WindowKind::WeeklyScoped, 92.0, 183_600).with_source_window("Fab", None),
+                window(WindowKind::Monthly, 10.0, 1_500_000),
+            ],
+            0,
+        );
+        let summary = dashboard_summary(&snapshot, 0, PercentStyle::default());
+        assert_eq!(
+            summary,
+            "5h 42% left reset 4h07m \u{b7} 7d 73% left reset 2d3h \u{b7} \
+             Fab 8% left reset 2d3h \u{b7} 30d 90% left reset 17d8h",
+            "{summary}"
+        );
     }
 
     #[test]
@@ -1613,13 +1734,78 @@ mod tests {
 
     #[test]
     fn an_expired_window_is_not_shown_as_live_quota() {
+        for kind in [
+            WindowKind::FiveHour,
+            WindowKind::Weekly,
+            WindowKind::WeeklyScoped,
+            WindowKind::Monthly,
+        ] {
+            let expired = window(kind, 20.0, 1_000);
+            let expired = if kind == WindowKind::WeeklyScoped {
+                expired.with_source_window("Fab", None)
+            } else {
+                expired
+            };
+            let label = expired.display_label().to_string();
+            let snapshot = ProviderSnapshot::new(Provider::Claude, vec![expired], 0);
+            for now in [1_000, 1_001] {
+                for style in [PercentStyle::Remaining, PercentStyle::Used] {
+                    for layout in [
+                        SidebarLayout::Packed,
+                        SidebarLayout::Stacked,
+                        SidebarLayout::Gauges,
+                    ] {
+                        for width in [23, 26] {
+                            let tokens = MetadataTokens::from_snapshot_for_session(
+                                &snapshot,
+                                now,
+                                None,
+                                style,
+                                SidebarShape::new(layout, width),
+                            );
+                            let (value, severity) = match kind {
+                                WindowKind::FiveHour => {
+                                    (&tokens.quota_5h, tokens.quota_5h_severity)
+                                }
+                                WindowKind::Weekly => {
+                                    (&tokens.quota_week, tokens.quota_week_severity)
+                                }
+                                WindowKind::WeeklyScoped => {
+                                    (&tokens.quota_week_scoped, tokens.quota_week_scoped_severity)
+                                }
+                                WindowKind::Monthly => {
+                                    (&tokens.quota_month, tokens.quota_month_severity)
+                                }
+                            };
+                            let expected = if layout == SidebarLayout::Gauges && width == 26 {
+                                format!("{label:<3} ▱▱▱▱▱▱   --")
+                            } else {
+                                format!("{label} --")
+                            };
+                            assert_eq!(*value, expected, "{kind:?} {layout:?} {style:?} {width}");
+                            assert_eq!(severity, None);
+                            assert_eq!(tokens.quota_headroom, None);
+                            assert_eq!(dashboard_summary(&snapshot, now, style), "");
+                            assert_eq!(
+                                ProviderSnapshot::severity_for_windows(
+                                    Provider::Claude,
+                                    &snapshot.windows,
+                                    now
+                                ),
+                                Severity::Unknown
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let snapshot = ProviderSnapshot::new(
             Provider::Claude,
             vec![window(WindowKind::FiveHour, 20.0, 1_000)],
             0,
         );
         let tokens = MetadataTokens::from_snapshot(&snapshot, 1_001);
-        assert_eq!(tokens.quota_5h, "");
+        assert_eq!(tokens.quota_5h, "5h --");
         assert_eq!(tokens.quota_5h_severity, None);
         assert_eq!(tokens.quota_headroom, None);
         assert!(!tokens.quota_5h.contains("80%"), "{tokens:?}");
@@ -1644,7 +1830,7 @@ mod tests {
             0,
         );
         let tokens = MetadataTokens::from_snapshot(&snapshot, 1_001);
-        assert_eq!(tokens.quota_5h, "");
+        assert_eq!(tokens.quota_5h, "5h --");
         assert_eq!(tokens.quota_5h_severity, None);
         assert!(tokens.quota_week.starts_with("7d 90%"), "{tokens:?}");
         assert_eq!(tokens.quota_headroom, Some(90));
@@ -2384,6 +2570,22 @@ mod tests {
             window(WindowKind::Weekly, 90.0, 2 * DAY),
         ];
         assert_eq!(pace_segment(&weekly_binds, 0).as_deref(), Some("⏱ 7d ↓19%"));
+    }
+
+    /// A model-scoped weekly window that binds names itself with its
+    /// `source_label` (the model name), never the enum's `wks` safety-net
+    /// label — otherwise the pace segment would show the one label this
+    /// window kind exists specifically to avoid ever displaying.
+    #[test]
+    fn pace_names_a_scoped_binding_window_by_its_model_not_wks() {
+        let scoped_binds = vec![
+            window(WindowKind::FiveHour, 20.0, 3 * HOUR),
+            window(WindowKind::WeeklyScoped, 90.0, 2 * DAY).with_source_window("Fab", None),
+        ];
+        assert_eq!(
+            pace_segment(&scoped_binds, 0).as_deref(),
+            Some("⏱ Fab ↓19%")
+        );
     }
 
     /// The binding window is chosen before asking whether it can be paced.

@@ -7,7 +7,8 @@ use crate::herdr::{
     refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens,
 };
 use crate::model::{
-    BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution,
+    BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution, UsageWindow,
+    WindowKind,
 };
 use crate::omp::OmpEvidence;
 use crate::opencode::OpenCodePaths;
@@ -19,6 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -304,6 +306,14 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
         return false;
     };
     let session_id = pane.session.as_ref().and_then(|session| session.id());
+    // 第三者モデルのペインは Claude の窓を表示していない。窓の期限切れで
+    // 取り直しに入れると、関係ない Claude usage API を叩き続ける（429 の元）
+    if target.billing == Provider::Claude
+        && session_id
+            .is_some_and(|id| crate::metered::session_backend(cache.root(), id, now).is_some())
+    {
+        return false;
+    }
     if snapshot.displayed_quota_has_expired(session_id, now) {
         return true;
     }
@@ -891,15 +901,27 @@ fn resolved_pane_tokens(
                         }
                     }
                 }
+                let session_id = pane.session.as_ref().and_then(|session| session.id());
                 tokens_for_loaded_snapshot(
                     provider,
                     snapshot.as_ref(),
                     usable,
                     now,
-                    pane.session.as_ref().and_then(|session| session.id()),
+                    session_id,
                     row,
                 )
-                .map(|values| PaneQuotaUpdate::Replace(Box::new(values)))
+                .map(|mut values| {
+                    apply_metered(
+                        cache.root(),
+                        crate::metered::billing_dir().as_deref(),
+                        provider,
+                        session_id,
+                        &mut values,
+                        now,
+                        row.shape,
+                    );
+                    PaneQuotaUpdate::Replace(Box::new(values))
+                })
             } else {
                 // Not one of the original four, so it is never fetched by the
                 // provider list: this pane resolved to it, so this pane pays
@@ -936,6 +958,30 @@ fn resolved_pane_tokens(
         identity,
         context,
     }))
+}
+
+/// The one place a pane is recognised as a Claude Code session running a
+/// DeepSeek / OpenRouter model: its session was bound by the statusLine hook
+/// (`CLAUDE_BILLING_BACKEND`). Its Claude windows mean nothing there, so the
+/// same three slots carry balance and spend instead (`crate::metered`).
+fn apply_metered(
+    state_root: &std::path::Path,
+    billing_dir: Option<&std::path::Path>,
+    provider: Provider,
+    session_id: Option<&str>,
+    values: &mut MetadataTokens,
+    now: u64,
+    shape: crate::presentation::SidebarShape,
+) {
+    if provider != Provider::Claude {
+        return;
+    }
+    let Some(session_id) = session_id else {
+        return;
+    };
+    if let Some(backend) = crate::metered::session_backend(state_root, session_id, now) {
+        crate::metered::overlay(values, backend, session_id, billing_dir, now, shape);
+    }
 }
 
 /// Quota for an omp pane, from omp's own usage layer.
@@ -1204,7 +1250,27 @@ fn refresh_provider(
         Provider::Devin => devin::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Muse => muse::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
         Provider::Cursor => cursor::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Claude | Provider::Agy => load_statusline_snapshot(cache, provider),
+        Provider::Claude => {
+            let statusline = load_statusline_snapshot(cache, provider);
+            let previous = cache.load(provider).ok().flatten();
+            let carried = statusline
+                .as_ref()
+                .ok()
+                .and_then(|fetched| fetched.session_id.as_deref())
+                .and_then(|session| {
+                    previous
+                        .as_ref()
+                        .map(|snapshot| snapshot.windows_for_session(Some(session)))
+                })
+                .map(<[UsageWindow]>::to_vec);
+            overlay_claude_windows(
+                crate::providers::claude_api::fetch(now),
+                statusline,
+                carried.as_deref(),
+                now,
+            )
+        }
+        Provider::Agy => load_statusline_snapshot(cache, provider),
         // OpenCode Go is fetched for a resolved pane, never through the
         // provider list; see `fetch_opencode_go`.
         Provider::OpenCodeGo | Provider::Omp | Provider::Hermes => Err(anyhow::anyhow!(
@@ -1406,6 +1472,88 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
     })
 }
 
+/// Claude quota is pollable without a turn; context, cache, model and topic are
+/// per session and only the statusLine has them. Take the windows from the
+/// endpoint and keep everything else the session already reported.
+///
+/// The merged reading stays `session_quota_only`, exactly like the statusLine
+/// one it replaces: Claude has no account gate, and a snapshot that claims to
+/// be account-wide without an `account_id` is rejected by
+/// [`ProviderSnapshot::usable_for_account`]. What the endpoint does add is
+/// `account_windows`, which holds the subscription's own allowance rather than
+/// one conversation's observation of it. Every Claude pane then renders it,
+/// instead of each pane showing whatever its own last turn happened to
+/// observe — or nothing at all, which is what a pane that has never taken a
+/// turn had to show.
+///
+/// With no endpoint we degrade to exactly the behaviour that shipped before
+/// this collector existed: nothing account-wide is published, `cache.rs` stops
+/// carrying the previous reading once one of its windows lapses, and each
+/// session falls back to its own last statusLine reading. With no statusLine
+/// observation there is no
+/// session to attach context, cache or model to, but the windows still stand on
+/// their own, so a pane can render quota before the hook has ever run.
+///
+/// `carried` is what the cache last held for the session the statusLine names.
+/// When the endpoint fails (a 429 is the common case) the statusLine reading
+/// would otherwise replace that session's windows wholesale and the scoped row
+/// would flap off until the next successful fetch. The scoped window only ever
+/// comes from the endpoint, so it is carried over; 5h and 7d come from the
+/// statusLine, which may well be fresher.
+///
+/// A carried window must still name a future reset. Without that guard the
+/// carry perpetuates itself — `merge_session_windows` writes it back into the
+/// session, so the next failure reads the same one out again — and a
+/// permanently failing fetch (a revoked token, not a 429) would freeze the row
+/// at a stale percentage forever. This is the same rule
+/// `merge_omitted_window_list` applies when it restores an omitted 5h or 7d.
+fn overlay_claude_windows(
+    api: Result<ProviderSnapshot>,
+    statusline: Result<FetchedSnapshot>,
+    carried: Option<&[UsageWindow]>,
+    now_unix: u64,
+) -> Result<FetchedSnapshot> {
+    match (api, statusline) {
+        (Ok(api), Ok(mut fetched)) => {
+            fetched.snapshot.windows = api.windows.clone();
+            fetched.snapshot.account_windows = api.windows;
+            Ok(fetched)
+        }
+        // No statusLine observation means no session to attach context, cache,
+        // model or topic to, but the windows are the account's and every pane
+        // can render them. It must still not be a `direct` save: that is a raw
+        // overwrite of the Claude cache file, and it would drop every other
+        // session's context, model, prompt-cache and window diagnostics.
+        (Ok(api), Err(_)) => Ok(FetchedSnapshot {
+            snapshot: {
+                let windows = api.windows.clone();
+                api.session_local().with_account_windows(windows)
+            },
+            preserve_context: true,
+            session_id: None,
+        }),
+        (Err(_), Ok(mut fetched)) => {
+            let scoped = carried
+                .into_iter()
+                .flatten()
+                .filter(|window| window.kind == WindowKind::WeeklyScoped)
+                .filter(|window| window.has_future_reset(now_unix))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !fetched
+                .snapshot
+                .windows
+                .iter()
+                .any(|window| window.kind == WindowKind::WeeklyScoped)
+            {
+                fetched.snapshot.windows.extend(scoped);
+            }
+            Ok(fetched)
+        }
+        (Err(_), Err(error)) => Err(error),
+    }
+}
+
 fn publish_resolved(
     cache: &CacheStore,
     panes: &mut [AgentPane],
@@ -1546,9 +1694,23 @@ fn is_working_status(status: &str) -> bool {
     status.eq_ignore_ascii_case("working")
 }
 
+/// Linux names a running binary that was replaced on disk `<path> (deleted)`.
+/// The new build sits at `<path>`; checking the suffixed name finds nothing,
+/// so a watcher started before a rebuild would never restart.
+fn live_exe_path(path: PathBuf) -> PathBuf {
+    match path
+        .to_str()
+        .and_then(|text| text.strip_suffix(" (deleted)"))
+    {
+        Some(live) => PathBuf::from(live),
+        None => path,
+    }
+}
+
 fn current_exe_modified() -> Option<SystemTime> {
     std::env::current_exe()
         .ok()
+        .map(live_exe_path)
         .and_then(|path| std::fs::metadata(path).ok())
         .and_then(|meta| meta.modified().ok())
 }
@@ -1558,7 +1720,7 @@ fn watch_binary_is_newer(started: SystemTime, modified: Option<SystemTime>) -> b
 }
 
 fn reexec_watch(server: Option<&WatchHerdrEnvironment>, interval_seconds: u64) -> Result<()> {
-    let executable = std::env::current_exe().context("resolve plugin executable")?;
+    let executable = live_exe_path(std::env::current_exe().context("resolve plugin executable")?);
     let mut command = Command::new(executable);
     command.args([
         "watch",
@@ -2032,6 +2194,52 @@ mod tests {
     }
 
     #[test]
+    fn a_metered_pane_is_not_pulled_in_by_its_claude_windows() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
+        // 5h は 1_000 で切れている。素の Claude ペインなら取り直しの対象
+        snapshot.session_windows.insert(
+            "s1".to_string(),
+            vec![window(WindowKind::FiveHour, 40.0, 1_000)],
+        );
+        cache.save(&snapshot).unwrap();
+        let panes = [test_pane_with_session("claude-ds", Harness::Claude, "s1")];
+        let pass = |cache: &CacheStore| {
+            watch_pass_ids(
+                cache,
+                &panes,
+                &Provider::ALL,
+                &[],
+                &[],
+                &mut BTreeMap::new(),
+                1_001,
+            )
+        };
+        assert!(pass(&cache).contains(&"claude-ds".to_string()));
+
+        crate::metered::record_session(
+            cache.root(),
+            "s1",
+            crate::metered::Backend::DeepSeek,
+            1_001,
+        )
+        .unwrap();
+        assert!(!pass(&cache).contains(&"claude-ds".to_string()));
+    }
+
+    #[test]
+    fn a_replaced_binary_is_found_at_its_path_not_the_deleted_inode() {
+        assert_eq!(
+            live_exe_path(PathBuf::from(
+                "/x/target/release/herdr-agent-quota (deleted)"
+            )),
+            PathBuf::from("/x/target/release/herdr-agent-quota")
+        );
+        assert_eq!(live_exe_path(PathBuf::from("/x/q")), PathBuf::from("/x/q"));
+    }
+
+    #[test]
     fn an_idle_pane_already_showing_the_cached_windows_stays_out_of_the_pass() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
@@ -2165,6 +2373,69 @@ mod tests {
                 matches!(update, Some(PaneQuotaUpdate::Replace(values)) if values.quota_week == expected)
             );
         }
+    }
+
+    #[test]
+    fn only_a_claude_session_bound_to_a_billing_backend_gets_the_metered_rows() {
+        let state = tempdir().unwrap();
+        let billing = tempdir().unwrap();
+        crate::metered::record_session(state.path(), "ds", crate::metered::Backend::DeepSeek, 100)
+            .unwrap();
+        let claude_rows = || {
+            let mut values = MetadataTokens::unavailable(Provider::Claude, "x");
+            values.quota_5h = "5h 10%".to_string();
+            values
+        };
+        let shape = crate::presentation::SidebarShape::default();
+
+        let mut bound = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            Some("ds"),
+            &mut bound,
+            100,
+            shape,
+        );
+        assert_eq!(bound.quota_5h, "bal ?");
+        assert_eq!(bound.quota_provider, "DeepSeek");
+
+        let mut unbound = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            Some("other"),
+            &mut unbound,
+            100,
+            shape,
+        );
+        assert_eq!(unbound.quota_5h, "5h 10%");
+
+        let mut codex = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Codex,
+            Some("ds"),
+            &mut codex,
+            100,
+            shape,
+        );
+        assert_eq!(codex.quota_5h, "5h 10%");
+
+        let mut no_session = claude_rows();
+        apply_metered(
+            state.path(),
+            Some(billing.path()),
+            Provider::Claude,
+            None,
+            &mut no_session,
+            100,
+            shape,
+        );
+        assert_eq!(no_session.quota_5h, "5h 10%");
     }
 
     #[test]
@@ -3335,5 +3606,418 @@ mod tests {
             claude.harness = Harness::Claude;
             assert!(!hermes_pane_is_stale(&cache, &claude, NOW, row));
         }
+    }
+
+    /// A real endpoint reading always names its reset, and the carry guard
+    /// requires one, so the fixture has to carry one too: with `resets_at:
+    /// None` the positive carry tests pass through the "cannot be proven
+    /// stale" branch and never exercise the path they claim to.
+    fn api_snapshot(used: f64) -> ProviderSnapshot {
+        ProviderSnapshot::new(
+            Provider::Claude,
+            vec![UsageWindow::new(
+                WindowKind::Weekly,
+                used,
+                Some(ResetAt::from_unix_seconds(CacheStore::now_unix() + 3_600)),
+            )
+            .unwrap()],
+            10,
+        )
+    }
+
+    fn statusline_fetched(used: f64) -> FetchedSnapshot {
+        FetchedSnapshot {
+            snapshot: ProviderSnapshot::new(
+                Provider::Claude,
+                vec![UsageWindow::new(WindowKind::Weekly, used, None).unwrap()],
+                5,
+            )
+            .session_local()
+            .with_model(Some("Opus 5".to_string())),
+            preserve_context: true,
+            session_id: Some("session-1".to_string()),
+        }
+    }
+
+    #[test]
+    fn api_windows_replace_statusline_windows_and_keep_session_data() {
+        let merged = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
+        // Session-scoped facts survive: only the windows come from the endpoint.
+        assert_eq!(merged.snapshot.model.as_deref(), Some("Opus 5"));
+        assert_eq!(merged.session_id.as_deref(), Some("session-1"));
+        assert!(merged.preserve_context);
+        assert!(merged.snapshot.session_quota_only);
+    }
+
+    /// The whole path a Claude pane actually walks: overlay, save, reload, and
+    /// render. A merged snapshot that is not session-local carries no
+    /// `account_id` either, which `usable_for_account` rejects outright, so
+    /// every row blanked behind "signed-in account changed" while the unit
+    /// tests either side of the seam stayed green.
+    #[test]
+    fn a_merged_claude_snapshot_still_renders_after_a_cache_round_trip() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let api = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                UsageWindow::new(
+                    WindowKind::Weekly,
+                    62.0,
+                    Some(ResetAt::from_unix_seconds(200_000)),
+                )
+                .unwrap(),
+                UsageWindow::new(
+                    WindowKind::WeeklyScoped,
+                    92.0,
+                    Some(ResetAt::from_unix_seconds(200_000)),
+                )
+                .unwrap()
+                .with_source_window("Fab", None),
+            ],
+            10,
+        );
+        let merged =
+            overlay_claude_windows(Ok(api), Ok(statusline_fetched(10.0)), None, 10).unwrap();
+        cache
+            .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
+            .unwrap();
+
+        let snapshot = cache.load(Provider::Claude).unwrap();
+        // Claude has no account gate: `current_account_gate` returns `(None, None)`.
+        let usable = snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.usable_for_account(None, None));
+        let tokens = tokens_for_loaded_snapshot(
+            Provider::Claude,
+            snapshot.as_ref(),
+            usable,
+            1_000,
+            Some("session-1"),
+            RowStyle::new(PercentStyle::default(), SidebarLayout::Packed.into()),
+        )
+        .expect("a cached Claude snapshot must render");
+        assert_eq!(tokens.quota_error, None, "{tokens:?}");
+        assert!(!tokens.quota_week.is_empty(), "{tokens:?}");
+        assert!(tokens.quota_week_scoped.contains("Fab"), "{tokens:?}");
+    }
+
+    #[test]
+    fn a_failed_api_call_falls_back_to_the_statusline_reading() {
+        let merged = overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 401")),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(merged.snapshot.windows[0].used_percent, 10.0);
+        assert!(merged.snapshot.session_quota_only);
+    }
+
+    /// A 429 must not knock the scoped row off: the statusLine never carries
+    /// it, so the last endpoint reading for the session is carried over.
+    #[test]
+    fn an_endpoint_failure_keeps_the_carried_scoped_window() {
+        let carried = vec![
+            UsageWindow::new(WindowKind::FiveHour, 8.0, None).unwrap(),
+            UsageWindow::new(
+                WindowKind::WeeklyScoped,
+                92.0,
+                Some(ResetAt::from_unix_seconds(900)),
+            )
+            .unwrap()
+            .with_source_window("Fab", None),
+        ];
+        let merged = overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 429")),
+            Ok(statusline_fetched(10.0)),
+            Some(&carried),
+            10,
+        )
+        .unwrap();
+        let kinds: Vec<_> = merged.snapshot.windows.iter().map(|w| w.kind).collect();
+        assert!(kinds.contains(&WindowKind::WeeklyScoped), "{kinds:?}");
+        // Only the scoped window is carried; 5h/7d stay the statusLine's own.
+        assert!(!kinds.contains(&WindowKind::FiveHour), "{kinds:?}");
+        assert_eq!(
+            kinds.iter().filter(|k| **k == WindowKind::Weekly).count(),
+            1
+        );
+    }
+
+    /// A carry with no future reset must be dropped, not perpetuated. Without
+    /// this the row freezes at a stale percentage for as long as the endpoint
+    /// keeps failing, which for a revoked token is forever.
+    #[test]
+    fn an_endpoint_failure_drops_a_stale_carried_scoped_window() {
+        let expired = vec![UsageWindow::new(
+            WindowKind::WeeklyScoped,
+            92.0,
+            Some(ResetAt::from_unix_seconds(900)),
+        )
+        .unwrap()
+        .with_source_window("Fab", None)];
+        let undated = vec![UsageWindow::new(WindowKind::WeeklyScoped, 92.0, None)
+            .unwrap()
+            .with_source_window("Fab", None)];
+        for carried in [expired, undated] {
+            let merged = overlay_claude_windows(
+                Err(anyhow::anyhow!("missing credentials")),
+                Ok(statusline_fetched(10.0)),
+                Some(&carried),
+                1_000,
+            )
+            .unwrap();
+            let kinds: Vec<_> = merged.snapshot.windows.iter().map(|w| w.kind).collect();
+            assert!(!kinds.contains(&WindowKind::WeeklyScoped), "{kinds:?}");
+        }
+    }
+
+    /// The endpoint alone names no session, so it carries no context, model or
+    /// prompt-cache — only the account's windows, which every pane renders
+    /// through `account_windows`. What it must not do is take the cache
+    /// down with it: a `direct` snapshot is written with a raw `cache.save`,
+    /// which replaces every other session's context, model, prompt-cache and
+    /// window diagnostics with an empty map.
+    #[test]
+    fn the_api_alone_does_not_wipe_the_cached_session_diagnostics() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let seeded = statusline_fetched(10.0);
+        cache
+            .save_preserving_context_for_session(
+                seeded
+                    .snapshot
+                    .with_context(Some(crate::model::ContextUsage::new(42.0).unwrap())),
+                seeded.session_id.as_deref(),
+            )
+            .unwrap();
+
+        let merged = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Err(anyhow::anyhow!("no observation yet")),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(merged.snapshot.windows[0].used_percent, 62.0);
+        assert!(merged.session_id.is_none());
+        // `refresh_provider` only preserves diagnostics for a preserving
+        // fetch; Claude is not in its fallback list.
+        assert!(merged.preserve_context);
+        // And it has to stay session-local. A non-session-local snapshot
+        // survives *this* save — the other branch of `merge_session_windows`
+        // copies the maps too — but the next statusLine tick then filters it
+        // out as `previous` and every session's windows vanish.
+        assert!(merged.snapshot.session_quota_only);
+        // Session-local storage, account-wide meaning: the pane that seeded the
+        // cache renders 62.0, not the 10.0 its own turn last reported.
+        assert_eq!(merged.snapshot.account_windows[0].used_percent, 62.0);
+        cache
+            .save_preserving_context_for_session(merged.snapshot, merged.session_id.as_deref())
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.session_contexts.contains_key("session-1"));
+        assert!(reloaded.session_models.contains_key("session-1"));
+        assert!(reloaded.session_windows.contains_key("session-1"));
+        assert_eq!(
+            reloaded.windows_for_session(Some("session-1"))[0].used_percent,
+            62.0
+        );
+        assert_eq!(
+            reloaded.windows_for_session(Some("a-pane-that-never-ran"))[0].used_percent,
+            62.0
+        );
+    }
+
+    /// The endpoint answered, so the merged snapshot speaks for the whole
+    /// subscription — including panes whose statusLine reading is hours old.
+    /// When it fails, nothing is published and each pane keeps its own reading.
+    #[test]
+    fn only_a_successful_endpoint_publishes_account_windows() {
+        let merged = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            merged.snapshot.windows_for_session(Some("another-session"))[0].used_percent,
+            62.0
+        );
+
+        let degraded = overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 429")),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        assert!(degraded.snapshot.account_windows.is_empty());
+        assert!(degraded
+            .snapshot
+            .windows_for_session(Some("another-session"))
+            .is_empty());
+    }
+
+    /// The statusLine hook saves after every turn and carries no endpoint
+    /// reading. Measured against the live cache before this was handled: a poll
+    /// wrote the account windows and the next turn dropped them again.
+    #[test]
+    fn a_statusline_save_keeps_the_account_windows() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let polled = overlay_claude_windows(
+            Ok(api_snapshot(62.0)),
+            Ok(statusline_fetched(10.0)),
+            None,
+            10,
+        )
+        .unwrap();
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        let turn = statusline_fetched(11.0);
+        assert!(turn.snapshot.account_windows.is_empty());
+        cache
+            .save_preserving_context_for_session(turn.snapshot, turn.session_id.as_deref())
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert_eq!(
+            reloaded.windows_for_session(Some("a-pane-that-never-ran"))[0].used_percent,
+            62.0
+        );
+    }
+
+    /// The carry must not outlive the window it read. A permanently failing
+    /// endpoint (a revoked token, not a 429) would otherwise keep re-carrying
+    /// the same reading: first frozen at a stale percentage, then -- once the
+    /// renderer filters the lapsed window -- blanking every pane, while each
+    /// pane's own live statusLine figures sat unreachable behind it.
+    #[test]
+    fn a_lapsed_account_reading_is_not_carried_into_the_next_turn() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let now = CacheStore::now_unix();
+        let mut polled = statusline_fetched(10.0);
+        polled.snapshot.account_windows = vec![UsageWindow::new(
+            WindowKind::FiveHour,
+            62.0,
+            Some(ResetAt::from_unix_seconds(now - 60)),
+        )
+        .unwrap()];
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        cache
+            .save_preserving_context_for_session(
+                statusline_fetched(11.0).snapshot,
+                Some("session-1"),
+            )
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.account_windows.is_empty());
+        // Back to the pre-endpoint behaviour: the session sees its own reading
+        // and a pane that never ran sees nothing, rather than a dead row.
+        assert_eq!(
+            reloaded.windows_for_session(Some("session-1"))[0].used_percent,
+            11.0
+        );
+        assert!(reloaded
+            .windows_for_session(Some("a-pane-that-never-ran"))
+            .is_empty());
+    }
+
+    /// One lapsed window drops the whole list, because `windows_for_session`
+    /// returns it wholesale: a surviving 7d would still suppress the pane's own
+    /// fresh 5h and leave the lapsed row drawing nothing.
+    #[test]
+    fn one_lapsed_window_drops_the_whole_carried_list() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let now = CacheStore::now_unix();
+        let mut polled = statusline_fetched(10.0);
+        polled.snapshot.account_windows = vec![
+            UsageWindow::new(
+                WindowKind::Weekly,
+                70.0,
+                Some(ResetAt::from_unix_seconds(now + 3_600)),
+            )
+            .unwrap(),
+            UsageWindow::new(
+                WindowKind::FiveHour,
+                62.0,
+                Some(ResetAt::from_unix_seconds(now - 60)),
+            )
+            .unwrap(),
+        ];
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        cache
+            .save_preserving_context_for_session(
+                statusline_fetched(11.0).snapshot,
+                Some("session-1"),
+            )
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.account_windows.is_empty());
+    }
+
+    /// A window with no `resets_at` can never be proven stale, so carrying it
+    /// would freeze every pane at a stale percentage for as long as the
+    /// endpoint stays down. `claude_api::parse_usage` builds one whenever the
+    /// response omits or malforms `resets_at`.
+    #[test]
+    fn an_account_window_without_a_reset_is_not_carried() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let mut polled = statusline_fetched(10.0);
+        polled.snapshot.account_windows =
+            vec![UsageWindow::new(WindowKind::Weekly, 62.0, None).unwrap()];
+        cache
+            .save_preserving_context_for_session(polled.snapshot, polled.session_id.as_deref())
+            .unwrap();
+
+        cache
+            .save_preserving_context_for_session(
+                statusline_fetched(11.0).snapshot,
+                Some("session-1"),
+            )
+            .unwrap();
+
+        let reloaded = cache.load(Provider::Claude).unwrap().expect("snapshot");
+        assert!(reloaded.account_windows.is_empty());
+        assert_eq!(
+            reloaded.windows_for_session(Some("session-1"))[0].used_percent,
+            11.0
+        );
+    }
+
+    #[test]
+    fn both_failing_reports_the_statusline_error() {
+        assert!(overlay_claude_windows(
+            Err(anyhow::anyhow!("HTTP 401")),
+            Err(anyhow::anyhow!("no observation yet")),
+            None,
+            10,
+        )
+        .is_err());
     }
 }

@@ -69,6 +69,7 @@ fn run_claude_collector_with_config_dir(
     command
         .arg("claude-statusline")
         .env("HERDR_PLUGIN_STATE_DIR", state)
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", herdr)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
@@ -84,6 +85,7 @@ fn run_claude_collector_with_timeout(state: &Path, input: &[u8], timeout: Durati
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("claude-statusline")
         .env("HERDR_PLUGIN_STATE_DIR", state)
+        .env_remove("HERDR_SOCKET_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -140,7 +142,16 @@ fn run_claude_refresh(state: &Path, herdr: &Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args(["refresh", "--provider", "claude", "--force"])
         .env("HERDR_PLUGIN_STATE_DIR", state)
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", herdr)
+        // Without this the Claude collector falls back to
+        // `$HOME/.claude/.credentials.json` and sends a real authenticated
+        // request to the usage endpoint, so the test's own fixtures lose to
+        // whatever the developer's live account says.
+        .env(
+            "CLAUDE_CREDENTIALS_FILE",
+            state.join("absent-claude-auth.json"),
+        )
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -508,6 +519,7 @@ fn claude_collector_is_silent_without_a_previous_statusline() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("claude-statusline")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -565,6 +577,7 @@ fn agy_collector_is_silent_without_a_previous_statusline() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("agy-statusline")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -929,6 +942,7 @@ fn a_scrolled_pane_completion_reports_only_icon_tokens() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
@@ -970,6 +984,7 @@ fn focus_paints_icons_without_reading_the_pane_or_collectors() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env_remove("HERDR_PLUGIN_EVENT_JSON")
         .output()
@@ -1033,6 +1048,7 @@ fn agent_event_refreshes_and_reads_topics_only_for_its_provider() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("GROK_HOME", state.path().join("missing-grok-home"))
@@ -1114,6 +1130,7 @@ fn run_event_binary_with_xdg(
     Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
         .env("HERDR_PLUGIN_STATE_DIR", state)
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", herdr)
         .env("CODEX_BIN_PATH", codex)
         .env("GROK_HOME", state.join("missing-grok-home"))
@@ -1331,6 +1348,7 @@ fn focus_event_uses_its_pane_even_when_the_current_focus_differs() {
         let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
             .arg("focus")
             .env("HERDR_PLUGIN_STATE_DIR", state.path())
+            .env_remove("HERDR_SOCKET_PATH")
             .env("HERDR_BIN_PATH", &herdr)
             .env("CODEX_BIN_PATH", &codex)
             .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1388,6 +1406,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1425,6 +1444,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
     let tab_output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1475,6 +1495,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1530,6 +1551,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
             "--defer",
         ])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1603,6 +1625,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
             "--defer",
         ])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1673,6 +1696,7 @@ fn focusing_a_done_pane_clears_the_teal_icon_immediately() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1731,6 +1755,7 @@ fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1789,6 +1814,7 @@ fn focus_change_clears_only_the_previous_green_pane() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1856,6 +1882,7 @@ fn focus_to_a_non_agent_pane_acknowledges_the_previous_agent() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
@@ -1895,6 +1922,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -1943,6 +1971,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -2009,6 +2038,7 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
@@ -2056,6 +2086,7 @@ fn focus_on_an_opencode_pane_does_not_refresh_collectors() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("GROK_HOME", state.path().join("missing-grok-home"))
@@ -2437,6 +2468,7 @@ impl AgentHomes {
                 self.state.parent().unwrap().join(".local/share"),
             )
             .env("HERDR_PLUGIN_STATE_DIR", &self.state)
+            .env_remove("HERDR_SOCKET_PATH")
             .env("HERDR_CONFIG_FILE", &self.herdr_config)
             .env("CLAUDE_SETTINGS_FILE", &self.claude_settings)
             .env("AGY_SETTINGS_FILE", &self.agy_settings)
@@ -2674,6 +2706,7 @@ fn cursor_hooks_command_writes_a_session_mailbox() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("cursor-hooks")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -3199,6 +3232,7 @@ fn run_pi_event(
     Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
         .env("HERDR_PLUGIN_STATE_DIR", state)
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", herdr)
         .env("CODEX_BIN_PATH", codex)
         .env("CODEX_HOME", codex_home)
@@ -3643,6 +3677,7 @@ fn a_manual_refresh_reads_no_pane_at_all() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args(["refresh", "--provider", "all"])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("GROK_HOME", state.path().join("missing-grok-home"))
@@ -3657,6 +3692,10 @@ fn a_manual_refresh_reads_no_pane_at_all() {
         .env(
             "CURSOR_STATE_DB",
             state.path().join("absent-cursor-state.vscdb"),
+        )
+        .env(
+            "CLAUDE_CREDENTIALS_FILE",
+            state.path().join("absent-claude-auth.json"),
         )
         .output()
         .unwrap();
@@ -3685,7 +3724,12 @@ fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args(["refresh", "--provider", "claude"])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
+        .env_remove("HERDR_SOCKET_PATH")
         .env("HERDR_BIN_PATH", &herdr)
+        .env(
+            "CLAUDE_CREDENTIALS_FILE",
+            state.path().join("absent-claude-auth.json"),
+        )
         .output()
         .unwrap();
     assert!(output.status.success());
