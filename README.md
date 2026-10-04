@@ -73,7 +73,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Fields | Provider, topic, model, context, short/long/monthly quota on by default; cache and TTL optional |
 | Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
 | Low quota alert | Off or a threshold from 1% to 100% |
-| Icon size | Small, medium (default), or large sidebar icon. WezTerm only: press Ctrl+Shift+R after applying. Other terminals keep their own icon size; body text never changes |
+| Icon size | Small, medium (default), or large sidebar icon. WezTerm only: the size name goes to `herdr-icon-size.local.json` in the WezTerm config folder; press Ctrl+Shift+R after applying. Other terminals keep their own icon size; body text never changes |
 | Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor, Hermes |
 
 Use arrows or Space to edit, `a` to apply, and `q` to close.

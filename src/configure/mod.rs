@@ -7,6 +7,7 @@ pub mod herdr;
 pub mod hermes;
 mod integration;
 mod statusline;
+pub mod wezterm;
 
 use crate::cache::CacheStore;
 use crate::cli::{
@@ -75,6 +76,10 @@ pub fn run(
         herdr::uninstall(agents, full, fields, brand)?;
         if full {
             font::uninstall(cache.root())?;
+            // A /mnt/c hiccup must not leave the rest of the uninstall undone.
+            if let Err(error) = wezterm::uninstall(&wezterm::size_file(), cache.root()) {
+                println!("WezTerm icon size file left in place: {error:#}");
+            }
             // Herdr keeps this view until something clears it, so an uninstall
             // that skipped it would leave the panel sorted by a token this
             // plugin no longer publishes.
@@ -150,8 +155,11 @@ pub fn run(
         cache.set_agent_order(order)?;
         prefs::write(prefs::AGENT_ORDER, order.as_str())?;
         apply_agent_order(order);
+        // The preference is saved even when the export fails, so the next
+        // apply retries it; the note says which happened.
         let size = persist_icon_size(options.icon_size)?;
-        println!("{}", icon_size_note(size));
+        let export = wezterm::export(size, &wezterm::size_file(), cache.root());
+        println!("{}", export.note(size));
         if agents.contains(&Harness::Claude) {
             claude::apply_with_refresh_interval(interval)?;
         }
@@ -181,7 +189,10 @@ pub fn run(
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Agent panel order: {}.", order.as_str());
         println!("Low quota alert: {alert}.");
-        println!("{}", icon_size_note(resolved_icon_size(options.icon_size)));
+        println!(
+            "Icon size: {} (WezTerm only).",
+            resolved_icon_size(options.icon_size).as_str()
+        );
         if agents.contains(&Harness::Claude) {
             claude::check()?;
         }
@@ -278,17 +289,6 @@ fn persist_icon_size(explicit: Option<IconSize>) -> Result<IconSize> {
     let size = resolved_icon_size(explicit);
     prefs::write(prefs::ICON_SIZE, size.as_str())?;
     Ok(size)
-}
-
-// The WezTerm-side write belongs right after `persist_icon_size` in `run`,
-// once the adapter's path and schema are fixed. Until then nothing outside
-// the preference changes, and the note says so instead of claiming success.
-fn icon_size_note(size: IconSize) -> String {
-    format!(
-        "Icon size: {} (WezTerm only; other terminals and body text keep their size). \
-         Not applied yet: the WezTerm size file is not connected.",
-        size.as_str()
-    )
 }
 
 /// Hand Herdr the Agent view the user asked for, or give the panel back.
