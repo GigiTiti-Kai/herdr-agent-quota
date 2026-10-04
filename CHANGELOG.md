@@ -16,6 +16,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reports the limits of the key it holds; any provider, endpoint, or account
   switch clears them at once. Other providers show no quota, and another
   CLI's quota is never borrowed.
+- Icon size setting (`small`, `medium`, `large`; settings pane and
+  `--icon-size`). WezTerm only, applied with Ctrl+Shift+R; other terminals
+  keep their own icon size, and body text never changes.
 
 ## [1.6.0] - 2026-09-17
 

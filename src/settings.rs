@@ -13,8 +13,8 @@
 
 use crate::cache::CacheStore;
 use crate::cli::{
-    AgentOrder, AgentSelection, FieldSet, LowQuotaAlert, PercentStyle, SidebarField, SidebarLayout,
-    SidebarRowGap,
+    AgentOrder, AgentSelection, FieldSet, IconSize, LowQuotaAlert, PercentStyle, SidebarField,
+    SidebarLayout, SidebarRowGap,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -46,6 +46,7 @@ enum Choice {
     Interval,
     Order,
     Alert,
+    IconSize,
 }
 
 impl Choice {
@@ -57,6 +58,7 @@ impl Choice {
             Self::Interval => "Watch interval",
             Self::Order => "Agent order",
             Self::Alert => "Low quota alert",
+            Self::IconSize => "Icon size",
         }
     }
 }
@@ -70,6 +72,7 @@ fn rows() -> Vec<Row> {
         Row::Choice(Choice::Interval),
         Row::Choice(Choice::Order),
         Row::Choice(Choice::Alert),
+        Row::Choice(Choice::IconSize),
         Row::Header("Fields"),
     ];
     rows.extend(SidebarField::ALL.into_iter().map(Row::Field));
@@ -87,6 +90,7 @@ pub struct Settings {
     interval_seconds: u64,
     order: AgentOrder,
     alert: LowQuotaAlert,
+    icon_size: IconSize,
     fields: FieldSet,
     /// Indexed by [`AgentSelection::SUPPORTED`], so the whole struct stays
     /// `Copy` and comparing a draft to what is applied is one `==`.
@@ -111,6 +115,7 @@ impl Settings {
                 .unwrap_or(crate::cache::DEFAULT_WATCH_INTERVAL_SECONDS),
             order: crate::configure::resolved_agent_order(None, cache),
             alert: crate::configure::resolved_low_quota_alert(None, cache),
+            icon_size: crate::configure::resolved_icon_size(None),
             fields: crate::configure::resolved_fields(None, cache),
             agents,
         }
@@ -124,6 +129,7 @@ impl Settings {
             Choice::Interval => format_interval(self.interval_seconds),
             Choice::Order => self.order.as_str().to_string(),
             Choice::Alert => self.alert.to_string(),
+            Choice::IconSize => self.icon_size.as_str().to_string(),
         }
     }
 
@@ -161,6 +167,9 @@ impl Settings {
                 true => "no notification",
                 false => "notify once per provider on the way down",
             },
+            // Other terminals have no icon scale, and WezTerm only rereads
+            // its config on a reload, so the hint names both.
+            Choice::IconSize => "WezTerm only · then Ctrl+Shift+R",
         }
     }
 
@@ -225,6 +234,15 @@ impl Settings {
                 let next = (current as i8 + step).rem_euclid(count);
                 self.alert = LowQuotaAlert::CHOICES[next as usize];
             }
+            Row::Choice(Choice::IconSize) => {
+                let current = IconSize::CHOICES
+                    .iter()
+                    .position(|value| *value == self.icon_size)
+                    .unwrap_or(1);
+                let count = IconSize::CHOICES.len() as i8;
+                let next = (current as i8 + step).rem_euclid(count);
+                self.icon_size = IconSize::CHOICES[next as usize];
+            }
             Row::Choice(Choice::Interval) => {
                 let current = INTERVALS
                     .iter()
@@ -269,6 +287,8 @@ impl Settings {
             self.order.as_str().to_string(),
             "--low-quota-alert".to_string(),
             self.alert.to_string(),
+            "--icon-size".to_string(),
+            self.icon_size.as_str().to_string(),
         ];
         arguments.push("--watch-interval-seconds".to_string());
         arguments.push(self.interval_seconds.to_string());
@@ -599,6 +619,7 @@ mod tests {
             interval_seconds: 60,
             order: AgentOrder::Quota,
             alert: LowQuotaAlert::OFF,
+            icon_size: IconSize::Medium,
             fields: FieldSet::all(),
             agents: [true; AgentSelection::SUPPORTED.len()],
         }
@@ -660,6 +681,25 @@ mod tests {
         assert_eq!(draft.interval_seconds, INTERVALS[0]);
     }
 
+    /// The icon size steps through all three sizes in both directions, and
+    /// its row keeps the WezTerm-only hint inside the pane width.
+    #[test]
+    fn the_icon_size_cycles_three_ways_and_its_hint_fits() {
+        let mut draft = settings();
+        draft.cycle(Row::Choice(Choice::IconSize), 1);
+        assert_eq!(draft.icon_size, IconSize::Large);
+        draft.cycle(Row::Choice(Choice::IconSize), 1);
+        assert_eq!(draft.icon_size, IconSize::Small);
+        draft.cycle(Row::Choice(Choice::IconSize), -1);
+        assert_eq!(draft.icon_size, IconSize::Large);
+
+        let row = render_row(&draft, settings(), Row::Choice(Choice::IconSize), true);
+        assert!(row.contains("> * Icon size"), "{row}");
+        assert!(row.contains("WezTerm only"), "{row}");
+        assert!(row.contains("Ctrl+Shift+R"), "{row}");
+        assert!(row.trim_end().chars().count() <= 70, "too wide: {row}");
+    }
+
     /// An unknown stored interval (`configure` accepts any value in range)
     /// must not trap the list: the first press lands on a known entry.
     #[test]
@@ -711,6 +751,8 @@ mod tests {
                 "quota",
                 "--low-quota-alert",
                 "off",
+                "--icon-size",
+                "medium",
                 "--watch-interval-seconds",
                 "60",
             ]

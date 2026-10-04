@@ -130,6 +130,11 @@ pub enum Command {
         /// percentage or below. `off` (default) never notifies.
         #[arg(long, value_parser = parse_low_quota_alert)]
         low_quota_alert: Option<LowQuotaAlert>,
+        /// Sidebar icon size in WezTerm: small, medium (default), or large.
+        /// Other terminals keep their own size, and body text never changes.
+        /// Press Ctrl+Shift+R in WezTerm after applying.
+        #[arg(long, value_enum)]
+        icon_size: Option<IconSize>,
     },
     /// Render the settings pane shown in the Herdr popup pane.
     Settings,
@@ -534,6 +539,7 @@ pub struct ConfigureOptions {
     pub brand_colors: Option<BrandColors>,
     pub agent_order: Option<AgentOrder>,
     pub low_quota_alert: Option<LowQuotaAlert>,
+    pub icon_size: Option<IconSize>,
 }
 
 /// Which side of a quota window a percentage reports.
@@ -705,6 +711,42 @@ impl AgentOrder {
             .ok()
             .as_deref()
             .and_then(Self::parse)
+    }
+}
+
+/// How large WezTerm draws the sidebar's vendor icon.
+///
+/// Only the icon font's scale changes; body text keeps its size, and the
+/// cells reserved after the icon are the same for every size. Other
+/// terminals have no such scale, so the choice is stored but changes nothing
+/// there. `medium` is the scale the sidebar was laid out for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum IconSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl IconSize {
+    /// The order the settings pane cycles through.
+    pub const CHOICES: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "small" => Some(Self::Small),
+            "medium" => Some(Self::Medium),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
     }
 }
 
@@ -1024,6 +1066,19 @@ mod tests {
         assert_eq!(AgentOrder::parse(" QUOTA "), Some(AgentOrder::Quota));
         assert_eq!(AgentOrder::parse("sideways"), None);
         assert_eq!(AgentOrder::default(), AgentOrder::Quota);
+    }
+
+    /// `medium` is the size the sidebar was laid out for, so an install that
+    /// never chose one keeps it, and a value nobody recognises is not a size.
+    #[test]
+    fn an_icon_size_round_trips_and_defaults_to_the_current_scale() {
+        for size in IconSize::CHOICES {
+            assert_eq!(IconSize::parse(size.as_str()), Some(size));
+        }
+        assert_eq!(IconSize::parse(" LARGE \n"), Some(IconSize::Large));
+        assert_eq!(IconSize::parse("huge"), None);
+        assert_eq!(IconSize::parse("1.3"), None);
+        assert_eq!(IconSize::default(), IconSize::Medium);
     }
 
     #[test]
