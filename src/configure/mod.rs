@@ -7,10 +7,11 @@ pub mod herdr;
 pub mod hermes;
 mod integration;
 mod statusline;
+pub mod wezterm;
 
 use crate::cache::CacheStore;
 use crate::cli::{
-    AgentOrder, AgentSelection, BrandColors, ConfigureOptions, FieldSet, LowQuotaAlert,
+    AgentOrder, AgentSelection, BrandColors, ConfigureOptions, FieldSet, IconSize, LowQuotaAlert,
     PercentStyle, SidebarLayout, SidebarRowGap,
 };
 use crate::model::Harness;
@@ -75,6 +76,10 @@ pub fn run(
         herdr::uninstall(agents, full, fields, brand)?;
         if full {
             font::uninstall(cache.root())?;
+            // A /mnt/c hiccup must not leave the rest of the uninstall undone.
+            if let Err(error) = wezterm::uninstall(&wezterm::size_file(), cache.root()) {
+                println!("WezTerm icon size file left in place: {error:#}");
+            }
             // Herdr keeps this view until something clears it, so an uninstall
             // that skipped it would leave the panel sorted by a token this
             // plugin no longer publishes.
@@ -150,6 +155,11 @@ pub fn run(
         cache.set_agent_order(order)?;
         prefs::write(prefs::AGENT_ORDER, order.as_str())?;
         apply_agent_order(order);
+        // The preference is saved even when the export fails, so the next
+        // apply retries it; the note says which happened.
+        let size = persist_icon_size(options.icon_size)?;
+        let export = wezterm::export(size, &wezterm::size_file(), cache.root());
+        println!("{}", export.note(size));
         if agents.contains(&Harness::Claude) {
             claude::apply_with_refresh_interval(interval)?;
         }
@@ -179,6 +189,10 @@ pub fn run(
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Agent panel order: {}.", order.as_str());
         println!("Low quota alert: {alert}.");
+        println!(
+            "Icon size: {} (WezTerm only).",
+            resolved_icon_size(options.icon_size).as_str()
+        );
         if agents.contains(&Harness::Claude) {
             claude::check()?;
         }
@@ -260,6 +274,23 @@ pub(crate) fn resolved_low_quota_alert(
         .unwrap_or_default()
 }
 
+/// A flag wins, then the stored choice. There is no environment channel and
+/// no cache copy: install.sh and the settings pane both reach `configure`
+/// through the preference, so it is the one place the choice lives.
+pub(crate) fn resolved_icon_size(explicit: Option<IconSize>) -> IconSize {
+    explicit
+        .or_else(|| prefs::read(prefs::ICON_SIZE).and_then(|value| IconSize::parse(&value)))
+        .unwrap_or_default()
+}
+
+/// Store the icon size this run resolved. Only the `icon-size` preference is
+/// written; every other preference is left as it was.
+fn persist_icon_size(explicit: Option<IconSize>) -> Result<IconSize> {
+    let size = resolved_icon_size(explicit);
+    prefs::write(prefs::ICON_SIZE, size.as_str())?;
+    Ok(size)
+}
+
 /// Hand Herdr the Agent view the user asked for, or give the panel back.
 ///
 /// Never fatal. The rows and collectors are already written by the time this
@@ -301,5 +332,52 @@ mod tests {
             Harness::Agy
         ]));
         assert!(!is_full(&[]));
+    }
+
+    /// A corrupt or foreign icon-size file must not stop a repair: it reads
+    /// as unset, and the run lands on `medium`, the size the sidebar was
+    /// laid out for.
+    #[test]
+    fn an_unreadable_icon_size_falls_back_to_medium() {
+        let directory = tempfile::tempdir().unwrap();
+        prefs::testing::with_config_dir(directory.path(), || {
+            assert_eq!(resolved_icon_size(None), IconSize::Medium);
+            for stored in ["huge", "1.3", "中"] {
+                prefs::write(prefs::ICON_SIZE, stored).unwrap();
+                assert_eq!(resolved_icon_size(None), IconSize::Medium, "{stored}");
+            }
+        });
+    }
+
+    /// A run that does not name a size keeps the one the user chose, and
+    /// writing the size touches no other preference.
+    #[test]
+    fn applying_keeps_the_chosen_icon_size_and_every_other_preference() {
+        let directory = tempfile::tempdir().unwrap();
+        prefs::testing::with_config_dir(directory.path(), || {
+            let unrelated = [
+                (prefs::AGENTS, "only,claude,codex,hermes\n"),
+                (prefs::AGENT_ORDER, "default\n"),
+                (prefs::ROW_GAP, "0\n"),
+            ];
+            for (name, value) in unrelated {
+                prefs::write(name, value).unwrap();
+            }
+            prefs::write(prefs::ICON_SIZE, "large\n").unwrap();
+
+            assert_eq!(persist_icon_size(None).unwrap(), IconSize::Large);
+            assert_eq!(prefs::read(prefs::ICON_SIZE).as_deref(), Some("large"));
+
+            assert_eq!(
+                persist_icon_size(Some(IconSize::Small)).unwrap(),
+                IconSize::Small
+            );
+            assert_eq!(resolved_icon_size(None), IconSize::Small);
+
+            for (name, value) in unrelated {
+                let raw = std::fs::read_to_string(directory.path().join(name)).unwrap();
+                assert_eq!(raw, value, "{name}");
+            }
+        });
     }
 }

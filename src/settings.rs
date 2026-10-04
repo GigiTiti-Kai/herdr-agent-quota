@@ -13,8 +13,8 @@
 
 use crate::cache::CacheStore;
 use crate::cli::{
-    AgentOrder, AgentSelection, FieldSet, LowQuotaAlert, PercentStyle, SidebarField, SidebarLayout,
-    SidebarRowGap,
+    AgentOrder, AgentSelection, FieldSet, IconSize, LowQuotaAlert, PercentStyle, SidebarField,
+    SidebarLayout, SidebarRowGap,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -46,6 +46,7 @@ enum Choice {
     Interval,
     Order,
     Alert,
+    IconSize,
 }
 
 impl Choice {
@@ -57,6 +58,7 @@ impl Choice {
             Self::Interval => "Watch interval",
             Self::Order => "Agent order",
             Self::Alert => "Low quota alert",
+            Self::IconSize => "Icon size",
         }
     }
 }
@@ -70,6 +72,7 @@ fn rows() -> Vec<Row> {
         Row::Choice(Choice::Interval),
         Row::Choice(Choice::Order),
         Row::Choice(Choice::Alert),
+        Row::Choice(Choice::IconSize),
         Row::Header("Fields"),
     ];
     rows.extend(SidebarField::ALL.into_iter().map(Row::Field));
@@ -87,6 +90,7 @@ pub struct Settings {
     interval_seconds: u64,
     order: AgentOrder,
     alert: LowQuotaAlert,
+    icon_size: IconSize,
     fields: FieldSet,
     /// Indexed by [`AgentSelection::SUPPORTED`], so the whole struct stays
     /// `Copy` and comparing a draft to what is applied is one `==`.
@@ -111,6 +115,7 @@ impl Settings {
                 .unwrap_or(crate::cache::DEFAULT_WATCH_INTERVAL_SECONDS),
             order: crate::configure::resolved_agent_order(None, cache),
             alert: crate::configure::resolved_low_quota_alert(None, cache),
+            icon_size: crate::configure::resolved_icon_size(None),
             fields: crate::configure::resolved_fields(None, cache),
             agents,
         }
@@ -124,6 +129,7 @@ impl Settings {
             Choice::Interval => format_interval(self.interval_seconds),
             Choice::Order => self.order.as_str().to_string(),
             Choice::Alert => self.alert.to_string(),
+            Choice::IconSize => self.icon_size.as_str().to_string(),
         }
     }
 
@@ -161,6 +167,9 @@ impl Settings {
                 true => "no notification",
                 false => "notify once per provider on the way down",
             },
+            // Other terminals have no icon scale, and WezTerm only rereads
+            // its config on a reload, so the hint names both.
+            Choice::IconSize => "WezTerm only · then Ctrl+Shift+R",
         }
     }
 
@@ -225,6 +234,15 @@ impl Settings {
                 let next = (current as i8 + step).rem_euclid(count);
                 self.alert = LowQuotaAlert::CHOICES[next as usize];
             }
+            Row::Choice(Choice::IconSize) => {
+                let current = IconSize::CHOICES
+                    .iter()
+                    .position(|value| *value == self.icon_size)
+                    .unwrap_or(1);
+                let count = IconSize::CHOICES.len() as i8;
+                let next = (current as i8 + step).rem_euclid(count);
+                self.icon_size = IconSize::CHOICES[next as usize];
+            }
             Row::Choice(Choice::Interval) => {
                 let current = INTERVALS
                     .iter()
@@ -269,6 +287,8 @@ impl Settings {
             self.order.as_str().to_string(),
             "--low-quota-alert".to_string(),
             self.alert.to_string(),
+            "--icon-size".to_string(),
+            self.icon_size.as_str().to_string(),
         ];
         arguments.push("--watch-interval-seconds".to_string());
         arguments.push(self.interval_seconds.to_string());
@@ -388,14 +408,24 @@ fn attempt_apply(draft: Settings, applied: &mut Settings, confirming: bool) -> (
         );
     }
     match apply(draft, &removed) {
-        Ok(()) => {
+        Ok(icon_note) => {
+            let size_changed = draft.icon_size != applied.icon_size;
             *applied = draft;
-            (
-                "Applied. Restart running agent panes to reload hooks.".to_string(),
-                false,
-            )
+            (applied_status(size_changed, icon_note), false)
         }
         Err(error) => (format!("Failed: {error}"), false),
+    }
+}
+
+/// The line shown after a successful apply. The icon size export is the one
+/// part that can fail without failing `configure`, so its note replaces the
+/// plain message whenever it did not save, and whenever the size changed.
+fn applied_status(size_changed: bool, icon_note: Option<String>) -> String {
+    match icon_note {
+        Some(note) if size_changed || !note.ends_with(crate::configure::wezterm::SAVED) => {
+            note.chars().take(66).collect()
+        }
+        _ => "Applied. Restart running agent panes to reload hooks.".to_string(),
     }
 }
 
@@ -404,7 +434,9 @@ fn attempt_apply(draft: Settings, applied: &mut Settings, confirming: bool) -> (
 /// `configure` runs as a child process rather than in-process: it prints a
 /// report, and this screen is in raw mode. The child inherits Herdr's plugin
 /// environment, which is what lets it write at all.
-fn apply(settings: Settings, removed: &[Harness]) -> Result<()> {
+///
+/// Returns the icon size line `configure` printed, if any.
+fn apply(settings: Settings, removed: &[Harness]) -> Result<Option<String>> {
     let executable = std::env::current_exe().context("resolve plugin executable")?;
     if !removed.is_empty() {
         run_self(&executable, &Settings::uninstall_arguments(removed))?;
@@ -415,7 +447,11 @@ fn apply(settings: Settings, removed: &[Harness]) -> Result<()> {
         prefs::AGENTS,
         &AgentSelection::as_stored_list(&settings.agents()),
     )?;
-    run_self(&executable, &settings.apply_arguments())?;
+    let report = run_self(&executable, &settings.apply_arguments())?;
+    let icon_note = report
+        .lines()
+        .find(|line| line.starts_with("Icon size "))
+        .map(str::to_string);
 
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     let reload = Command::new(herdr)
@@ -440,10 +476,12 @@ fn apply(settings: Settings, removed: &[Harness]) -> Result<()> {
             "all".to_string(),
             "--force".to_string(),
         ],
-    )
+    )?;
+    Ok(icon_note)
 }
 
-fn run_self(executable: &std::path::Path, arguments: &[String]) -> Result<()> {
+/// Run this binary and return what it printed.
+fn run_self(executable: &std::path::Path, arguments: &[String]) -> Result<String> {
     let output = Command::new(executable)
         .args(arguments)
         .output()
@@ -460,7 +498,7 @@ fn run_self(executable: &std::path::Path, arguments: &[String]) -> Result<()> {
                 .unwrap_or_else(|| "configure failed".to_string())
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn first_line(text: &str) -> Option<String> {
@@ -599,6 +637,7 @@ mod tests {
             interval_seconds: 60,
             order: AgentOrder::Quota,
             alert: LowQuotaAlert::OFF,
+            icon_size: IconSize::Medium,
             fields: FieldSet::all(),
             agents: [true; AgentSelection::SUPPORTED.len()],
         }
@@ -660,6 +699,48 @@ mod tests {
         assert_eq!(draft.interval_seconds, INTERVALS[0]);
     }
 
+    /// The icon size steps through all three sizes in both directions, and
+    /// its row keeps the WezTerm-only hint inside the pane width.
+    #[test]
+    fn the_icon_size_cycles_three_ways_and_its_hint_fits() {
+        let mut draft = settings();
+        draft.cycle(Row::Choice(Choice::IconSize), 1);
+        assert_eq!(draft.icon_size, IconSize::Large);
+        draft.cycle(Row::Choice(Choice::IconSize), 1);
+        assert_eq!(draft.icon_size, IconSize::Small);
+        draft.cycle(Row::Choice(Choice::IconSize), -1);
+        assert_eq!(draft.icon_size, IconSize::Large);
+
+        let row = render_row(&draft, settings(), Row::Choice(Choice::IconSize), true);
+        assert!(row.contains("> * Icon size"), "{row}");
+        assert!(row.contains("WezTerm only"), "{row}");
+        assert!(row.contains("Ctrl+Shift+R"), "{row}");
+        assert!(row.trim_end().chars().count() <= 70, "too wide: {row}");
+    }
+
+    /// "Applied." alone must not hide an icon size that did not export, and
+    /// a size the user just changed reports where it went.
+    #[test]
+    fn the_status_after_apply_never_hides_a_failed_icon_export() {
+        use crate::configure::wezterm::Export;
+        let saved = Export::Saved.note(IconSize::Large);
+        let refused = Export::Refused("file not made by this plugin").note(IconSize::Large);
+        let unsupported = Export::Unsupported.note(IconSize::Medium);
+        let long = Export::Failed("x".repeat(200)).note(IconSize::Small);
+
+        assert_eq!(applied_status(true, Some(saved.clone())), saved);
+        assert!(applied_status(false, Some(saved)).starts_with("Applied."));
+        assert_eq!(applied_status(false, Some(refused.clone())), refused);
+        assert_eq!(
+            applied_status(false, Some(unsupported.clone())),
+            unsupported
+        );
+        assert!(applied_status(false, None).starts_with("Applied."));
+        let shown = applied_status(true, Some(long));
+        assert!(shown.starts_with("Icon size small not exported"), "{shown}");
+        assert!(format!("  {shown}").chars().count() <= 70, "{shown}");
+    }
+
     /// An unknown stored interval (`configure` accepts any value in range)
     /// must not trap the list: the first press lands on a known entry.
     #[test]
@@ -711,6 +792,8 @@ mod tests {
                 "quota",
                 "--low-quota-alert",
                 "off",
+                "--icon-size",
+                "medium",
                 "--watch-interval-seconds",
                 "60",
             ]

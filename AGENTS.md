@@ -288,6 +288,34 @@ network; `tests/hermes_plugin/test_real_hermes.py` refuses to start anywhere
 else. That test is `#[ignore]`d in `tests/hermes_plugin.rs` because it needs a
 local Hermes install and bubblewrap.
 
+## The WezTerm icon size file
+
+`configure --apply` exports the `icon-size` preference to
+`/mnt/c/Users/hadas/.config/wezterm/herdr-icon-size.local.json`
+(`src/configure/wezterm.rs`) as `{"icon_size":"<name>"}`, UTF-8 without a BOM.
+WezTerm's own `herdr_icon_size.lua` owns the name → scale mapping; never add a
+number for it here. Rules:
+
+1. **Only that one file.** Never edit `wezterm.lua` or anything else in the
+   folder, and never create the folder: a host without it is unsupported.
+2. **Ours means bytes we wrote** (sha256 in `owned-wezterm-icon-size` in the
+   plugin state dir). The marker is published first — owning old and new —
+   then the file is swapped, then the marker narrows; a marker that cannot be
+   written stops the export before the file changes. A symlink, a hand edit,
+   extra keys, or a file over 4096 bytes is refused and reported, never
+   overwritten; uninstall removes only our file, and WezTerm reads the missing
+   file as `medium`.
+3. **The rename is not atomic.** `/mnt/c` is 9P, which has no
+   rename-over-existing, so a reader can briefly see no file. The reader's
+   fallback to `medium` is what makes that safe; do not describe the write as
+   atomic. Identical bytes are not rewritten.
+4. **Tests never use the real path.** Any test that runs `configure --apply`
+   sets `HERDR_AGENT_QUOTA_WEZTERM_ICON_SIZE_FILE` into its fixture; without
+   it the binary exports to the developer's real WezTerm folder.
+5. **A failed export is not a failed configure.** The preference is still
+   saved, the next apply retries, and the `Icon size … not exported` line must
+   reach the user: the settings pane shows it instead of `Applied.`.
+
 ## Herdr state this plugin owns outside a pane
 
 Two things reach past the pane metadata, and both are global to the Herdr

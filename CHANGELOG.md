@@ -16,6 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reports the limits of the key it holds; any provider, endpoint, or account
   switch clears them at once. Other providers show no quota, and another
   CLI's quota is never borrowed.
+- Icon size setting (`small`, `medium`, `large`; settings pane and
+  `--icon-size`). `configure` writes the size name to
+  `herdr-icon-size.local.json` in the WezTerm config folder, and WezTerm picks
+  it up on Ctrl+Shift+R. Other terminals keep their own icon size, and body
+  text never changes. A host without that folder, or a file the plugin did
+  not write, is reported rather than created or overwritten.
 
 ## [1.6.0] - 2026-09-17
 

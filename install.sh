@@ -11,6 +11,7 @@
 #   ./install.sh --fields topic,model,context,5h,7d
 #   ./install.sh --agent-order default
 #   ./install.sh --low-quota-alert 10
+#   ./install.sh --icon-size large
 #
 # --agent installs only the agents you name (all, claude, codex, grok, agy,
 # opencode, pi, omp, devin, muse, cursor, hermes). Anything you leave out gets no sidebar row, no
@@ -43,6 +44,10 @@
 # per provider, when its remaining quota falls to that number or below, and
 # again only after it has recovered above it.
 #
+# --icon-size small, medium (default), or large sets how big WezTerm draws the
+# sidebar icon; press Ctrl+Shift+R in WezTerm afterwards. Other terminals keep
+# their own icon size, and body text never changes size.
+#
 # Everything here can also be changed later in the Agent quota settings pane.
 #
 # Every option is written to the plugin config directory before configure runs.
@@ -65,6 +70,7 @@ QUOTA_PERCENT=""
 FIELDS=""
 AGENT_ORDER=""
 LOW_QUOTA_ALERT=""
+ICON_SIZE=""
 
 while (($# > 0)); do
   case "$1" in
@@ -116,8 +122,13 @@ while (($# > 0)); do
       LOW_QUOTA_ALERT="$2"
       shift 2
       ;;
+    --icon-size)
+      (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
+      ICON_SIZE="$2"
+      shift 2
+      ;;
     -h|--help)
-      sed -n '2,53p' "$0"
+      sed -n '2,59p' "$0"
       exit 0
       ;;
     *)
@@ -158,6 +169,10 @@ case "$LOW_QUOTA_ALERT" in
   *) ((LOW_QUOTA_ALERT <= 100)) \
     || die "low-quota-alert must be off or a percentage from 0 to 100" ;;
 esac
+case "$ICON_SIZE" in
+  ""|small|medium|large) ;;
+  *) die "icon-size must be small, medium, or large" ;;
+esac
 # The field list is validated by configure, which owns the field names.
 
 printf '%s\n' '→ building herdr-agent-quota'
@@ -188,6 +203,7 @@ write_plugin_pref quota-percent "$QUOTA_PERCENT"
 write_plugin_pref fields "$FIELDS"
 write_plugin_pref agent-order "$AGENT_ORDER"
 write_plugin_pref low-quota-alert "$LOW_QUOTA_ALERT"
+write_plugin_pref icon-size "$ICON_SIZE"
 
 printf '%s\n' '→ installing reversible sidebar and provider collectors'
 invoke_action_and_wait configure || die "configuration action failed"
