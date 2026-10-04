@@ -2487,6 +2487,14 @@ impl AgentHomes {
                 self.state.join("hermes-absent"),
             )
             .env("HERDR_BIN_PATH", self.state.join("herdr-absent"))
+            // Never the developer's own WezTerm folder: an absent one exports nothing.
+            .env(
+                "HERDR_AGENT_QUOTA_WEZTERM_ICON_SIZE_FILE",
+                self.state
+                    .parent()
+                    .unwrap()
+                    .join("wezterm-absent/herdr-icon-size.local.json"),
+            )
             .output()
             .unwrap()
     }
@@ -2494,6 +2502,22 @@ impl AgentHomes {
     fn sidebar(&self) -> String {
         fs::read_to_string(&self.herdr_config).unwrap_or_default()
     }
+}
+
+/// A fixture `configure --apply` exports the icon size into the fixture,
+/// never into the developer's real WezTerm folder. That folder exists here,
+/// so a leak would report "saved" or "not made by this plugin" instead.
+#[test]
+fn fixture_configure_never_reaches_the_real_wezterm_folder() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    let output = homes.configure(&["--apply", "--agent", "codex"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Icon size medium not exported: no WezTerm config folder."),
+        "{stdout}"
+    );
 }
 
 #[test]

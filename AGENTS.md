@@ -309,7 +309,10 @@ number for it here. Rules:
    rename-over-existing, so a reader can briefly see no file. The reader's
    fallback to `medium` is what makes that safe; do not describe the write as
    atomic. Identical bytes are not rewritten.
-4. **A failed export is not a failed configure.** The preference is still
+4. **Tests never use the real path.** Any test that runs `configure --apply`
+   sets `HERDR_AGENT_QUOTA_WEZTERM_ICON_SIZE_FILE` into its fixture; without
+   it the binary exports to the developer's real WezTerm folder.
+5. **A failed export is not a failed configure.** The preference is still
    saved, the next apply retries, and the `Icon size … not exported` line must
    reach the user: the settings pane shows it instead of `Applied.`.
 
