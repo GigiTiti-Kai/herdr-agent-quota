@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! `configure` end to end against a fixture WezTerm folder: the writer runs,
 //! the JSON reads back, and every outcome lands in the report.
 //!
