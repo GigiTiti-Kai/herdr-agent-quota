@@ -362,7 +362,8 @@ impl MetadataTokens {
                 all_windows,
                 now_unix,
                 row,
-            ));
+            ))
+            .filter(|account| !account.segments.is_empty());
             values.clear_window_rows();
         }
         values
@@ -1139,6 +1140,26 @@ mod tests {
         assert_eq!(off.account, None);
         assert!(off.quota_5h.starts_with("5h "), "{off:?}");
         assert!(off.quota_week_scoped.contains("Fab"), "{off:?}");
+    }
+
+    /// A pane with nothing to summarise supplies no row, so it cannot shadow
+    /// a populated sibling of the same family; its window strings stay blank.
+    #[test]
+    fn a_summary_without_segments_is_no_account_row() {
+        let row = RowStyle {
+            fields: FieldSet::parse("none").unwrap(),
+            ..summary_style(SummaryFormat::Compact)
+        };
+        let values =
+            MetadataTokens::from_snapshot_for_pane_with_fields(&spec_claude(), 0, None, row);
+        assert_eq!(values.account, None);
+        assert!(
+            values.quota_5h.is_empty() && values.quota_week.is_empty(),
+            "{values:?}"
+        );
+
+        let empty = ProviderSnapshot::new(Provider::Muse, vec![], 0);
+        assert_eq!(summarised(&empty, 0, SummaryFormat::Compact).account, None);
     }
 
     /// The footer shows the windows the field set shows, like `headroom`.
