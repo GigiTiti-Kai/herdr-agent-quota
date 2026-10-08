@@ -135,6 +135,11 @@ pub enum Command {
         /// Press Ctrl+Shift+R in WezTerm after applying.
         #[arg(long, value_enum)]
         icon_size: Option<IconSize>,
+        /// Agent panel footer: off (default) keeps meters on every agent row;
+        /// compact, bars, or numbers move 5h/7d/30d into one footer row per
+        /// account. Needs a Herdr build that understands `footer`.
+        #[arg(long, value_enum)]
+        account_summary: Option<SummaryFormat>,
     },
     /// Render the settings pane shown in the Herdr popup pane.
     Settings,
@@ -540,6 +545,7 @@ pub struct ConfigureOptions {
     pub agent_order: Option<AgentOrder>,
     pub low_quota_alert: Option<LowQuotaAlert>,
     pub icon_size: Option<IconSize>,
+    pub account_summary: Option<SummaryFormat>,
 }
 
 /// Which side of a quota window a percentage reports.

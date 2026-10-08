@@ -47,6 +47,7 @@ fn main() -> Result<()> {
             agent_order,
             low_quota_alert,
             icon_size,
+            account_summary,
         } => herdr_agent_quota::configure::run(
             check,
             apply,
@@ -62,6 +63,7 @@ fn main() -> Result<()> {
                 agent_order,
                 low_quota_alert,
                 icon_size,
+                account_summary,
             },
         ),
         Command::ClaudeStatusline => herdr_agent_quota::configure::claude::run_statusline_hook(),

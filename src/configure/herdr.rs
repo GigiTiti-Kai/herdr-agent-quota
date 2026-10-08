@@ -1,7 +1,9 @@
 use crate::cli::{
     AgentSelection, BrandColors, FieldSet, SidebarField, SidebarLayout, SidebarRowGap,
+    SummaryFormat,
 };
 use crate::model::Harness;
+use crate::presentation::AccountFamily;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,6 +72,7 @@ const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
 /// Marks `ui.agent_panel_sort` when this plugin wrote Space grouping.
 const AGENT_PANEL_SORT_MARKER: &str = "herdr-agent-quota";
 const PROVIDER_STYLE_MARKER: &str = "herdr-agent-quota-provider";
+const FOOTER_MARKER: &str = "herdr-agent-quota-footer";
 const REFRESH_KEY: &str = "prefix+shift+r";
 const REFRESH_ACTION: &str = "herdr-agent-quota.refresh";
 const SETTINGS_KEY: &str = "prefix+shift+q";
@@ -143,11 +146,12 @@ pub fn check(
     row_gap: SidebarRowGap,
     fields: FieldSet,
     brand: BrandColors,
+    summary: SummaryFormat,
 ) -> Result<()> {
     let path = config_path()?;
     let original = fs::read_to_string(&path).unwrap_or_default();
     let (updated, skipped) =
-        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand)?;
+        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand, summary)?;
     if updated == original {
         println!(
             "Herdr sidebar already contains quota tokens: {}",
@@ -159,7 +163,7 @@ pub fn check(
             layout.as_str(),
             path.display()
         );
-        print_diff_hint(layout, fields, brand);
+        print_diff_hint(layout, fields, brand, summary);
     }
     if let Some(line) = skipped_provider_notice(&skipped) {
         println!("{line}");
@@ -173,12 +177,13 @@ pub fn apply(
     row_gap: SidebarRowGap,
     fields: FieldSet,
     brand: BrandColors,
+    summary: SummaryFormat,
 ) -> Result<()> {
     let path = config_path()?;
     let existed = path.exists();
     let original = fs::read_to_string(&path).unwrap_or_default();
     let (updated, skipped) =
-        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand)?;
+        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand, summary)?;
     if let Some(line) = skipped_provider_notice(&skipped) {
         println!("{line}");
     }
@@ -412,16 +417,19 @@ fn matches_installed_quota_rows(
     for (fields, brand) in variants {
         for layout in SidebarLayout::CHOICES {
             for gap in [SidebarRowGap::FLUSH, SidebarRowGap::SEPARATED] {
-                if add_quota_row_with(
-                    original,
-                    &AgentSelection::SUPPORTED,
-                    layout,
-                    gap,
-                    fields,
-                    brand,
-                )? == current
-                {
-                    return Ok(true);
+                for summary in SummaryFormat::CHOICES {
+                    if add_quota_row_with_summary(
+                        original,
+                        &AgentSelection::SUPPORTED,
+                        layout,
+                        gap,
+                        fields,
+                        brand,
+                        summary,
+                    )? == current
+                    {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -460,7 +468,27 @@ pub fn add_quota_row_with(
     fields: FieldSet,
     brand: BrandColors,
 ) -> Result<String> {
-    Ok(rewrite_quota_sidebar(input, agents, layout, row_gap, fields, brand)?.0)
+    add_quota_row_with_summary(
+        input,
+        agents,
+        layout,
+        row_gap,
+        fields,
+        brand,
+        SummaryFormat::Off,
+    )
+}
+
+pub fn add_quota_row_with_summary(
+    input: &str,
+    agents: &[Harness],
+    layout: SidebarLayout,
+    row_gap: SidebarRowGap,
+    fields: FieldSet,
+    brand: BrandColors,
+    summary: SummaryFormat,
+) -> Result<String> {
+    Ok(rewrite_quota_sidebar(input, agents, layout, row_gap, fields, brand, summary)?.0)
 }
 
 fn rewrite_quota_sidebar(
@@ -470,6 +498,7 @@ fn rewrite_quota_sidebar(
     row_gap: SidebarRowGap,
     fields: FieldSet,
     _brand: BrandColors,
+    summary: SummaryFormat,
 ) -> Result<(String, Vec<&'static str>)> {
     let mut document = if input.trim().is_empty() {
         DocumentMut::new()
@@ -512,7 +541,11 @@ fn rewrite_quota_sidebar(
     let managed_rows = build_managed_rows(
         original_rows,
         layout,
-        fields,
+        if summary.is_on() {
+            without_window_rows(fields)
+        } else {
+            fields
+        },
         if rows_safe {
             RowRewrite::Takeover
         } else {
@@ -533,6 +566,15 @@ fn rewrite_quota_sidebar(
             .decor_mut()
             .set_suffix(format!(" # {MANAGED_ROW_MARKER}"));
         table.insert("rows", Item::Value(rows_value));
+    }
+    // Shared like `row_gap`: written when absent or ours, removed only when ours.
+    let managed_footer = has_footer_marker(table);
+    if summary.is_on() && (managed_footer || !table.contains_key("footer")) {
+        let mut footer = Value::Array(footer_rows(layout));
+        footer.decor_mut().set_suffix(format!(" # {FOOTER_MARKER}"));
+        table.insert("footer", Item::Value(footer));
+    } else if !summary.is_on() && managed_footer {
+        table.remove("footer");
     }
     remove_managed_selection_theme(&mut document);
     Ok((document.to_string(), skipped))
@@ -772,6 +814,9 @@ pub fn remove_quota_row_for(input: &str, agents: &[Harness], full: bool) -> Resu
     if managed_row_gap {
         table.remove("row_gap");
     }
+    if has_footer_marker(table) {
+        table.remove("footer");
+    }
     remove_managed_selection_theme(&mut document);
     remove_managed_panel_sort(&mut document);
     Ok(document.to_string())
@@ -853,8 +898,9 @@ fn strip_quota_tokens(row: &Value) -> Array {
     let mut cleaned = Array::new();
     if let Some(items) = row.as_array() {
         for item in items {
-            let is_quota_token =
-                configured_token_name(item).is_some_and(|value| QUOTA_ROW_MARKERS.contains(&value));
+            let is_quota_token = configured_token_name(item).is_some_and(|value| {
+                QUOTA_ROW_MARKERS.contains(&value) || value.starts_with("$quota_acct_")
+            });
             if !is_quota_token {
                 cleaned.push(item.clone());
             }
@@ -1267,6 +1313,62 @@ fn append_context_style_tokens(row: &mut Array, palette: [&'static str; 3]) {
     }
 }
 
+/// Summary mode: the footer carries 5h, 7d and 30d, so agent rows drop them.
+/// The scoped row stays: a metered pane's `ses` rides it (R7).
+fn without_window_rows(fields: FieldSet) -> FieldSet {
+    [
+        SidebarField::FiveHour,
+        SidebarField::Week,
+        SidebarField::Month,
+    ]
+    .into_iter()
+    .filter(|field| fields.contains(*field))
+    .fold(fields, FieldSet::toggled)
+}
+
+/// The Agent panel footer: a title row, then one row per account family in
+/// R6 order. Every family is written whatever `--agent` says: Herdr drops a
+/// row no pane resolves, and a partial apply must not shrink a shared key.
+fn footer_rows(layout: SidebarLayout) -> Array {
+    let palette = severity_palette(layout);
+    let mut rows = Array::new();
+    rows.push(Value::Array(styled_row(
+        "$quota_acct_title",
+        None,
+        Some(true),
+        Some(true),
+    )));
+    for id in AccountFamily::IDS {
+        let mut row = Array::new();
+        row.push(styled_token(
+            &format!("$quota_acct_{id}_icon"),
+            Some(IDLE_ICON_COLOR),
+            Some(false),
+            Some(false),
+        ));
+        for slot in 1..=3 {
+            append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
+        }
+        row.push(styled_token(
+            &format!("$quota_acct_{id}_reset"),
+            None,
+            Some(false),
+            Some(true),
+        ));
+        rows.push(Value::Array(row));
+    }
+    rows
+}
+
+fn has_footer_marker(table: &Table) -> bool {
+    table
+        .get("footer")
+        .and_then(Item::as_value)
+        .and_then(|value| value.decor().suffix())
+        .and_then(|suffix| suffix.as_str())
+        .is_some_and(|suffix| suffix.contains(FOOTER_MARKER))
+}
+
 fn append_window_row(rows: &mut Array, palette: [&'static str; 3]) {
     let mut row = Array::new();
     for base in ["quota_5h", "quota_week", "quota_week_scoped", "quota_month"] {
@@ -1397,7 +1499,12 @@ fn skipped_provider_label(provider: &str) -> &str {
     }
 }
 
-fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, _brand: BrandColors) {
+fn print_diff_hint(
+    layout: SidebarLayout,
+    fields: FieldSet,
+    _brand: BrandColors,
+    summary: SummaryFormat,
+) {
     println!("  use the Space group header instead of repeating machine, workspace, and tab rows");
     match layout {
         SidebarLayout::Packed => {
@@ -1429,6 +1536,12 @@ fn print_diff_hint(layout: SidebarLayout, fields: FieldSet, _brand: BrandColors)
         .collect();
     if !hidden.is_empty() {
         println!("  leave out {}", hidden.join(", "));
+    }
+    if summary.is_on() {
+        println!(
+            "  move 5h, 7d and 30d into one {} footer row per account; agent rows keep cache, TTL and metered ses",
+            summary.as_str()
+        );
     }
     println!("  paint brand icon idle/working/done (no state_icon ring)");
 }
@@ -2436,6 +2549,7 @@ claude = [["state_icon", "agent"]]
             SidebarRowGap::default(),
             FieldSet::all(),
             BrandColors::On,
+            SummaryFormat::Off,
         )
         .unwrap()
         .1;
@@ -3175,6 +3289,102 @@ mod field_tests {
             matches_installed_quota_rows("", &installed, fields, BrandColors::Off).unwrap(),
             "{installed}"
         );
+    }
+
+    fn summary_install(original: &str, summary: SummaryFormat) -> String {
+        add_quota_row_with_summary(
+            original,
+            &AgentSelection::SUPPORTED,
+            SidebarLayout::Gauges,
+            SidebarRowGap::default(),
+            FieldSet::all(),
+            BrandColors::On,
+            summary,
+        )
+        .unwrap()
+    }
+
+    /// Shared rows (takeover) and per-agent rows (user-owned shared rows) both
+    /// lose 5h/7d/30d; the scoped row stays for a metered `ses` (R7); the
+    /// footer is marked and carries the title plus one <=16-token row per family.
+    #[test]
+    fn summary_mode_writes_a_marked_footer_and_drops_the_window_rows() {
+        for original in [
+            "",
+            "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"pane\", \"terminal_title_stripped\"]]\n",
+        ] {
+            let updated = summary_install(original, SummaryFormat::Compact);
+            for gone in ["$quota_5h_", "$quota_week_normal", "$quota_week_inline_", "$quota_month_"] {
+                assert!(!updated.contains(gone), "{gone}:\n{updated}");
+            }
+            assert!(updated.contains("$quota_week_scoped_normal"), "{updated}");
+            let document = updated.parse::<DocumentMut>().unwrap();
+            let agents = document["ui"]["sidebar"]["agents"].as_table().unwrap();
+            assert!(has_footer_marker(agents), "{updated}");
+            let footer = agents["footer"].as_array().unwrap();
+            assert_eq!(footer.len(), 1 + AccountFamily::IDS.len());
+            let first = footer.get(0).and_then(Value::as_array).and_then(|row| row.get(0));
+            assert_eq!(first.and_then(configured_token_name), Some("$quota_acct_title"));
+            for row in footer.iter().filter_map(Value::as_array) {
+                assert!(row.len() <= 16, "{row}");
+            }
+            assert!(updated.contains("$quota_acct_hm_w3_danger"), "{updated}");
+        }
+    }
+
+    #[test]
+    fn a_user_footer_is_never_touched() {
+        let original = "[ui.sidebar.agents]\nfooter = [[\"$mine\"]]\n";
+        for summary in SummaryFormat::CHOICES {
+            let updated = summary_install(original, summary);
+            assert!(
+                updated.contains("footer = [[\"$mine\"]]"),
+                "{summary:?}:\n{updated}"
+            );
+            assert!(!updated.contains(FOOTER_MARKER), "{summary:?}:\n{updated}");
+        }
+    }
+
+    /// `off` is today's install byte for byte, and any switch between formats
+    /// lands on what a fresh install of the second one writes.
+    #[test]
+    fn off_is_todays_install_and_every_switch_is_a_fresh_install() {
+        let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"tab\", \"agent\"]]\n";
+        let today = add_quota_row_with(
+            original,
+            &AgentSelection::SUPPORTED,
+            SidebarLayout::Gauges,
+            SidebarRowGap::default(),
+            FieldSet::all(),
+            BrandColors::On,
+        )
+        .unwrap();
+        assert_eq!(summary_install(original, SummaryFormat::Off), today);
+        for first in SummaryFormat::CHOICES {
+            for second in SummaryFormat::CHOICES {
+                let switched = summary_install(&summary_install(original, first), second);
+                assert_eq!(
+                    switched,
+                    summary_install(original, second),
+                    "{first:?} then {second:?}"
+                );
+            }
+        }
+    }
+
+    /// Full uninstall restores the empty original from a summary install, and
+    /// the token-strip fallback still removes the managed footer.
+    #[test]
+    fn full_uninstall_removes_a_summary_install() {
+        let installed = summary_install("", SummaryFormat::Bars);
+        assert!(
+            matches_installed_quota_rows("", &installed, FieldSet::all(), BrandColors::On).unwrap()
+        );
+        assert_eq!(remove_quota_row(&installed).unwrap(), "");
+        let edited = installed.replace("prefix+shift+r", "prefix+shift+t");
+        let removed = remove_quota_row(&edited).unwrap();
+        assert!(!removed.contains("footer"), "{removed}");
+        assert!(!removed.contains("$quota_acct_"), "{removed}");
     }
 }
 

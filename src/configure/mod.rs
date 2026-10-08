@@ -12,7 +12,7 @@ pub mod wezterm;
 use crate::cache::CacheStore;
 use crate::cli::{
     AgentOrder, AgentSelection, BrandColors, ConfigureOptions, FieldSet, IconSize, LowQuotaAlert,
-    PercentStyle, SidebarLayout, SidebarRowGap,
+    PercentStyle, SidebarLayout, SidebarRowGap, SummaryFormat,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -89,6 +89,7 @@ pub fn run(
             cache.clear_row_gap()?;
             cache.clear_percent_style()?;
             cache.clear_fields()?;
+            cache.clear_account_summary()?;
             cache.clear_brand_colors()?;
             cache.clear_agent_order()?;
             cache.clear_low_quota_alert()?;
@@ -132,6 +133,9 @@ pub fn run(
         let fields = resolved_fields(options.fields, Some(&cache));
         cache.set_fields(fields)?;
         prefs::write(prefs::FIELDS, &fields.as_list())?;
+        let summary = resolved_account_summary(options.account_summary, Some(&cache));
+        cache.set_account_summary(summary)?;
+        prefs::write(prefs::ACCOUNT_SUMMARY, summary.as_str())?;
         let brand = resolved_brand_colors(options.brand_colors, Some(&cache));
         let alert = resolved_low_quota_alert(options.low_quota_alert, Some(&cache));
         // A new threshold has never warned about anything yet. Without this,
@@ -142,7 +146,7 @@ pub fn run(
         }
         cache.set_low_quota_alert(alert)?;
         prefs::write(prefs::LOW_QUOTA_ALERT, &alert.to_string())?;
-        herdr::apply(agents, layout, gap, fields, brand)?;
+        herdr::apply(agents, layout, gap, fields, brand, summary)?;
         for note in font::install(cache.root())? {
             println!("{note}");
         }
@@ -185,7 +189,8 @@ pub fn run(
         let brand = resolved_brand_colors(options.brand_colors, cache.as_ref());
         let order = resolved_agent_order(options.agent_order, cache.as_ref());
         let alert = resolved_low_quota_alert(options.low_quota_alert, cache.as_ref());
-        herdr::check(agents, layout, gap, fields, brand)?;
+        let summary = resolved_account_summary(options.account_summary, cache.as_ref());
+        herdr::check(agents, layout, gap, fields, brand, summary)?;
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Agent panel order: {}.", order.as_str());
         println!("Low quota alert: {alert}.");
@@ -274,6 +279,20 @@ pub(crate) fn resolved_low_quota_alert(
         .unwrap_or_default()
 }
 
+/// A flag wins, then the stored preference, then the state-dir copy that the
+/// publishers read. No environment channel, like the icon size.
+pub(crate) fn resolved_account_summary(
+    explicit: Option<SummaryFormat>,
+    cache: Option<&CacheStore>,
+) -> SummaryFormat {
+    explicit
+        .or_else(|| {
+            prefs::read(prefs::ACCOUNT_SUMMARY).and_then(|value| SummaryFormat::parse(&value))
+        })
+        .or_else(|| cache.and_then(CacheStore::account_summary))
+        .unwrap_or_default()
+}
+
 /// A flag wins, then the stored choice. There is no environment channel and
 /// no cache copy: install.sh and the settings pane both reach `configure`
 /// through the preference, so it is the one place the choice lives.
@@ -332,6 +351,23 @@ mod tests {
             Harness::Agy
         ]));
         assert!(!is_full(&[]));
+    }
+
+    /// A corrupt stored format reads as unset, so a repair lands on `off` (R9).
+    #[test]
+    fn an_unreadable_account_summary_falls_back_to_off() {
+        let directory = tempfile::tempdir().unwrap();
+        prefs::testing::with_config_dir(directory.path(), || {
+            assert_eq!(resolved_account_summary(None, None), SummaryFormat::Off);
+            prefs::write(prefs::ACCOUNT_SUMMARY, "wide").unwrap();
+            assert_eq!(resolved_account_summary(None, None), SummaryFormat::Off);
+            prefs::write(prefs::ACCOUNT_SUMMARY, "compact\n").unwrap();
+            assert_eq!(resolved_account_summary(None, None), SummaryFormat::Compact);
+            assert_eq!(
+                resolved_account_summary(Some(SummaryFormat::Numbers), None),
+                SummaryFormat::Numbers
+            );
+        });
     }
 
     /// A corrupt or foreign icon-size file must not stop a repair: it reads
