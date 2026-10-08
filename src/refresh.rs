@@ -317,14 +317,8 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
     if snapshot.displayed_quota_has_expired(session_id, now) {
         return true;
     }
-    let values = MetadataTokens::from_snapshot_for_pane_with_fields(
-        &snapshot,
-        now,
-        session_id,
-        row.percent,
-        row.shape,
-        row.fields,
-    );
+    let values =
+        MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, now, session_id, row);
     crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape)
 }
 
@@ -918,7 +912,7 @@ fn resolved_pane_tokens(
                         session_id,
                         &mut values,
                         now,
-                        row.shape,
+                        row,
                     );
                     PaneQuotaUpdate::Replace(Box::new(values))
                 })
@@ -971,7 +965,7 @@ fn apply_metered(
     session_id: Option<&str>,
     values: &mut MetadataTokens,
     now: u64,
-    shape: crate::presentation::SidebarShape,
+    row: RowStyle,
 ) {
     if provider != Provider::Claude {
         return;
@@ -980,7 +974,7 @@ fn apply_metered(
         return;
     };
     if let Some(backend) = crate::metered::session_backend(state_root, session_id, now) {
-        crate::metered::overlay(values, backend, session_id, billing_dir, now, shape);
+        crate::metered::overlay(values, backend, session_id, billing_dir, now, row);
     }
 }
 
@@ -1812,14 +1806,7 @@ fn tokens_for_provider(
     row: RowStyle,
 ) -> Option<MetadataTokens> {
     snapshot.map(|snapshot| {
-        MetadataTokens::from_snapshot_for_pane_with_fields(
-            snapshot,
-            now_unix,
-            session_id,
-            row.percent,
-            row.shape,
-            row.fields,
-        )
+        MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now_unix, session_id, row)
     })
 }
 
@@ -2386,7 +2373,7 @@ mod tests {
             values.quota_5h = "5h 10%".to_string();
             values
         };
-        let shape = crate::presentation::SidebarShape::default();
+        let row = RowStyle::default();
 
         let mut bound = claude_rows();
         apply_metered(
@@ -2396,7 +2383,7 @@ mod tests {
             Some("ds"),
             &mut bound,
             100,
-            shape,
+            row,
         );
         assert_eq!(bound.quota_5h, "bal ?");
         assert_eq!(bound.quota_provider, "DeepSeek");
@@ -2409,7 +2396,7 @@ mod tests {
             Some("other"),
             &mut unbound,
             100,
-            shape,
+            row,
         );
         assert_eq!(unbound.quota_5h, "5h 10%");
 
@@ -2421,7 +2408,7 @@ mod tests {
             Some("ds"),
             &mut codex,
             100,
-            shape,
+            row,
         );
         assert_eq!(codex.quota_5h, "5h 10%");
 
@@ -2433,7 +2420,7 @@ mod tests {
             None,
             &mut no_session,
             100,
-            shape,
+            row,
         );
         assert_eq!(no_session.quota_5h, "5h 10%");
     }

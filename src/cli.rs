@@ -750,6 +750,48 @@ impl IconSize {
     }
 }
 
+/// How the Agent panel footer summarises each account's quota.
+///
+/// `off` keeps today's meters on every agent row and writes no footer. The
+/// other three move 5h/7d/scoped/30d into one footer row per account family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SummaryFormat {
+    /// `5h▱▱▱  0% 7d▰▱▱ 24% 2d2h`: 3-cell bars, then the most-used window's reset.
+    Compact,
+    /// 4-cell bars, no reset.
+    Bars,
+    /// `5h 0% 7d 24% 2d2h`: numbers and the reset.
+    Numbers,
+    /// Per-agent meters, no footer.
+    #[default]
+    Off,
+}
+
+impl SummaryFormat {
+    /// The order the settings pane cycles through, the default first.
+    pub const CHOICES: [Self; 4] = [Self::Off, Self::Compact, Self::Bars, Self::Numbers];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Bars => "bars",
+            Self::Numbers => "numbers",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        Self::CHOICES
+            .into_iter()
+            .find(|format| format.as_str() == name)
+    }
+
+    pub fn is_on(self) -> bool {
+        self != Self::Off
+    }
+}
+
 /// The remaining-quota percentage at or below which a provider gets one
 /// desktop notification. `0` disables the alert entirely.
 ///
@@ -1079,6 +1121,21 @@ mod tests {
         assert_eq!(IconSize::parse("huge"), None);
         assert_eq!(IconSize::parse("1.3"), None);
         assert_eq!(IconSize::default(), IconSize::Medium);
+    }
+
+    /// R9: an install that never chose a format keeps today's per-agent meters.
+    #[test]
+    fn a_summary_format_round_trips_and_defaults_to_off() {
+        for format in SummaryFormat::CHOICES {
+            assert_eq!(SummaryFormat::parse(format.as_str()), Some(format));
+        }
+        assert_eq!(
+            SummaryFormat::parse(" Compact\n"),
+            Some(SummaryFormat::Compact)
+        );
+        assert_eq!(SummaryFormat::parse("wide"), None);
+        assert_eq!(SummaryFormat::default(), SummaryFormat::Off);
+        assert!(!SummaryFormat::Off.is_on() && SummaryFormat::Numbers.is_on());
     }
 
     #[test]

@@ -10,8 +10,8 @@
 
 use crate::model::Severity;
 use crate::presentation::{
-    gauge_cells, meter, provider_model_label, MetadataTokens, SidebarShape, GAUGE_LABEL_WIDTH,
-    NARROW_IDENTITY_CONTENT_WIDTH,
+    gauge_cells, meter, provider_model_label, AccountFamily, AccountSegment, AccountSummary,
+    MetadataTokens, RowStyle, SidebarShape, GAUGE_LABEL_WIDTH, NARROW_IDENTITY_CONTENT_WIDTH,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,21 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// No DeepSeek/OpenRouter glyph exists in the icon font, so the footer
+    /// row is marked with text.
+    pub fn family(self) -> AccountFamily {
+        match self {
+            Self::DeepSeek => AccountFamily {
+                id: "ds",
+                icon: "DS",
+            },
+            Self::OpenRouter => AccountFamily {
+                id: "or",
+                icon: "OR",
+            },
+        }
+    }
+
     /// launcher が export する `CLAUDE_BILLING_BACKEND` の値
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim() {
@@ -242,8 +257,9 @@ pub fn overlay(
     session_id: &str,
     dir: Option<&Path>,
     now: u64,
-    shape: SidebarShape,
+    row: RowStyle,
 ) {
+    let shape = row.shape;
     let summary: Summary = dir
         .and_then(|dir| read_json(&dir.join(format!("summary-{}.json", backend.key()))))
         .unwrap_or_default();
@@ -287,13 +303,9 @@ pub fn overlay(
         shape.content_width,
     );
     (values.quota_5h, values.quota_5h_severity) = balance_row(balance.as_ref(), now, shape);
-    values.quota_week = format!(
-        "day {}{} · mon {}{}",
-        usd(day),
-        flag(day_unpriced),
-        usd(month),
-        flag(month_unpriced)
-    );
+    let day_text = format!("day {}{}", usd(day), flag(day_unpriced));
+    let month_text = format!("mon {}{}", usd(month), flag(month_unpriced));
+    values.quota_week = format!("{day_text} · {month_text}");
     values.quota_week_severity = Some(Severity::Normal);
     values.quota_week_scoped = format!(
         "ses {}{}",
@@ -307,14 +319,42 @@ pub fn overlay(
     values.quota_headroom = None;
     // Claude の usage API の失敗は、このペインの数字とは関係ない
     values.quota_error = None;
+    if row.summary.is_on() {
+        // The bar is a guess against the last top-up, so the footer keeps
+        // only the amount; the colour still carries the fuel level.
+        let (bal, bal_severity) = balance_row(balance.as_ref(), now, SidebarShape::default());
+        values.account = Some(AccountSummary {
+            family: backend.family(),
+            segments: vec![
+                AccountSegment {
+                    text: bal,
+                    severity: bal_severity,
+                },
+                AccountSegment {
+                    text: day_text,
+                    severity: Some(Severity::Normal),
+                },
+                AccountSegment {
+                    text: month_text,
+                    severity: Some(Severity::Normal),
+                },
+            ],
+            reset: String::new(),
+        });
+        // R7: `ses` stays on the agent row (`quota_week_scoped`).
+        values.quota_5h.clear();
+        values.quota_5h_severity = None;
+        values.quota_week.clear();
+        values.quota_week_severity = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::SidebarLayout;
+    use crate::cli::{SidebarLayout, SummaryFormat};
     use crate::model::{Provider, Severity};
-    use crate::presentation::{MetadataTokens, SidebarShape};
+    use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
     use std::fs;
     use tempfile::tempdir;
 
@@ -374,7 +414,17 @@ mod tests {
 
     fn overlaid(dir: &std::path::Path, shape: SidebarShape) -> MetadataTokens {
         let mut values = base();
-        overlay(&mut values, Backend::DeepSeek, "sX", Some(dir), NOW, shape);
+        overlay(
+            &mut values,
+            Backend::DeepSeek,
+            "sX",
+            Some(dir),
+            NOW,
+            RowStyle {
+                shape,
+                ..RowStyle::default()
+            },
+        );
         values
     }
 
@@ -512,6 +562,49 @@ mod tests {
         assert!(!empty.path().join(SESSION_FILE).exists());
     }
 
+    /// R7: `bal` / `day` / `mon` move to the ds row; `ses` stays on the agent row.
+    #[test]
+    fn summary_mode_moves_balance_and_spend_to_the_account_row_and_keeps_ses() {
+        let dir = tempdir().unwrap();
+        summary(dir.path(), "2026-09-24");
+        balance(dir.path(), "ok", 1.5, 10.0);
+        let mut values = base();
+        let row = RowStyle {
+            summary: SummaryFormat::Compact,
+            ..RowStyle::default()
+        };
+        overlay(
+            &mut values,
+            Backend::DeepSeek,
+            "sX",
+            Some(dir.path()),
+            NOW,
+            row,
+        );
+        let account = values.account.clone().unwrap();
+        assert_eq!(account.family, Backend::DeepSeek.family());
+        let segments: Vec<_> = account
+            .segments
+            .iter()
+            .map(|s| (s.text.as_str(), s.severity))
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                ("bal $1.50", Some(Severity::Warning)),
+                ("day $0.21", Some(Severity::Normal)),
+                ("mon $3.40", Some(Severity::Normal)),
+            ]
+        );
+        assert_eq!(account.reset, "");
+        assert_eq!(
+            (values.quota_5h.as_str(), values.quota_week.as_str()),
+            ("", "")
+        );
+        assert_eq!(values.quota_week_scoped, "ses $0.050");
+        assert_eq!(overlaid(dir.path(), packed()).account, None);
+    }
+
     #[test]
     fn a_claude_error_does_not_survive_on_a_metered_row() {
         let dir = tempdir().unwrap();
@@ -523,7 +616,7 @@ mod tests {
             "sX",
             Some(dir.path()),
             NOW,
-            packed(),
+            RowStyle::default(),
         );
         assert_eq!(values.quota_error, None);
     }
