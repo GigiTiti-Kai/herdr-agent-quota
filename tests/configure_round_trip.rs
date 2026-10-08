@@ -1,5 +1,5 @@
 use herdr_agent_quota::cache::CacheStore;
-use herdr_agent_quota::cli::AgentSelection;
+use herdr_agent_quota::cli::{AgentSelection, SummaryFormat};
 use herdr_agent_quota::configure::herdr::{add_quota_row, remove_quota_row};
 use herdr_agent_quota::model::{Harness, Provider, ProviderSnapshot, UsageWindow, WindowKind};
 use std::fs;
@@ -3764,4 +3764,50 @@ fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
     assert!(calls.contains("pane report-metadata w1:p1"), "{calls}");
     assert!(calls.contains("--token quota_icon="), "{calls}");
     assert!(!calls.contains("pane read"), "{calls}");
+}
+
+#[test]
+fn summary_mode_publishes_the_account_row_under_its_own_source() {
+    let state = tempdir().unwrap();
+    let (herdr_stub, herdr_log) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"test-session"}}]}}"#,
+    );
+    // Before the collector, so no off-mode report can precede the summary one.
+    CacheStore::new(state.path())
+        .set_account_summary(SummaryFormat::Compact)
+        .unwrap();
+    let reset = future_reset_unix();
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        claude_statusline_windows("test-session", 58.0, Some(27.0), reset).as_bytes(),
+    );
+    run_claude_refresh(state.path(), &herdr_stub);
+
+    let report = fs::read_to_string(herdr_log).unwrap();
+    let summary = report
+        .lines()
+        .find(|line| line.contains("--source herdr-agent-quota-summary"))
+        .unwrap_or_else(|| panic!("no summary report:\n{report}"));
+    assert!(
+        summary.contains("--token quota_acct_cl_w1_warning=5h▰▱▱ 42%"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("--token quota_acct_cl_w2_normal=7d▰▰▱ 73%"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("--token quota_acct_title=quota"),
+        "{summary}"
+    );
+    let rows = report
+        .lines()
+        .find(|line| line.contains("--source herdr-agent-quota "))
+        .unwrap_or_else(|| panic!("no agent-row report:\n{report}"));
+    assert!(
+        !rows.contains("quota_5h_") && !rows.contains("quota_week_normal"),
+        "{rows}"
+    );
 }

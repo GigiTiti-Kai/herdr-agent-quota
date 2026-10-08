@@ -1,7 +1,7 @@
-use crate::cli::{FieldSet, PercentStyle, SidebarField, SidebarLayout};
+use crate::cli::{FieldSet, PercentStyle, SidebarField, SidebarLayout, SummaryFormat};
 use crate::model::{
-    format_percent, live_windows, printed_percent, window_in, Provider, ProviderSnapshot, ResetAt,
-    Severity, UsageWindow, WindowKind,
+    format_percent, live_windows, printed_percent, window_in, Harness, Provider, ProviderSnapshot,
+    ResetAt, Severity, UsageWindow, WindowKind,
 };
 
 /// Three-character label, three spaces, `100%`, and a six-character ETA.
@@ -74,6 +74,7 @@ pub struct RowStyle {
     pub percent: PercentStyle,
     pub shape: SidebarShape,
     pub fields: FieldSet,
+    pub summary: SummaryFormat,
 }
 
 impl RowStyle {
@@ -82,8 +83,62 @@ impl RowStyle {
             percent,
             shape,
             fields: FieldSet::all(),
+            summary: SummaryFormat::Off,
         }
     }
+}
+
+/// Footer text width: Herdr's 42-column sidebar minus divider and indent (40),
+/// minus the `«` toggle cells on the panel's last row.
+pub(crate) const SUMMARY_ROW_WIDTH: usize = 38;
+
+/// One footer row: tokens `quota_acct_<id>_*`, drawn after `icon`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountFamily {
+    pub id: &'static str,
+    pub icon: &'static str,
+}
+
+impl AccountFamily {
+    /// Every footer row `configure` writes, in display order (R6).
+    pub const IDS: [&'static str; 12] = [
+        "cl", "ds", "or", "cx", "gk", "ag", "dv", "mu", "cu", "og", "om", "hm",
+    ];
+
+    /// A family is keyed by the collector, so a Pi pane that resolved to
+    /// canonical Codex shares the Codex row and nothing is borrowed.
+    pub fn for_provider(provider: Provider) -> Self {
+        let (id, harness) = match provider {
+            Provider::Claude => ("cl", Harness::Claude),
+            Provider::Codex => ("cx", Harness::Codex),
+            Provider::Grok => ("gk", Harness::Grok),
+            Provider::Agy => ("ag", Harness::Agy),
+            Provider::Devin => ("dv", Harness::Devin),
+            Provider::Muse => ("mu", Harness::Muse),
+            Provider::Cursor => ("cu", Harness::Cursor),
+            Provider::OpenCodeGo => ("og", Harness::OpenCode),
+            Provider::Omp => ("om", Harness::Omp),
+            Provider::Hermes => ("hm", Harness::Hermes),
+        };
+        Self {
+            id,
+            icon: crate::icons::for_harness(harness),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSegment {
+    pub text: String,
+    pub severity: Option<Severity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub family: AccountFamily,
+    /// At most three, in 5h / 7d / scoped / 30d order.
+    pub segments: Vec<AccountSegment>,
+    pub reset: String,
 }
 
 impl From<SidebarLayout> for SidebarShape {
@@ -163,6 +218,9 @@ pub struct MetadataTokens {
     /// will hit first is the one worth sorting and warning on, and for a
     /// weekly plan that is often the 7d window.
     pub quota_headroom: Option<u8>,
+    /// The footer row this pane supplies in summary mode; `None` when the
+    /// summary is off or the pane has nothing to show.
+    pub account: Option<AccountSummary>,
 }
 
 impl MetadataTokens {
@@ -216,9 +274,7 @@ impl MetadataTokens {
             snapshot,
             now_unix,
             session_id,
-            style,
-            shape,
-            FieldSet::all(),
+            RowStyle::new(style, shape),
         )
     }
 
@@ -226,9 +282,7 @@ impl MetadataTokens {
         snapshot: &ProviderSnapshot,
         now_unix: u64,
         session_id: Option<&str>,
-        style: PercentStyle,
-        shape: SidebarShape,
-        fields: FieldSet,
+        row: RowStyle,
     ) -> Self {
         let quota_model = match session_id {
             Some(session_id) => snapshot.model_for_session(Some(session_id)),
@@ -237,18 +291,7 @@ impl MetadataTokens {
         let context =
             session_id.and_then(|session_id| snapshot.context_for_session(Some(session_id)));
         let windows = snapshot.windows_for_session(session_id);
-        Self::from_snapshot_parts(
-            snapshot,
-            now_unix,
-            quota_model,
-            context,
-            windows,
-            RowStyle {
-                percent: style,
-                shape,
-                fields,
-            },
-        )
+        Self::from_snapshot_parts(snapshot, now_unix, quota_model, context, windows, row)
     }
 
     fn from_snapshot_parts(
@@ -275,7 +318,7 @@ impl MetadataTokens {
         let weekly = window_in(windows, WindowKind::Weekly);
         let weekly_scoped = window_in(windows, WindowKind::WeeklyScoped);
         let monthly = window_in(windows, WindowKind::Monthly);
-        Self {
+        let mut values = Self {
             quota_provider_model,
             quota_provider: if narrow_identity && !quota_model.is_empty() {
                 String::new()
@@ -311,6 +354,35 @@ impl MetadataTokens {
             quota_cache_state: sidebar_cache_state(context, now_unix),
             quota_error: None,
             quota_headroom: headroom(windows, fields),
+            account: None,
+        };
+        if row.summary.is_on() {
+            values.account = Some(account_summary(
+                AccountFamily::for_provider(snapshot.provider),
+                all_windows,
+                now_unix,
+                row,
+            ))
+            .filter(|account| !account.segments.is_empty());
+            values.clear_window_rows();
+        }
+        values
+    }
+
+    /// Summary mode: the account footer carries every window, so the agent
+    /// rows publish none (a metered `ses` is put back by `metered::overlay`).
+    fn clear_window_rows(&mut self) {
+        for (text, severity) in [
+            (&mut self.quota_5h, &mut self.quota_5h_severity),
+            (&mut self.quota_week, &mut self.quota_week_severity),
+            (
+                &mut self.quota_week_scoped,
+                &mut self.quota_week_scoped_severity,
+            ),
+            (&mut self.quota_month, &mut self.quota_month_severity),
+        ] {
+            text.clear();
+            *severity = None;
         }
     }
 
@@ -338,6 +410,7 @@ impl MetadataTokens {
             quota_cache_state: String::new(),
             quota_error: Some(reason.into().chars().take(80).collect()),
             quota_headroom: None,
+            account: None,
         }
     }
 
@@ -382,6 +455,97 @@ fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
     .flatten()
     .map(|window| window.remaining_percent.clamp(0.0, 100.0).floor() as u8)
     .min()
+}
+
+/// One footer row from the same window slice the agent rows used to show.
+/// Text comes from every window (a lapsed one reads `--`), colour only from a
+/// live one, exactly like [`MetadataTokens::from_snapshot_parts`]. The reset is
+/// the most-used live window's, shortened to fit [`SUMMARY_ROW_WIDTH`].
+fn account_summary(
+    family: AccountFamily,
+    windows: &[UsageWindow],
+    now_unix: u64,
+    row: RowStyle,
+) -> AccountSummary {
+    let live = live_windows(windows, now_unix);
+    let shown: Vec<&UsageWindow> = [
+        (WindowKind::FiveHour, SidebarField::FiveHour),
+        (WindowKind::Weekly, SidebarField::Week),
+        (WindowKind::WeeklyScoped, SidebarField::WeekScoped),
+        (WindowKind::Monthly, SidebarField::Month),
+    ]
+    .into_iter()
+    .filter(|(_, field)| row.fields.contains(*field))
+    .filter_map(|(kind, _)| window_in(&live, kind).or_else(|| window_in(windows, kind)))
+    .take(3)
+    .collect();
+    let cells = match row.summary {
+        SummaryFormat::Compact => Some(3),
+        SummaryFormat::Bars => Some(4),
+        SummaryFormat::Numbers | SummaryFormat::Off => None,
+    };
+    let segments: Vec<AccountSegment> = shown
+        .iter()
+        .map(|window| summary_segment(window, now_unix, row.percent, cells))
+        .collect();
+    let used = family.icon.chars().count()
+        + segments
+            .iter()
+            .map(|segment| 1 + segment.text.chars().count())
+            .sum::<usize>();
+    let reset = if row.summary == SummaryFormat::Bars {
+        String::new()
+    } else {
+        shown
+            .iter()
+            .filter(|window| window.is_current(now_unix))
+            // `min_by` keeps the first of equals, so 5h wins a tie.
+            .min_by(|a, b| a.remaining_percent.total_cmp(&b.remaining_percent))
+            .and_then(|window| window.resets_at)
+            .map(|reset| {
+                fit_eta(
+                    format_reset_eta(reset, now_unix),
+                    SUMMARY_ROW_WIDTH.saturating_sub(used + 1),
+                )
+            })
+            .unwrap_or_default()
+    };
+    AccountSummary {
+        family,
+        segments,
+        reset,
+    }
+}
+
+/// `5h▱▱▱  0%` with `cells`, `5h 0%` without; a lapsed window is `5h▱▱▱ --`.
+fn summary_segment(
+    window: &UsageWindow,
+    now_unix: u64,
+    style: PercentStyle,
+    cells: Option<usize>,
+) -> AccountSegment {
+    let label = window.display_label();
+    if !window.is_current(now_unix) {
+        // `5h▱▱▱ --` with cells, `5h --` without.
+        let bar = cells.map(|cells| meter(0, cells)).unwrap_or_default();
+        return AccountSegment {
+            text: format!("{label}{bar} --"),
+            severity: None,
+        };
+    }
+    let percent = style.percent_of(window);
+    let text = match cells {
+        Some(cells) => format!(
+            "{label}{} {:>2}%",
+            meter(printed_percent(percent), cells),
+            format_percent(percent)
+        ),
+        None => format!("{label} {}%", format_percent(percent)),
+    };
+    AccountSegment {
+        text,
+        severity: Some(Severity::for_window(window, now_unix)),
+    }
 }
 
 /// Below this content width the logo already names the vendor, so the
@@ -773,18 +937,20 @@ mod tests {
             &snapshot,
             0,
             None,
-            PercentStyle::default(),
-            SidebarShape::default(),
-            FieldSet::parse("5h,7d").unwrap(),
+            RowStyle {
+                fields: FieldSet::parse("5h,7d").unwrap(),
+                ..RowStyle::default()
+            },
         );
         assert_eq!(visible.quota_headroom, Some(25));
         let hidden = MetadataTokens::from_snapshot_for_pane_with_fields(
             &snapshot,
             0,
             None,
-            PercentStyle::default(),
-            SidebarShape::default(),
-            FieldSet::parse("none").unwrap(),
+            RowStyle {
+                fields: FieldSet::parse("none").unwrap(),
+                ..RowStyle::default()
+            },
         );
         assert_eq!(hidden.quota_headroom, None);
     }
@@ -864,6 +1030,194 @@ mod tests {
         UsageWindow::new(WindowKind::WeeklyScoped, used, None)
             .unwrap()
             .with_source_window("Fab", None)
+    }
+
+    fn summary_style(summary: SummaryFormat) -> RowStyle {
+        RowStyle {
+            percent: PercentStyle::Used,
+            fields: FieldSet::all(),
+            summary,
+            ..RowStyle::default()
+        }
+    }
+
+    /// What Herdr draws for one footer row: tokens joined by one space (R2).
+    fn footer_line(account: &AccountSummary) -> String {
+        std::iter::once(account.family.icon.to_string())
+            .chain(account.segments.iter().map(|segment| segment.text.clone()))
+            .chain((!account.reset.is_empty()).then(|| account.reset.clone()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn summarised(snapshot: &ProviderSnapshot, now: u64, summary: SummaryFormat) -> MetadataTokens {
+        MetadataTokens::from_snapshot_for_pane_with_fields(
+            snapshot,
+            now,
+            None,
+            summary_style(summary),
+        )
+    }
+
+    fn spec_claude() -> ProviderSnapshot {
+        ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 0.0, 3_600),
+                // 2d2h ahead of `now = 0`.
+                window(WindowKind::Weekly, 24.0, 180_000),
+                scoped_window(16.0),
+            ],
+            0,
+        )
+    }
+
+    /// The three spec rows, character for character (format ③ joins with one
+    /// space: Herdr trims values and joins tokens with a single blank).
+    #[test]
+    fn the_footer_rows_match_the_spec_in_every_format() {
+        let claude = crate::icons::for_harness(Harness::Claude);
+        let line = |summary| {
+            footer_line(
+                summarised(&spec_claude(), 0, summary)
+                    .account
+                    .as_ref()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            line(SummaryFormat::Compact),
+            format!("{claude} 5h▱▱▱  0% 7d▰▱▱ 24% Fab▰▱▱ 16% 2d2h")
+        );
+        assert_eq!(
+            line(SummaryFormat::Bars),
+            format!("{claude} 5h▱▱▱▱  0% 7d▰▱▱▱ 24% Fab▰▱▱▱ 16%")
+        );
+        assert_eq!(
+            line(SummaryFormat::Numbers),
+            format!("{claude} 5h 0% 7d 24% Fab 16% 2d2h")
+        );
+
+        // A lapsed window keeps its slot as `--` and reads unknown.
+        let agy = ProviderSnapshot::new(
+            Provider::Agy,
+            vec![
+                window(WindowKind::FiveHour, 30.0, 100),
+                window(WindowKind::Weekly, 1.0, 479_000),
+            ],
+            0,
+        );
+        let values = summarised(&agy, 200, SummaryFormat::Compact);
+        let account = values.account.unwrap();
+        assert_eq!(
+            footer_line(&account),
+            format!(
+                "{} 5h▱▱▱ -- 7d▰▱▱  1% 5d13h",
+                crate::icons::for_harness(Harness::Agy)
+            )
+        );
+        assert_eq!(account.segments[0].severity, None);
+        assert_eq!(account.segments[1].severity, Some(Severity::Normal));
+    }
+
+    /// Summary mode moves the windows to the footer: the agent-row strings are
+    /// empty, headroom (the sort key) is not, and `off` is today's output.
+    #[test]
+    fn summary_mode_blanks_the_agent_row_windows_and_off_changes_nothing() {
+        let on = summarised(&spec_claude(), 0, SummaryFormat::Compact);
+        for text in [
+            &on.quota_5h,
+            &on.quota_week,
+            &on.quota_week_scoped,
+            &on.quota_month,
+        ] {
+            assert!(text.is_empty(), "{on:?}");
+        }
+        assert_eq!(on.quota_headroom, Some(76));
+        assert_eq!(on.account.as_ref().unwrap().family.id, "cl");
+
+        let off = summarised(&spec_claude(), 0, SummaryFormat::Off);
+        assert_eq!(off.account, None);
+        assert!(off.quota_5h.starts_with("5h "), "{off:?}");
+        assert!(off.quota_week_scoped.contains("Fab"), "{off:?}");
+    }
+
+    /// A pane with nothing to summarise supplies no row, so it cannot shadow
+    /// a populated sibling of the same family; its window strings stay blank.
+    #[test]
+    fn a_summary_without_segments_is_no_account_row() {
+        let row = RowStyle {
+            fields: FieldSet::parse("none").unwrap(),
+            ..summary_style(SummaryFormat::Compact)
+        };
+        let values =
+            MetadataTokens::from_snapshot_for_pane_with_fields(&spec_claude(), 0, None, row);
+        assert_eq!(values.account, None);
+        assert!(
+            values.quota_5h.is_empty() && values.quota_week.is_empty(),
+            "{values:?}"
+        );
+
+        let empty = ProviderSnapshot::new(Provider::Muse, vec![], 0);
+        assert_eq!(summarised(&empty, 0, SummaryFormat::Compact).account, None);
+    }
+
+    /// The footer shows the windows the field set shows, like `headroom`.
+    #[test]
+    fn the_footer_leaves_out_a_window_whose_field_is_off() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::OpenCodeGo,
+            vec![
+                window(WindowKind::FiveHour, 10.0, 3_600),
+                window(WindowKind::Weekly, 20.0, 183_600),
+                window(WindowKind::Monthly, 30.0, 1_500_000),
+            ],
+            0,
+        );
+        let row = RowStyle {
+            fields: FieldSet::parse("5h,7d").unwrap(),
+            ..summary_style(SummaryFormat::Numbers)
+        };
+        let values = MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, 0, None, row);
+        let labels: Vec<_> = values
+            .account
+            .unwrap()
+            .segments
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect();
+        assert_eq!(labels, ["5h 10%", "7d 20%"]);
+    }
+
+    /// Worst case (every window at 100%, a 6d23h reset) stays inside the
+    /// footer budget by shortening the reset to its leading unit.
+    #[test]
+    fn a_full_footer_row_fits_the_footer_width() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 99.0, 3_600),
+                window(WindowKind::Weekly, 100.0, 601_200),
+                scoped_window(100.0),
+            ],
+            0,
+        );
+        for summary in [
+            SummaryFormat::Compact,
+            SummaryFormat::Bars,
+            SummaryFormat::Numbers,
+        ] {
+            let account = summarised(&snapshot, 0, summary).account.unwrap();
+            let line = footer_line(&account);
+            assert!(
+                line.chars().count() <= SUMMARY_ROW_WIDTH,
+                "{summary:?}: {line}"
+            );
+        }
+        let compact = summarised(&snapshot, 0, SummaryFormat::Compact)
+            .account
+            .unwrap();
+        assert_eq!(compact.reset, "6d");
     }
 
     #[test]
