@@ -828,6 +828,7 @@ fn sidebar_shape(cache: &CacheStore) -> SidebarShape {
 fn publish_row(cache: &CacheStore) -> RowStyle {
     RowStyle {
         fields: cache.fields().unwrap_or_default(),
+        summary: cache.account_summary().unwrap_or_default(),
         ..RowStyle::new(
             cache.percent_style().unwrap_or_default(),
             sidebar_shape(cache),

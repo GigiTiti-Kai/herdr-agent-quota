@@ -7,6 +7,15 @@ use std::process::Command;
 
 const METADATA_TTL_MS: &str = "86400000";
 const MAX_METADATA_TOKENS: usize = 16;
+/// Footer rows ride their own source so they get their own 16-name report
+/// budget. Herdr keeps one token map per pane, so comparisons scope by name.
+const SUMMARY_SOURCE: &str = "herdr-agent-quota-summary";
+/// Every name [`desired_summary_tokens`] produces starts with this. It is the
+/// comparison and clear set for the summary source (AGENTS.md rule 3).
+const SUMMARY_TOKEN_PREFIX: &str = "quota_acct_";
+const SUMMARY_TITLE_TOKEN: &str = "quota_acct_title";
+/// Herdr trims values; the footer's own indent supplies the leading blank.
+const SUMMARY_TITLE: &str = "quota";
 /// Every name [`desired_tokens`] can produce, and nothing else.
 ///
 /// This list is the comparison set for [`metadata_matches`] and the report set
@@ -850,7 +859,17 @@ fn publish_pane_tokens_inner(
         }
         fold_cache_row(&mut desired, row);
         apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels);
-        if metadata_matches(&pane.tokens, &desired) {
+        // Summary rows: their own source and comparison. Preserve leaves them.
+        let desired_summary = match &pane_tokens.quota {
+            PaneQuotaUpdate::Replace(values) => Some(desired_summary_tokens(values)),
+            PaneQuotaUpdate::Clear => Some(BTreeMap::new()),
+            PaneQuotaUpdate::Preserve => None,
+        };
+        let rows_match = metadata_matches(&pane.tokens, &desired);
+        let summary_match = desired_summary
+            .as_ref()
+            .is_none_or(|summary| summary_tokens_match(&pane.tokens, summary));
+        if rows_match && summary_match {
             continue;
         }
         // Herdr versions that repaint metadata can snap a terminal viewport
@@ -867,9 +886,33 @@ fn publish_pane_tokens_inner(
             }
             continue;
         }
-        reported += 1;
-        if !report_pane_metadata(&executable, pane, &desired, sequence)? {
-            failed.push(pane.pane_id.clone());
+        if !rows_match {
+            reported += 1;
+            let names = metadata_report_names(pane, &desired);
+            if !report_pane_metadata(
+                &executable,
+                &pane.pane_id,
+                "herdr-agent-quota",
+                names,
+                &desired,
+                sequence,
+            )? {
+                failed.push(pane.pane_id.clone());
+            }
+        }
+        if let Some(summary) = desired_summary.filter(|_| !summary_match) {
+            reported += 1;
+            let names = summary_report_names(&pane.tokens, &summary);
+            if !report_pane_metadata(
+                &executable,
+                &pane.pane_id,
+                SUMMARY_SOURCE,
+                names,
+                &summary,
+                sequence,
+            )? {
+                failed.push(pane.pane_id.clone());
+            }
         }
     }
     reported += sync_sibling_group_headers(
@@ -929,24 +972,21 @@ fn report_icon_metadata(
     Ok(output.status.success())
 }
 
-fn report_pane_metadata(
+fn report_pane_metadata<S: AsRef<str>>(
     executable: &std::ffi::OsStr,
-    pane: &AgentPane,
+    pane_id: &str,
+    source: &str,
+    names: impl IntoIterator<Item = S>,
     desired: &BTreeMap<String, String>,
     sequence: u64,
 ) -> Result<bool> {
     let mut command = Command::new(executable);
     command
-        .args([
-            "pane",
-            "report-metadata",
-            &pane.pane_id,
-            "--source",
-            "herdr-agent-quota",
-        ])
+        .args(["pane", "report-metadata", pane_id, "--source", source])
         .args(["--seq", &sequence.to_string()])
         .args(["--ttl-ms", METADATA_TTL_MS]);
-    for name in metadata_report_names(pane, desired) {
+    for name in names {
+        let name = name.as_ref();
         if let Some(value) = desired.get(name) {
             command.args(["--token", &format!("{name}={value}")]);
         } else {
@@ -1322,6 +1362,68 @@ fn desired_tokens(
     tokens
 }
 
+/// The footer row this pane supplies, or nothing (summary off, or no window).
+fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String, String> {
+    let mut tokens = BTreeMap::new();
+    let Some(account) = values
+        .account
+        .as_ref()
+        .filter(|account| !account.segments.is_empty())
+    else {
+        return tokens;
+    };
+    let id = account.family.id;
+    tokens.insert(SUMMARY_TITLE_TOKEN.to_string(), SUMMARY_TITLE.to_string());
+    tokens.insert(
+        format!("quota_acct_{id}_icon"),
+        account.family.icon.to_string(),
+    );
+    for (slot, segment) in account.segments.iter().take(3).enumerate() {
+        insert_severity_token(
+            &mut tokens,
+            &format!("quota_acct_{id}_w{}", slot + 1),
+            &segment.text,
+            segment.severity,
+        );
+    }
+    insert_optional_token(
+        &mut tokens,
+        &format!("quota_acct_{id}_reset"),
+        &account.reset,
+    );
+    tokens
+}
+
+fn is_summary_token(name: &str) -> bool {
+    name.starts_with(SUMMARY_TOKEN_PREFIX)
+}
+
+fn summary_tokens_match(
+    current: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> bool {
+    current
+        .iter()
+        .filter(|(name, _)| is_summary_token(name))
+        .eq(desired.iter())
+}
+
+/// Desired names plus every summary name the pane still carries, so a moved
+/// severity variant or another family's leftovers are cleared in one report.
+fn summary_report_names(
+    current: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> Vec<String> {
+    current
+        .keys()
+        .filter(|name| is_summary_token(name))
+        .chain(desired.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn display_topic(pane: &AgentPane) -> String {
     let topic = pane.topic.trim();
     if topic.is_empty() || is_status_line(topic) {
@@ -1335,6 +1437,7 @@ pub(crate) fn quota_rows_present(tokens: &BTreeMap<String, String>) -> bool {
     QUOTA_WINDOW_TOKEN_NAMES
         .into_iter()
         .any(|name| tokens.contains_key(name))
+        || tokens.keys().any(|name| is_summary_token(name))
 }
 
 pub(crate) fn plugin_quota_present(tokens: &BTreeMap<String, String>) -> bool {
@@ -1344,6 +1447,7 @@ pub(crate) fn plugin_quota_present(tokens: &BTreeMap<String, String>) -> bool {
         .chain(LEGACY_METADATA_TOKEN_NAMES)
         .filter(|name| *name != "quota_topic")
         .any(|name| tokens.contains_key(name))
+        || tokens.keys().any(|name| is_summary_token(name))
 }
 
 fn desired_cleared_quota(pane: &AgentPane) -> BTreeMap<String, String> {
@@ -1472,12 +1576,15 @@ pub(crate) fn quota_rows_have_drifted(
     let desired_has_window = QUOTA_WINDOW_TOKEN_NAMES
         .into_iter()
         .any(|name| desired.contains_key(name));
+    let summary_drifted = plugin_quota_present(current)
+        && !summary_tokens_match(current, &desired_summary_tokens(values));
     if !current_has_window {
-        return desired_has_window && plugin_quota_present(current);
+        return summary_drifted || (desired_has_window && plugin_quota_present(current));
     }
-    QUOTA_WINDOW_TOKEN_NAMES
-        .into_iter()
-        .any(|name| current.get(name) != desired.get(name))
+    summary_drifted
+        || QUOTA_WINDOW_TOKEN_NAMES
+            .into_iter()
+            .any(|name| current.get(name) != desired.get(name))
 }
 
 fn metadata_matches(
@@ -1706,11 +1813,204 @@ fn is_status_line(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{FieldSet, PercentStyle, SidebarLayout};
+    use crate::cli::{FieldSet, PercentStyle, SidebarLayout, SummaryFormat};
     use crate::model::{
         CacheUsage, ContextUsage, ProviderSnapshot, ResetAt, UsageWindow, WindowKind,
     };
     use serde_json::json;
+
+    fn claude_summary(used_5h: f64) -> MetadataTokens {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                UsageWindow::new(
+                    WindowKind::FiveHour,
+                    used_5h,
+                    Some(ResetAt::from_unix_seconds(3_600)),
+                )
+                .unwrap(),
+                UsageWindow::new(
+                    WindowKind::Weekly,
+                    24.0,
+                    Some(ResetAt::from_unix_seconds(180_000)),
+                )
+                .unwrap(),
+            ],
+            0,
+        );
+        MetadataTokens::from_snapshot_for_pane_with_fields(
+            &snapshot,
+            0,
+            None,
+            RowStyle {
+                percent: PercentStyle::Used,
+                fields: FieldSet::all(),
+                summary: SummaryFormat::Compact,
+                ..RowStyle::default()
+            },
+        )
+    }
+
+    /// R6 names, one severity variant per window, every key and value inside
+    /// Herdr's limits; the agent-row report keeps headroom but no window.
+    #[test]
+    fn summary_tokens_carry_the_family_row_under_their_own_names() {
+        let desired = desired_summary_tokens(&claude_summary(0.0));
+        let mark = crate::icons::for_harness(Harness::Claude).to_string();
+        let expected = [
+            ("quota_acct_cl_icon", mark.as_str()),
+            ("quota_acct_cl_reset", "2d2h"),
+            ("quota_acct_cl_w1_normal", "5h▱▱▱  0%"),
+            ("quota_acct_cl_w2_normal", "7d▰▱▱ 24%"),
+            ("quota_acct_title", "quota"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        assert_eq!(desired, BTreeMap::from(expected));
+        for (name, value) in &desired {
+            assert!(
+                name.starts_with(SUMMARY_TOKEN_PREFIX) && name.len() <= 32,
+                "{name}"
+            );
+            assert!(value.chars().count() <= 80, "{name}={value}");
+        }
+        let rows = desired_tokens(&claude_summary(0.0), "", SidebarShape::default());
+        assert!(
+            rows.keys()
+                .all(|name| !["quota_5h", "quota_week", "quota_month"]
+                    .iter()
+                    .any(|base| name.starts_with(base))),
+            "{rows:?}"
+        );
+        assert_eq!(rows.get(HEADROOM_TOKEN).map(String::as_str), Some("076"));
+    }
+
+    /// No-op guard: equal summaries are not rewritten, main-source names do not
+    /// count, a moved variant clears the old one, and off clears leftovers.
+    #[test]
+    fn the_summary_report_is_sent_only_when_its_own_names_differ() {
+        let mut current = desired_summary_tokens(&claude_summary(0.0));
+        current.insert("quota_provider".to_string(), "Claude".to_string());
+        assert!(summary_tokens_match(
+            &current,
+            &desired_summary_tokens(&claude_summary(0.0))
+        ));
+
+        let spent = desired_summary_tokens(&claude_summary(90.0));
+        assert!(!summary_tokens_match(&current, &spent));
+        let names = summary_report_names(&current, &spent);
+        assert!(
+            names.contains(&"quota_acct_cl_w1_normal".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"quota_acct_cl_w1_danger".to_string()),
+            "{names:?}"
+        );
+        assert!(!names.contains(&"quota_provider".to_string()), "{names:?}");
+
+        let off = desired_summary_tokens(&MetadataTokens::unavailable(Provider::Claude, "x"));
+        assert!(off.is_empty());
+        assert!(!summary_tokens_match(&current, &off));
+        current.remove("quota_provider");
+        assert!(quota_rows_present(&current) && plugin_quota_present(&current));
+    }
+
+    /// Summary mode keeps both reports inside Herdr's caps: the agent-row
+    /// report only loses names, the summary report holds at most one family
+    /// plus whatever another family left behind, and the pane stays under 32.
+    #[test]
+    fn summary_mode_stays_within_herdrs_report_and_pane_caps() {
+        for provider in [
+            Provider::Codex,
+            Provider::Grok,
+            Provider::Claude,
+            Provider::Agy,
+            Provider::OpenCodeGo,
+            Provider::Cursor,
+        ] {
+            let snapshot = ProviderSnapshot::new(
+                provider,
+                vec![
+                    UsageWindow::new(
+                        WindowKind::FiveHour,
+                        85.0,
+                        Some(ResetAt::from_unix_seconds(9_000)),
+                    )
+                    .unwrap(),
+                    UsageWindow::new(
+                        WindowKind::Weekly,
+                        42.0,
+                        Some(ResetAt::from_unix_seconds(600_000)),
+                    )
+                    .unwrap(),
+                    UsageWindow::new(
+                        WindowKind::Monthly,
+                        10.0,
+                        Some(ResetAt::from_unix_seconds(2_000_000)),
+                    )
+                    .unwrap(),
+                ],
+                0,
+            )
+            .with_model(Some("A Very Long Model Name".to_string()));
+            let row = |summary| RowStyle {
+                fields: FieldSet::all(),
+                summary,
+                ..RowStyle::default()
+            };
+            let render = |summary| {
+                MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, 0, None, row(summary))
+            };
+            let off = desired_tokens(
+                &render(SummaryFormat::Off),
+                "topic",
+                SidebarShape::default(),
+            );
+            let on_values = render(SummaryFormat::Compact);
+            let on = desired_tokens(&on_values, "topic", SidebarShape::default());
+            assert!(
+                on.keys().all(|name| off.contains_key(name)),
+                "{provider:?}: {on:?}"
+            );
+            let summary = desired_summary_tokens(&on_values);
+            let leftover = desired_summary_tokens(&claude_summary(90.0));
+            assert!(
+                summary_report_names(&leftover, &summary).len() <= MAX_METADATA_TOKENS,
+                "{provider:?}"
+            );
+            // + group, gap, icon from `apply_group_and_icon`; 2 keys left for the user's own hooks.
+            assert!(on.len() + 3 + summary.len() <= 30, "{provider:?}");
+        }
+    }
+
+    /// An idle sibling wakes when only its footer row is stale, and a pane
+    /// never published to still does not count as drift.
+    #[test]
+    fn a_summary_only_change_counts_as_drift() {
+        let published = claude_summary(0.0);
+        let mut current = desired_tokens(&published, "", SidebarShape::default());
+        current.extend(desired_summary_tokens(&published));
+        assert!(!quota_rows_have_drifted(
+            &current,
+            &published,
+            SidebarShape::default()
+        ));
+        let moved = claude_summary(10.0); // 7d stays the tightest: same headroom
+        assert_eq!(
+            desired_tokens(&moved, "", SidebarShape::default()).get(HEADROOM_TOKEN),
+            current.get(HEADROOM_TOKEN)
+        );
+        assert!(quota_rows_have_drifted(
+            &current,
+            &moved,
+            SidebarShape::default()
+        ));
+        assert!(!quota_rows_have_drifted(
+            &BTreeMap::new(),
+            &moved,
+            SidebarShape::default()
+        ));
+    }
 
     #[test]
     fn muse_sessions_fill_only_session_less_muse_panes() {

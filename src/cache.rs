@@ -1,5 +1,6 @@
 use crate::cli::{
     AgentOrder, BrandColors, FieldSet, LowQuotaAlert, PercentStyle, SidebarLayout, SidebarRowGap,
+    SummaryFormat,
 };
 use crate::model::{
     merge_omitted_window_list, window_in, BillingTarget, ContextUsage, Provider, ProviderSnapshot,
@@ -26,6 +27,7 @@ const FIELDS_FILE: &str = "fields";
 const BRAND_COLORS_FILE: &str = "brand-colors";
 const AGENT_ORDER_FILE: &str = "agent-order";
 const LOW_QUOTA_ALERT_FILE: &str = "low-quota-alert";
+const ACCOUNT_SUMMARY_FILE: &str = "account-summary";
 /// One line per provider that is currently below the alert threshold, so a
 /// crossing notifies once instead of on every refresh.
 const LOW_QUOTA_ALERTED_FILE: &str = "low-quota-alerted";
@@ -653,6 +655,30 @@ impl CacheStore {
         }
     }
 
+    /// The account summary format every renderer reads. Kept in the state
+    /// directory for the same reason as [`Self::percent_style`]: the
+    /// statusLine hooks only see `HERDR_PLUGIN_STATE_DIR`.
+    pub fn account_summary(&self) -> Option<SummaryFormat> {
+        fs::read_to_string(self.account_summary_path())
+            .ok()
+            .as_deref()
+            .and_then(SummaryFormat::parse)
+    }
+
+    pub fn set_account_summary(&self, format: SummaryFormat) -> Result<()> {
+        self.ensure()?;
+        fs::write(self.account_summary_path(), format.as_str())
+            .context("write account summary format")
+    }
+
+    pub fn clear_account_summary(&self) -> Result<()> {
+        match fs::remove_file(self.account_summary_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove account summary format"),
+        }
+    }
+
     pub fn brand_colors(&self) -> Option<BrandColors> {
         fs::read_to_string(self.brand_colors_path())
             .ok()
@@ -932,6 +958,10 @@ impl CacheStore {
 
     fn fields_path(&self) -> PathBuf {
         self.root.join(FIELDS_FILE)
+    }
+
+    fn account_summary_path(&self) -> PathBuf {
+        self.root.join(ACCOUNT_SUMMARY_FILE)
     }
 
     fn brand_colors_path(&self) -> PathBuf {
