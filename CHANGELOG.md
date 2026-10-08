@@ -22,6 +22,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it up on Ctrl+Shift+R. Other terminals keep their own icon size, and body
   text never changes. A host without that folder, or a file the plugin did
   not write, is reported rather than created or overwritten.
+- Account summary setting (`off` by default, `compact`, `bars`, `numbers`;
+  settings pane and `--account-summary`). When on, `configure` writes a
+  marked `footer` to `[ui.sidebar.agents]` with one row per account family
+  and drops the 5h/7d/30d rows from agent rows; a metered pane keeps `ses`.
+  Needs a Herdr build that understands `footer`.
 
 ## [1.6.0] - 2026-09-17
 

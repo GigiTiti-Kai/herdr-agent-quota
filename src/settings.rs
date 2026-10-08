@@ -14,7 +14,7 @@
 use crate::cache::CacheStore;
 use crate::cli::{
     AgentOrder, AgentSelection, FieldSet, IconSize, LowQuotaAlert, PercentStyle, SidebarField,
-    SidebarLayout, SidebarRowGap,
+    SidebarLayout, SidebarRowGap, SummaryFormat,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -47,6 +47,7 @@ enum Choice {
     Order,
     Alert,
     IconSize,
+    Summary,
 }
 
 impl Choice {
@@ -59,6 +60,7 @@ impl Choice {
             Self::Order => "Agent order",
             Self::Alert => "Low quota alert",
             Self::IconSize => "Icon size",
+            Self::Summary => "Account summary",
         }
     }
 }
@@ -73,6 +75,7 @@ fn rows() -> Vec<Row> {
         Row::Choice(Choice::Order),
         Row::Choice(Choice::Alert),
         Row::Choice(Choice::IconSize),
+        Row::Choice(Choice::Summary),
         Row::Header("Fields"),
     ];
     rows.extend(SidebarField::ALL.into_iter().map(Row::Field));
@@ -91,6 +94,7 @@ pub struct Settings {
     order: AgentOrder,
     alert: LowQuotaAlert,
     icon_size: IconSize,
+    summary: SummaryFormat,
     fields: FieldSet,
     /// Indexed by [`AgentSelection::SUPPORTED`], so the whole struct stays
     /// `Copy` and comparing a draft to what is applied is one `==`.
@@ -116,6 +120,7 @@ impl Settings {
             order: crate::configure::resolved_agent_order(None, cache),
             alert: crate::configure::resolved_low_quota_alert(None, cache),
             icon_size: crate::configure::resolved_icon_size(None),
+            summary: crate::configure::resolved_account_summary(None, cache),
             fields: crate::configure::resolved_fields(None, cache),
             agents,
         }
@@ -130,6 +135,7 @@ impl Settings {
             Choice::Order => self.order.as_str().to_string(),
             Choice::Alert => self.alert.to_string(),
             Choice::IconSize => self.icon_size.as_str().to_string(),
+            Choice::Summary => self.summary.as_str().to_string(),
         }
     }
 
@@ -170,6 +176,12 @@ impl Settings {
             // Other terminals have no icon scale, and WezTerm only rereads
             // its config on a reload, so the hint names both.
             Choice::IconSize => "WezTerm only · then Ctrl+Shift+R",
+            Choice::Summary => match self.summary {
+                SummaryFormat::Off => "meters on every agent row",
+                SummaryFormat::Compact => "footer: 3-cell bars + reset",
+                SummaryFormat::Bars => "footer: 4-cell bars",
+                SummaryFormat::Numbers => "footer: numbers + reset",
+            },
         }
     }
 
@@ -243,6 +255,15 @@ impl Settings {
                 let next = (current as i8 + step).rem_euclid(count);
                 self.icon_size = IconSize::CHOICES[next as usize];
             }
+            Row::Choice(Choice::Summary) => {
+                let current = SummaryFormat::CHOICES
+                    .iter()
+                    .position(|value| *value == self.summary)
+                    .unwrap_or(0);
+                let count = SummaryFormat::CHOICES.len() as i8;
+                let next = (current as i8 + step).rem_euclid(count);
+                self.summary = SummaryFormat::CHOICES[next as usize];
+            }
             Row::Choice(Choice::Interval) => {
                 let current = INTERVALS
                     .iter()
@@ -289,6 +310,8 @@ impl Settings {
             self.alert.to_string(),
             "--icon-size".to_string(),
             self.icon_size.as_str().to_string(),
+            "--account-summary".to_string(),
+            self.summary.as_str().to_string(),
         ];
         arguments.push("--watch-interval-seconds".to_string());
         arguments.push(self.interval_seconds.to_string());
@@ -638,6 +661,7 @@ mod tests {
             order: AgentOrder::Quota,
             alert: LowQuotaAlert::OFF,
             icon_size: IconSize::Medium,
+            summary: SummaryFormat::Off,
             fields: FieldSet::all(),
             agents: [true; AgentSelection::SUPPORTED.len()],
         }
@@ -718,6 +742,27 @@ mod tests {
         assert!(row.trim_end().chars().count() <= 70, "too wide: {row}");
     }
 
+    /// The footer format steps through all four choices in both directions,
+    /// and every hint keeps the row inside the pane width.
+    #[test]
+    fn the_account_summary_cycles_four_ways_and_its_hint_fits() {
+        let mut draft = settings();
+        for expected in [
+            SummaryFormat::Compact,
+            SummaryFormat::Bars,
+            SummaryFormat::Numbers,
+            SummaryFormat::Off,
+        ] {
+            draft.cycle(Row::Choice(Choice::Summary), 1);
+            assert_eq!(draft.summary, expected);
+            let row = render_row(&draft, settings(), Row::Choice(Choice::Summary), true);
+            assert!(row.contains("Account summary"), "{row}");
+            assert!(row.trim_end().chars().count() <= 70, "too wide: {row}");
+        }
+        draft.cycle(Row::Choice(Choice::Summary), -1);
+        assert_eq!(draft.summary, SummaryFormat::Numbers);
+    }
+
     /// "Applied." alone must not hide an icon size that did not export, and
     /// a size the user just changed reports where it went.
     #[test]
@@ -794,6 +839,8 @@ mod tests {
                 "off",
                 "--icon-size",
                 "medium",
+                "--account-summary",
+                "off",
                 "--watch-interval-seconds",
                 "60",
             ]

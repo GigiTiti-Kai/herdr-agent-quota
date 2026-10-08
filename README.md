@@ -74,6 +74,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
 | Low quota alert | Off or a threshold from 1% to 100% |
 | Icon size | Small, medium (default), or large sidebar icon. WezTerm only: the size name goes to `herdr-icon-size.local.json` in the WezTerm config folder; press Ctrl+Shift+R after applying. Other terminals keep their own icon size; body text never changes |
+| Account summary | `off` (default) keeps quota meters on every agent row. `compact` (3-cell bars + reset), `bars` (4-cell bars), or `numbers` show one footer row per account at the bottom of the Agent panel instead; needs a Herdr build with `[ui.sidebar.agents] footer` |
 | Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor, Hermes |
 
 Use arrows or Space to edit, `a` to apply, and `q` to close.
