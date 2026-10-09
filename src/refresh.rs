@@ -1458,9 +1458,23 @@ fn should_skip_fetch_within(
     interval: u64,
 ) -> Result<bool> {
     let snapshot = cache.load(provider)?;
+    let debounced = cache.should_debounce(provider, now_unix, interval)?;
+    // A pane-less provider is held to one attempt per interval even when its
+    // old windows have lapsed: a provider that keeps failing keeps its old
+    // snapshot, and the expired-window bypass would refetch it every tick.
+    // The pane path (60 s) keeps the bypass.
+    if !force
+        && debounced
+        && interval > PANE_DEBOUNCE_SECONDS
+        && cache
+            .last_refresh_account(provider)
+            .is_some_and(|attempted| attempted.as_deref() == account)
+    {
+        return Ok(true);
+    }
     if !debounce_reuses_snapshot(
         force,
-        cache.should_debounce(provider, now_unix, interval)?,
+        debounced,
         snapshot.as_ref(),
         account,
         mtime,
@@ -3384,20 +3398,70 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_paneless_attempt_is_debounced_and_keeps_the_snapshot() {
-        // refresh_provider marks the attempt before it fetches and saves
-        // nothing on error, so a failure leaves exactly this state: the
-        // marker at the attempt time and the previous snapshot untouched.
+    fn a_paneless_provider_with_lapsed_windows_still_waits_out_five_minutes() {
         let directory = tempdir().unwrap();
-        let cache = grok_cache_attempted_at(directory.path(), 1_000);
+        let cache = CacheStore::new(directory.path());
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 500)],
+                    400,
+                )
+                .with_account_id(Some("acc".into())),
+            )
+            .unwrap();
+        cache
+            .mark_refresh_account(Provider::Grok, 1_000, Some("acc"))
+            .unwrap();
+        let due = |now| paneless_due(&cache, &[Provider::Grok], &[], now, grok_gate).unwrap();
         assert!(
-            paneless_due(&cache, &[Provider::Grok], &[], 1_200, grok_gate)
-                .unwrap()
-                .is_empty()
+            due(1_299).is_empty(),
+            "lapsed windows must not bypass 300 s"
         );
-        let kept = cache.load(Provider::Grok).unwrap().unwrap();
-        assert_eq!(kept.fetched_at_unix, 900);
-        assert!(kept.usable_for_account(Some("acc"), None));
+        assert_eq!(due(1_300), vec![Provider::Grok]);
+        // The pane path keeps the bypass.
+        assert!(!should_skip_fetch_for_account(
+            &cache,
+            Provider::Grok,
+            false,
+            1_030,
+            Some("acc"),
+            None
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn a_failed_paneless_refresh_records_the_attempt_and_keeps_the_snapshot() {
+        // No Grok auth file: the fetch fails locally, before any request.
+        let _env = crate::providers::test_support::env_guard();
+        let directory = tempdir().unwrap();
+        std::env::set_var("GROK_AUTH_FILE", directory.path().join("missing.json"));
+        let cache = grok_cache_attempted_at(directory.path(), 1);
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 4_000_000_000)],
+                    900,
+                )
+                .with_account_id(None),
+            )
+            .unwrap();
+        let outcome = refresh_provider(&cache, Provider::Grok, false, &[], 300).unwrap();
+        std::env::remove_var("GROK_AUTH_FILE");
+        assert!(outcome.error.is_some(), "the fetch must have failed");
+        let marked = std::fs::read_to_string(directory.path().join("grok.refresh")).ok();
+        let now = CacheStore::now_unix();
+        assert!(
+            cache.should_debounce(Provider::Grok, now, 300).unwrap(),
+            "the failed attempt must count as an attempt (marker: {marked:?})"
+        );
+        assert_eq!(
+            cache.load(Provider::Grok).unwrap().unwrap().fetched_at_unix,
+            900
+        );
     }
 
     #[test]
