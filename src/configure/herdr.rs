@@ -570,7 +570,7 @@ fn rewrite_quota_sidebar(
     // Shared like `row_gap`: written when absent or ours, removed only when ours.
     let managed_footer = has_footer_marker(table);
     if summary.is_on() && (managed_footer || !table.contains_key("footer")) {
-        let mut footer = Value::Array(footer_rows(layout));
+        let mut footer = Value::Array(footer_rows(layout, summary));
         footer.decor_mut().set_suffix(format!(" # {FOOTER_MARKER}"));
         table.insert("footer", Item::Value(footer));
     } else if !summary.is_on() && managed_footer {
@@ -1329,7 +1329,7 @@ fn without_window_rows(fields: FieldSet) -> FieldSet {
 /// The Agent panel footer: a title row, then one row per account family in
 /// R6 order. Every family is written whatever `--agent` says: Herdr drops a
 /// row no pane resolves, and a partial apply must not shrink a shared key.
-fn footer_rows(layout: SidebarLayout) -> Array {
+fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
     let palette = severity_palette(layout);
     let mut rows = Array::new();
     rows.push(Value::Array(styled_row(
@@ -1346,6 +1346,20 @@ fn footer_rows(layout: SidebarLayout) -> Array {
             Some(false),
             Some(false),
         ));
+        if summary == SummaryFormat::Lines {
+            // R23: one row per window (icon rides the first), then a blank gap.
+            for slot in 1..=3 {
+                append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
+                rows.push(Value::Array(std::mem::take(&mut row)));
+            }
+            rows.push(Value::Array(styled_row(
+                &format!("$quota_acct_{id}_gap"),
+                None,
+                None,
+                None,
+            )));
+            continue;
+        }
         for slot in 1..=3 {
             append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
         }
@@ -1538,10 +1552,16 @@ fn print_diff_hint(
         println!("  leave out {}", hidden.join(", "));
     }
     if summary.is_on() {
-        println!(
-            "  move 5h, 7d and 30d into one {} footer row per account; agent rows keep cache, TTL and metered ses",
-            summary.as_str()
-        );
+        if summary == SummaryFormat::Lines {
+            println!(
+                "  move 5h, 7d and 30d into one footer line per window per account, blank line between accounts; agent rows keep cache, TTL and metered ses"
+            );
+        } else {
+            println!(
+                "  move 5h, 7d and 30d into one {} footer row per account; agent rows keep cache, TTL and metered ses",
+                summary.as_str()
+            );
+        }
     }
     println!("  paint brand icon idle/working/done (no state_icon ring)");
 }
@@ -3329,6 +3349,57 @@ mod field_tests {
                 assert!(row.len() <= 16, "{row}");
             }
             assert!(updated.contains("$quota_acct_hm_w3_danger"), "{updated}");
+        }
+    }
+
+    fn written_footer(summary: SummaryFormat) -> (String, Vec<Vec<String>>) {
+        let updated = summary_install("", summary);
+        let document = updated.parse::<DocumentMut>().unwrap();
+        let agents = document["ui"]["sidebar"]["agents"].as_table().unwrap();
+        assert!(has_footer_marker(agents), "{updated}");
+        let rows = agents["footer"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_array)
+            .map(|row| {
+                row.iter()
+                    .filter_map(configured_token_name)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect();
+        (updated, rows)
+    }
+
+    #[test]
+    fn the_lines_footer_is_four_rows_per_family_in_order() {
+        let (updated, rows) = written_footer(SummaryFormat::Lines);
+        assert_eq!(rows.len(), 1 + 4 * AccountFamily::IDS.len(), "{updated}");
+        assert_eq!(rows[0], ["$quota_acct_title"]);
+        assert!(!updated.contains("_reset"), "{updated}");
+        let windows = |id: &str, slot: usize| -> Vec<String> {
+            ["normal", "warning", "danger", "unknown"]
+                .map(|sev| format!("$quota_acct_{id}_w{slot}_{sev}"))
+                .to_vec()
+        };
+        for (index, id) in AccountFamily::IDS.into_iter().enumerate() {
+            let at = 1 + 4 * index;
+            let mut first = vec![format!("$quota_acct_{id}_icon")];
+            first.extend(windows(id, 1));
+            assert_eq!(rows[at], first, "{id}");
+            assert_eq!(rows[at + 1], windows(id, 2), "{id}");
+            assert_eq!(rows[at + 2], windows(id, 3), "{id}");
+            assert_eq!(rows[at + 3], [format!("$quota_acct_{id}_gap")], "{id}");
+        }
+    }
+
+    #[test]
+    fn every_footer_row_has_at_most_sixteen_tokens() {
+        for summary in SummaryFormat::CHOICES.into_iter().filter(|s| s.is_on()) {
+            for row in written_footer(summary).1 {
+                assert!(row.len() <= 16, "{summary:?}: {row:?}");
+            }
         }
     }
 

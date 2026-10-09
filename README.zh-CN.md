@@ -66,7 +66,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Agent order | 按 Space 分组，组内剩余额度最少优先（默认）；或使用 Herdr 自己的排序 |
 | Low quota alert | 关闭，或设置 1%–100% 的提醒阈值 |
 | Icon size | 侧栏图标小、中（默认）、大。仅 WezTerm：尺寸名写入 WezTerm 配置目录的 `herdr-icon-size.local.json`，应用后按 Ctrl+Shift+R。其他终端保持原有图标大小；正文字号不变 |
-| Account summary | `off`（默认）在每个 agent 行显示额度条。`compact`（3 格条 + 重置时间）、`bars`（4 格条）或 `numbers` 改为在 Agent 面板底部按账号各显示一行；需要支持 `[ui.sidebar.agents] footer` 的 Herdr |
+| Account summary | `off`（默认）在每个 agent 行显示额度条。`compact`（3 格条 + 重置时间）、`bars`（4 格条）或 `numbers` 改为在 Agent 面板底部按账号各显示一行；`lines` 则每个额度窗口各占一行并带各自的重置倒计时，账号之间空一行。都需要支持 `[ui.sidebar.agents] footer` 的 Herdr；`lines` 还要求 footer 允许 64 行（`MAX_AGENT_FOOTER_ROWS`），旧版客户端遇到超过 16 行的 footer 会拒绝整个配置。已知限制：Herdr 从该账号第一个带有某行的 pane 填充每一行，因此同一账号的两个 pane 窗口数不同时（两个 Agy 池、两个 Claude 配置），同一块可能混合显示两者的行 |
 | Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor、Hermes |
 
 方向键或空格修改，`a` 应用，`q` 关闭。脚本配置选项见 `./install.sh --help`。
