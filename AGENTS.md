@@ -82,6 +82,12 @@ reconciles those changes without reading pane output or writing unchanged
 metadata. The watcher stays alive for unseen completions until they are seen.
 Local stop/connection checks interrupt sleeps. Uninstall writes a stop marker.
 
+An enabled always-on provider with no pane in the pass is refreshed by the
+`startup`, `refresh` and `watch` passes on a 300-second debounce (a provider
+with a pane keeps 60). Never forced; a failed attempt still counts, and the
+last usable snapshot survives it. `event` does not do this: it stays on the
+named pane's budget.
+
 ## omp's quota does not come from a provider endpoint
 
 Every other collector either reads a local credential and calls the provider

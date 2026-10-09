@@ -195,6 +195,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             .filter(|pane| pane.icon_needs_update())
             .map(|pane| pane.pane_id.clone())
             .collect::<Vec<_>>();
+        refresh_paneless(&cache, &state.panes);
         let _ = refresh_working_panes(&cache, &state.panes, &affected, &icon_dirty);
         let stale_icons = state.panes.iter().any(has_stale_done_icon);
         if active.is_empty()
@@ -1144,7 +1145,7 @@ fn refresh_omp_target(
 /// surfacing on every event.
 fn refresh_scoped_target(cache: &CacheStore, target: &BillingTarget, force: bool) {
     let now = CacheStore::now_unix();
-    if should_skip_fetch(cache, target.billing, force, now).unwrap_or(true) {
+    if should_skip_fetch(cache, target.billing, force, now, PANE_DEBOUNCE_SECONDS).unwrap_or(true) {
         return;
     }
     let Ok(Some(_lease)) = cache.try_lock_target_refresh(target) else {
@@ -1214,11 +1215,81 @@ fn refresh_selected(
     force: bool,
     panes: &[AgentPane],
 ) -> Result<Vec<ProviderOutcome>> {
+    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+    let backed = pane_backed_providers(panes);
     providers
         .iter()
         .copied()
-        .map(|provider| refresh_provider(cache, provider, force, panes))
+        .map(|provider| {
+            let interval = debounce_seconds(provider, &always_on, &backed);
+            refresh_provider(cache, provider, force, panes, interval)
+        })
         .collect()
+}
+
+/// Providers some pane in the pass is billed to.
+fn pane_backed_providers(panes: &[AgentPane]) -> Vec<Provider> {
+    let mut backed = Vec::new();
+    for pane in panes {
+        let provider = match route::resolve(pane) {
+            Resolution::Subscription(target) => target.original_provider(),
+            _ => pane.harness.billing(),
+        };
+        if let Some(provider) = provider.filter(|provider| !backed.contains(provider)) {
+            backed.push(provider);
+        }
+    }
+    backed
+}
+
+/// An enabled always-on provider with no pane in the pass is refreshed only
+/// every five minutes; one a pane backs keeps the pane's 60 seconds (R29).
+fn debounce_seconds(provider: Provider, always_on: &[Provider], backed: &[Provider]) -> u64 {
+    if always_on.contains(&provider) && !backed.contains(&provider) {
+        PANELESS_DEBOUNCE_SECONDS
+    } else {
+        PANE_DEBOUNCE_SECONDS
+    }
+}
+
+/// Always-on providers no pane backs whose 300 s window is open. Never forced.
+fn paneless_due(
+    cache: &CacheStore,
+    always_on: &[Provider],
+    backed: &[Provider],
+    now: u64,
+    gate: impl Fn(Provider) -> (Option<String>, Option<u64>),
+) -> Result<Vec<Provider>> {
+    let mut due = Vec::new();
+    for provider in always_on.iter().filter(|p| !backed.contains(p)) {
+        let (account, mtime) = gate(*provider);
+        let skip = should_skip_fetch_within(
+            cache,
+            *provider,
+            false,
+            now,
+            account.as_deref(),
+            mtime,
+            PANELESS_DEBOUNCE_SECONDS,
+        )?;
+        if !skip {
+            due.push(*provider);
+        }
+    }
+    Ok(due)
+}
+
+/// Refresh the enabled always-on providers that have no pane in this pass, so
+/// the workspace rows do not go stale. Reads no pane; a failed fetch still
+/// counts as the attempt (marked before the fetch) and keeps the last snapshot.
+fn refresh_paneless(cache: &CacheStore, panes: &[AgentPane]) {
+    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+    let backed = pane_backed_providers(panes);
+    let now = CacheStore::now_unix();
+    let Ok(due) = paneless_due(cache, &always_on, &backed, now, current_account_gate) else {
+        return;
+    };
+    let _ = refresh_selected(cache, &due, false, panes);
 }
 
 fn refresh_provider(
@@ -1226,9 +1297,10 @@ fn refresh_provider(
     provider: Provider,
     force: bool,
     panes: &[AgentPane],
+    interval: u64,
 ) -> Result<ProviderOutcome> {
     let now = CacheStore::now_unix();
-    if should_skip_fetch(cache, provider, force, now)? {
+    if should_skip_fetch(cache, provider, force, now, interval)? {
         return Ok(ProviderOutcome {
             provider,
             available: load_usable_snapshot(cache, provider)?.is_some(),
@@ -1332,16 +1404,31 @@ fn refresh_provider(
     }
 }
 
+/// Debounce for a provider some pane in the pass is billed to.
+const PANE_DEBOUNCE_SECONDS: u64 = 60;
+/// Debounce for an enabled always-on provider no pane backs (R29).
+const PANELESS_DEBOUNCE_SECONDS: u64 = 300;
+
 fn should_skip_fetch(
     cache: &CacheStore,
     provider: Provider,
     force: bool,
     now_unix: u64,
+    interval: u64,
 ) -> Result<bool> {
     let (account, mtime) = current_account_gate(provider);
-    should_skip_fetch_for_account(cache, provider, force, now_unix, account.as_deref(), mtime)
+    should_skip_fetch_within(
+        cache,
+        provider,
+        force,
+        now_unix,
+        account.as_deref(),
+        mtime,
+        interval,
+    )
 }
 
+#[cfg(test)]
 fn should_skip_fetch_for_account(
     cache: &CacheStore,
     provider: Provider,
@@ -1350,10 +1437,30 @@ fn should_skip_fetch_for_account(
     account: Option<&str>,
     mtime: Option<u64>,
 ) -> Result<bool> {
+    should_skip_fetch_within(
+        cache,
+        provider,
+        force,
+        now_unix,
+        account,
+        mtime,
+        PANE_DEBOUNCE_SECONDS,
+    )
+}
+
+fn should_skip_fetch_within(
+    cache: &CacheStore,
+    provider: Provider,
+    force: bool,
+    now_unix: u64,
+    account: Option<&str>,
+    mtime: Option<u64>,
+    interval: u64,
+) -> Result<bool> {
     let snapshot = cache.load(provider)?;
     if !debounce_reuses_snapshot(
         force,
-        cache.should_debounce(provider, now_unix, 60)?,
+        cache.should_debounce(provider, now_unix, interval)?,
         snapshot.as_ref(),
         account,
         mtime,
@@ -3218,6 +3325,81 @@ mod tests {
         }
     }
 
+    fn grok_gate(_: Provider) -> (Option<String>, Option<u64>) {
+        (Some("acc".into()), None)
+    }
+
+    fn grok_cache_attempted_at(dir: &std::path::Path, attempt: u64) -> CacheStore {
+        let cache = CacheStore::new(dir);
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 1_000_000)],
+                    900,
+                )
+                .with_account_id(Some("acc".into())),
+            )
+            .unwrap();
+        cache
+            .mark_refresh_account(Provider::Grok, attempt, Some("acc"))
+            .unwrap();
+        cache
+    }
+
+    #[test]
+    fn a_paneless_always_on_provider_is_due_only_after_five_minutes() {
+        let directory = tempdir().unwrap();
+        let cache = grok_cache_attempted_at(directory.path(), 1_000);
+        let always_on = [Provider::Grok];
+        let due = |now| paneless_due(&cache, &always_on, &[], now, grok_gate).unwrap();
+        assert!(due(1_100).is_empty(), "inside 300 s the attempt is reused");
+        assert!(due(1_299).is_empty());
+        assert_eq!(due(1_300), vec![Provider::Grok]);
+    }
+
+    #[test]
+    fn a_provider_with_a_pane_keeps_the_sixty_second_rule() {
+        let directory = tempdir().unwrap();
+        let cache = grok_cache_attempted_at(directory.path(), 1_000);
+        let always_on = [Provider::Grok];
+        let backed = [Provider::Grok];
+        assert_eq!(debounce_seconds(Provider::Grok, &always_on, &backed), 60);
+        assert_eq!(debounce_seconds(Provider::Grok, &always_on, &[]), 300);
+        assert_eq!(debounce_seconds(Provider::Grok, &[], &[]), 60);
+        // The pane path is not the paneless selection, and its own window is 60.
+        assert!(paneless_due(&cache, &always_on, &backed, 1_100, grok_gate)
+            .unwrap()
+            .is_empty());
+        assert!(!should_skip_fetch_within(
+            &cache,
+            Provider::Grok,
+            false,
+            1_100,
+            Some("acc"),
+            None,
+            debounce_seconds(Provider::Grok, &always_on, &backed),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn a_failed_paneless_attempt_is_debounced_and_keeps_the_snapshot() {
+        // refresh_provider marks the attempt before it fetches and saves
+        // nothing on error, so a failure leaves exactly this state: the
+        // marker at the attempt time and the previous snapshot untouched.
+        let directory = tempdir().unwrap();
+        let cache = grok_cache_attempted_at(directory.path(), 1_000);
+        assert!(
+            paneless_due(&cache, &[Provider::Grok], &[], 1_200, grok_gate)
+                .unwrap()
+                .is_empty()
+        );
+        let kept = cache.load(Provider::Grok).unwrap().unwrap();
+        assert_eq!(kept.fetched_at_unix, 900);
+        assert!(kept.usable_for_account(Some("acc"), None));
+    }
+
     #[test]
     fn debounce_does_not_keep_another_accounts_grok_snapshot() {
         let directory = tempdir().unwrap();
@@ -3231,7 +3413,7 @@ mod tests {
         cache.save(&snapshot).unwrap();
         cache.mark_refresh(Provider::Grok, 100).unwrap();
         assert!(
-            !should_skip_fetch(&cache, Provider::Grok, false, 120).unwrap(),
+            !should_skip_fetch(&cache, Provider::Grok, false, 120, PANE_DEBOUNCE_SECONDS).unwrap(),
             "a snapshot for another Grok login must be fetched even inside the debounce window"
         );
     }
