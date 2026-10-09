@@ -86,8 +86,8 @@ An enabled always-on provider with no pane in the pass is refreshed by the
 `startup`, `refresh` and `watch` passes on a 300-second debounce (a provider
 with a pane keeps 60). Never forced; a failed attempt still counts, and the
 last usable snapshot survives it, even when its windows have lapsed. These rows
-refresh during watch, refresh and startup passes only (the watch `--provider`
-scope is ignored); `event` does not do this: it stays on the
+refresh during watch, refresh and startup passes only (a watcher scoped with `--provider`
+refreshes only providers in that scope; `--provider all` covers every one); `event` does not do this: it stays on the
 named pane's budget.
 
 ## omp's quota does not come from a provider endpoint

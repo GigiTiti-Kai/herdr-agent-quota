@@ -195,7 +195,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             .filter(|pane| pane.icon_needs_update())
             .map(|pane| pane.pane_id.clone())
             .collect::<Vec<_>>();
-        refresh_paneless(&cache, &state.panes);
+        refresh_paneless(&cache, &state.panes, providers);
         let _ = refresh_working_panes(&cache, &state.panes, &affected, &icon_dirty);
         let stale_icons = state.panes.iter().any(has_stale_done_icon);
         if active.is_empty()
@@ -1279,11 +1279,25 @@ fn paneless_due(
     Ok(due)
 }
 
+/// A watcher scoped to `--provider agy` must not fetch anything else.
+fn in_watch_scope(always_on: Vec<Provider>, scope: &[Provider]) -> Vec<Provider> {
+    if covers_every_collector(scope) {
+        return always_on;
+    }
+    always_on
+        .into_iter()
+        .filter(|p| scope.contains(p))
+        .collect()
+}
+
 /// Refresh the enabled always-on providers that have no pane in this pass, so
 /// the workspace rows do not go stale. Reads no pane; a failed fetch still
 /// counts as the attempt (marked before the fetch) and keeps the last snapshot.
-fn refresh_paneless(cache: &CacheStore, panes: &[AgentPane]) {
-    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+fn refresh_paneless(cache: &CacheStore, panes: &[AgentPane], scope: &[Provider]) {
+    let always_on = in_watch_scope(
+        always_on_providers(&AgentSelection::from_args_or_env(&[])),
+        scope,
+    );
     let backed = pane_backed_providers(panes);
     let now = CacheStore::now_unix();
     let Ok(due) = paneless_due(cache, &always_on, &backed, now, current_account_gate) else {
@@ -3359,6 +3373,17 @@ mod tests {
             .mark_refresh_account(Provider::Grok, attempt, Some("acc"))
             .unwrap();
         cache
+    }
+
+    #[test]
+    fn a_scoped_watcher_refreshes_only_paneless_providers_in_its_scope() {
+        let all = vec![Provider::Claude, Provider::Codex, Provider::Agy];
+        assert_eq!(
+            in_watch_scope(all.clone(), &[Provider::Agy]),
+            vec![Provider::Agy]
+        );
+        assert!(in_watch_scope(all.clone(), &[Provider::Grok]).is_empty());
+        assert_eq!(in_watch_scope(all.clone(), &Provider::ALL), all);
     }
 
     #[test]
