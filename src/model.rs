@@ -674,6 +674,10 @@ pub struct ProviderSnapshot {
     /// Current session-local observations clear this map during migration.
     #[serde(default)]
     pub session_quota_scopes: BTreeMap<String, String>,
+    /// Unix time each session was last named by a save. Cap eviction drops
+    /// the least recently seen session; absent counts as 0.
+    #[serde(default)]
+    pub session_seen_unix: BTreeMap<String, u64>,
     /// Legacy profile-shared windows; not trusted by current StatusLine data.
     #[serde(default)]
     pub quota_scope_windows: BTreeMap<String, Vec<UsageWindow>>,
@@ -701,6 +705,7 @@ impl ProviderSnapshot {
             session_contexts: BTreeMap::new(),
             session_windows: BTreeMap::new(),
             session_quota_scopes: BTreeMap::new(),
+            session_seen_unix: BTreeMap::new(),
             quota_scope_windows: BTreeMap::new(),
             account_id: None,
         }
