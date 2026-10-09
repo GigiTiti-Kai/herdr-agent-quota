@@ -1961,58 +1961,65 @@ mod tests {
             Provider::OpenCodeGo,
             Provider::Cursor,
         ] {
-            let snapshot = ProviderSnapshot::new(
-                provider,
-                vec![
-                    UsageWindow::new(
-                        WindowKind::FiveHour,
-                        85.0,
-                        Some(ResetAt::from_unix_seconds(9_000)),
+            for format in [SummaryFormat::Compact, SummaryFormat::Lines] {
+                let snapshot = ProviderSnapshot::new(
+                    provider,
+                    vec![
+                        UsageWindow::new(
+                            WindowKind::FiveHour,
+                            85.0,
+                            Some(ResetAt::from_unix_seconds(9_000)),
+                        )
+                        .unwrap(),
+                        UsageWindow::new(
+                            WindowKind::Weekly,
+                            42.0,
+                            Some(ResetAt::from_unix_seconds(600_000)),
+                        )
+                        .unwrap(),
+                        UsageWindow::new(
+                            WindowKind::Monthly,
+                            10.0,
+                            Some(ResetAt::from_unix_seconds(2_000_000)),
+                        )
+                        .unwrap(),
+                    ],
+                    0,
+                )
+                .with_model(Some("A Very Long Model Name".to_string()));
+                let row = |summary| RowStyle {
+                    fields: FieldSet::all(),
+                    summary,
+                    ..RowStyle::default()
+                };
+                let render = |summary| {
+                    MetadataTokens::from_snapshot_for_pane_with_fields(
+                        &snapshot,
+                        0,
+                        None,
+                        row(summary),
                     )
-                    .unwrap(),
-                    UsageWindow::new(
-                        WindowKind::Weekly,
-                        42.0,
-                        Some(ResetAt::from_unix_seconds(600_000)),
-                    )
-                    .unwrap(),
-                    UsageWindow::new(
-                        WindowKind::Monthly,
-                        10.0,
-                        Some(ResetAt::from_unix_seconds(2_000_000)),
-                    )
-                    .unwrap(),
-                ],
-                0,
-            )
-            .with_model(Some("A Very Long Model Name".to_string()));
-            let row = |summary| RowStyle {
-                fields: FieldSet::all(),
-                summary,
-                ..RowStyle::default()
-            };
-            let render = |summary| {
-                MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, 0, None, row(summary))
-            };
-            let off = desired_tokens(
-                &render(SummaryFormat::Off),
-                "topic",
-                SidebarShape::default(),
-            );
-            let on_values = render(SummaryFormat::Lines);
-            let on = desired_tokens(&on_values, "topic", SidebarShape::default());
-            assert!(
-                on.keys().all(|name| off.contains_key(name)),
-                "{provider:?}: {on:?}"
-            );
-            let summary = desired_summary_tokens(&on_values);
-            let leftover = desired_summary_tokens(&claude_summary(90.0));
-            assert!(
-                summary_report_names(&leftover, &summary).len() <= MAX_METADATA_TOKENS,
-                "{provider:?}"
-            );
-            // + group, gap, icon from `apply_group_and_icon`; 2 keys left for the user's own hooks.
-            assert!(on.len() + 3 + summary.len() <= 30, "{provider:?}");
+                };
+                let off = desired_tokens(
+                    &render(SummaryFormat::Off),
+                    "topic",
+                    SidebarShape::default(),
+                );
+                let on_values = render(format);
+                let on = desired_tokens(&on_values, "topic", SidebarShape::default());
+                assert!(
+                    on.keys().all(|name| off.contains_key(name)),
+                    "{provider:?} {format:?}: {on:?}"
+                );
+                let summary = desired_summary_tokens(&on_values);
+                let leftover = desired_summary_tokens(&claude_summary(90.0));
+                assert!(
+                    summary_report_names(&leftover, &summary).len() <= MAX_METADATA_TOKENS,
+                    "{provider:?}"
+                );
+                // + group, gap, icon from `apply_group_and_icon`; 2 keys left for the user's own hooks.
+                assert!(on.len() + 3 + summary.len() <= 30, "{provider:?}");
+            }
         }
     }
 
@@ -2034,6 +2041,54 @@ mod tests {
             );
         }
         assert!(!desired_summary_tokens(&claude_summary(0.0)).contains_key("quota_acct_cl_gap"));
+    }
+
+    #[test]
+    fn lines_mode_with_one_window_publishes_one_line_and_a_gap_that_clears_on_switch() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Codex,
+            vec![UsageWindow::new(
+                WindowKind::Weekly,
+                24.0,
+                Some(ResetAt::from_unix_seconds(180_000)),
+            )
+            .unwrap()],
+            0,
+        );
+        let render = |summary| {
+            MetadataTokens::from_snapshot_for_pane_with_fields(
+                &snapshot,
+                0,
+                None,
+                RowStyle {
+                    percent: PercentStyle::Used,
+                    fields: FieldSet::all(),
+                    summary,
+                    ..RowStyle::default()
+                },
+            )
+        };
+        let lines = desired_summary_tokens(&render(SummaryFormat::Lines));
+        let names: Vec<&str> = lines.keys().map(String::as_str).collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.contains(&SUMMARY_TITLE_TOKEN), "{names:?}");
+        assert!(names.contains(&"quota_acct_cx_icon"), "{names:?}");
+        assert!(names.contains(&"quota_acct_cx_gap"), "{names:?}");
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("quota_acct_cx_w1_"))
+                .count(),
+            1,
+            "{names:?}"
+        );
+
+        let claude_lines = desired_summary_tokens(&lines_claude());
+        let compact = desired_summary_tokens(&claude_summary(90.0));
+        assert!(compact.keys().all(|name| !name.ends_with("_gap")));
+        assert!(summary_report_names(&claude_lines, &compact)
+            .iter()
+            .any(|name| name == "quota_acct_cl_gap"));
     }
 
     #[test]

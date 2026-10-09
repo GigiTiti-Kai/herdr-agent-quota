@@ -1301,7 +1301,7 @@ mod tests {
         );
         let account = lines_of(&snapshot, 0);
         assert!(account.segments[0].text.chars().count() <= SUMMARY_ROW_WIDTH - 2);
-        assert!(account.segments[0].text.contains("29d"));
+        assert!(account.segments[0].text.contains("29d23h"));
     }
 
     /// The footer shows the windows the field set shows, like `headroom`.

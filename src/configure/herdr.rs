@@ -1552,10 +1552,16 @@ fn print_diff_hint(
         println!("  leave out {}", hidden.join(", "));
     }
     if summary.is_on() {
-        println!(
-            "  move 5h, 7d and 30d into one {} footer row per account; agent rows keep cache, TTL and metered ses",
-            summary.as_str()
-        );
+        if summary == SummaryFormat::Lines {
+            println!(
+                "  move 5h, 7d and 30d into one footer line per window per account, blank line between accounts; agent rows keep cache, TTL and metered ses"
+            );
+        } else {
+            println!(
+                "  move 5h, 7d and 30d into one {} footer row per account; agent rows keep cache, TTL and metered ses",
+                summary.as_str()
+            );
+        }
     }
     println!("  paint brand icon idle/working/done (no state_icon ring)");
 }

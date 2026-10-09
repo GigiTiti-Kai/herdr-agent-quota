@@ -137,7 +137,9 @@ pub enum Command {
         icon_size: Option<IconSize>,
         /// Agent panel footer: off (default) keeps meters on every agent row;
         /// compact, bars, or numbers move 5h/7d/30d into one footer row per
-        /// account. Needs a Herdr build that understands `footer`.
+        /// account; lines gives one footer line per window with its own reset,
+        /// blank line between accounts (needs a Herdr footer cap of 64 rows).
+        /// Needs a Herdr build that understands `footer`.
         #[arg(long, value_enum)]
         account_summary: Option<SummaryFormat>,
     },
@@ -759,7 +761,8 @@ impl IconSize {
 /// How the Agent panel footer summarises each account's quota.
 ///
 /// `off` keeps today's meters on every agent row and writes no footer. The
-/// other three move 5h/7d/scoped/30d into one footer row per account family.
+/// other four move 5h/7d/scoped/30d into the footer: `compact`, `bars` and
+/// `numbers` one row per account family, `lines` one line per window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SummaryFormat {
     /// `5h▱▱▱  0% 7d▰▱▱ 24% 2d2h`: 3-cell bars, then the most-used window's reset.
