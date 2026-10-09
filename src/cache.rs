@@ -2335,9 +2335,19 @@ mod tests {
 
     fn statusline_save(cache: &CacheStore, id: &str) {
         let observation = json!({"session_id": id});
+        let mut next = snapshot();
+        next.session_models.insert(id.to_string(), "m".into());
         cache
-            .save_statusline_observation(Provider::Grok, snapshot(), &observation)
+            .save_statusline_observation(Provider::Grok, next, &observation)
             .unwrap();
+    }
+
+    fn load_statusline(cache: &CacheStore) -> ProviderSnapshot {
+        cache
+            .load_statusline_observation(Provider::Grok)
+            .unwrap()
+            .unwrap()
+            .snapshot
     }
 
     #[test]
@@ -2346,25 +2356,83 @@ mod tests {
         let cache = CacheStore::new(directory.path());
         let now = CacheStore::now_unix();
         let mut previous = full_models(&[("1088live", now - 60)]);
-        previous.session_seen_unix.insert("9dead-005".into(), 1); // oldest stamp, not smallest key
-        previous
-            .session_models
-            .insert("0882writer".into(), "m".into());
-        let observation = json!({"session_id": "0882writer"});
+        for id in previous.session_models.keys().cloned().collect::<Vec<_>>() {
+            previous.session_seen_unix.entry(id).or_insert(100);
+        }
+        // Smallest dead key has a newer stamp than 9dead-005, so key order
+        // and seen order disagree.
+        previous.session_seen_unix.insert("9dead-005".into(), 1);
+        previous.session_models.insert("9writer".into(), "m".into());
         cache
-            .save_statusline_observation(Provider::Grok, previous.clone(), &observation)
+            .save_statusline_observation(
+                Provider::Grok,
+                previous,
+                &json!({"session_id": "9writer"}),
+            )
             .unwrap();
-        statusline_save(&cache, "0882writer");
-        let saved = cache
-            .load_statusline_observation(Provider::Grok)
-            .unwrap()
-            .unwrap()
-            .snapshot;
+        let saved = load_statusline(&cache);
         assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
         assert!(saved.session_models.contains_key("1088live"));
-        assert!(saved.session_models.contains_key("0882writer"));
-        assert!(!saved.session_models.contains_key("9dead-000"));
+        assert!(saved.session_models.contains_key("9writer"));
+        assert!(!saved.session_models.contains_key("9dead-005"));
+        assert!(saved.session_models.contains_key("9dead-000"));
         assert!(saved.session_seen_unix.len() <= saved.session_models.len());
+
+        // A second writer must not forget 1088live's stamp: without the
+        // merge it falls back to 0 and is evicted ahead of the dead tail.
+        statusline_save(&cache, "07new");
+        let saved = load_statusline(&cache);
+        assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
+        assert!(saved.session_models.contains_key("1088live"));
+        assert!(saved.session_models.contains_key("07new"));
+        assert!(saved.session_seen_unix.len() <= saved.session_models.len());
+    }
+
+    #[test]
+    fn diagnostics_save_keeps_a_session_stamped_by_an_earlier_save() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let mut first = snapshot();
+        first.session_models.insert("0x".into(), "m".into());
+        cache
+            .save_preserving_diagnostics_for_sessions(&mut first, &["0x".to_string()], None)
+            .unwrap();
+        let mut filler = cache.load(Provider::Grok).unwrap().unwrap();
+        for index in 0..(MAX_STATUSLINE_SESSIONS - 1) {
+            filler
+                .session_models
+                .insert(format!("9dead-{index:03}"), "m".into());
+        }
+        cache.save(&filler).unwrap();
+        let mut latest = snapshot();
+        latest.session_models.insert("0y".into(), "m".into());
+        cache
+            .save_preserving_diagnostics_for_sessions(&mut latest, &["0y".to_string()], None)
+            .unwrap();
+        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
+        assert!(saved.session_models.contains_key("0x"));
+        assert!(saved.session_models.contains_key("0y"));
+    }
+
+    #[test]
+    fn context_save_keeps_a_session_stamped_by_an_earlier_save() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let now = CacheStore::now_unix();
+        let mut previous = full_models(&[("1088live", now - 60)]);
+        previous.session_models.insert("9writer".into(), "m".into());
+        cache
+            .save_preserving_context_for_session(previous, Some("9writer"))
+            .unwrap();
+        let mut next = snapshot();
+        next.session_models.insert("07new".into(), "m".into());
+        cache
+            .save_preserving_context_for_session(next, Some("07new"))
+            .unwrap();
+        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
+        assert!(saved.session_models.contains_key("1088live"));
     }
 
     #[test]
