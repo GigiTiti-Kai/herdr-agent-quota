@@ -141,6 +141,8 @@ than a wrong number.
 - OMP stores all accounts in one sanitized provider report so a second pin
   does not lose its quota during debounce. Select by pin; keep a failed
   account's old reading only while the report still identifies that account.
+- Per-session maps are capped at 128. Eviction drops the least recently seen
+  session (`session_seen_unix`, absent = 0, ties by key), never a current one.
 - Cursor stamps `sha256("cursor\0" || access token)`. Included is
   `planUsage.totalPercentUsed` when present — the CLI usage panel's Included
   row — and only then `includedSpend / limit`. The IDE `state.vscdb` mtime is

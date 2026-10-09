@@ -252,6 +252,7 @@ impl CacheStore {
                 // diagnostics are carried forward rather than dropped and then
                 // re-published as a cleared token on the next focus.
                 // `prune_session_diagnostics` below keeps the map bounded.
+                merge_session_seen(snapshot, &previous);
                 for (session_id, context) in previous.session_contexts {
                     snapshot
                         .session_contexts
@@ -274,7 +275,7 @@ impl CacheStore {
                 }
             }
         }
-        prune_session_diagnostics(snapshot, session_ids);
+        prune_session_diagnostics(snapshot, session_ids, Self::now_unix());
         self.save(snapshot)
     }
 
@@ -328,6 +329,7 @@ impl CacheStore {
             session_id,
         );
         if let Some(previous_snapshot) = previous_snapshot {
+            merge_session_seen(&mut snapshot, previous_snapshot);
             for (session_id, context) in &previous_snapshot.session_contexts {
                 snapshot
                     .session_contexts
@@ -352,7 +354,7 @@ impl CacheStore {
         let current_session_ids = session_id
             .map(|session_id| vec![session_id.to_string()])
             .unwrap_or_default();
-        prune_session_diagnostics(&mut snapshot, &current_session_ids);
+        prune_session_diagnostics(&mut snapshot, &current_session_ids, Self::now_unix());
         let saved = StatuslineObservation {
             snapshot,
             payload: observation.clone(),
@@ -429,6 +431,7 @@ impl CacheStore {
             session_id,
         );
         if let Some(previous) = previous.as_ref() {
+            merge_session_seen(&mut snapshot, previous);
             for (session_id, context) in &previous.session_contexts {
                 snapshot
                     .session_contexts
@@ -453,7 +456,7 @@ impl CacheStore {
         let current_session_ids = session_id
             .map(|session_id| vec![session_id.to_string()])
             .unwrap_or_default();
-        prune_session_diagnostics(&mut snapshot, &current_session_ids);
+        prune_session_diagnostics(&mut snapshot, &current_session_ids, Self::now_unix());
         self.save(&snapshot)
     }
 
@@ -1244,30 +1247,63 @@ fn previous_windows_for_merge<'a>(
         })
 }
 
-fn prune_session_diagnostics(snapshot: &mut ProviderSnapshot, current_session_ids: &[String]) {
-    prune_session_map(&mut snapshot.session_models, current_session_ids);
-    prune_session_map(&mut snapshot.session_contexts, current_session_ids);
-    prune_session_map(&mut snapshot.session_windows, current_session_ids);
-    prune_session_map(&mut snapshot.session_quota_scopes, current_session_ids);
+fn merge_session_seen(snapshot: &mut ProviderSnapshot, previous: &ProviderSnapshot) {
+    for (session_id, seen) in &previous.session_seen_unix {
+        snapshot
+            .session_seen_unix
+            .entry(session_id.clone())
+            .or_insert(*seen);
+    }
+}
+
+fn prune_session_diagnostics(
+    snapshot: &mut ProviderSnapshot,
+    current_session_ids: &[String],
+    now: u64,
+) {
+    for session_id in current_session_ids {
+        snapshot.session_seen_unix.insert(session_id.clone(), now);
+    }
+    let seen = &snapshot.session_seen_unix;
+    prune_session_map(&mut snapshot.session_models, current_session_ids, seen);
+    prune_session_map(&mut snapshot.session_contexts, current_session_ids, seen);
+    prune_session_map(&mut snapshot.session_windows, current_session_ids, seen);
+    prune_session_map(
+        &mut snapshot.session_quota_scopes,
+        current_session_ids,
+        seen,
+    );
     snapshot.quota_scope_windows.retain(|scope, _| {
         snapshot
             .session_quota_scopes
             .values()
             .any(|mapped| mapped == scope)
     });
+    snapshot.session_seen_unix.retain(|id, _| {
+        snapshot.session_models.contains_key(id)
+            || snapshot.session_contexts.contains_key(id)
+            || snapshot.session_windows.contains_key(id)
+            || snapshot.session_quota_scopes.contains_key(id)
+    });
 }
 
-fn prune_session_map<T>(map: &mut BTreeMap<String, T>, current_session_ids: &[String]) {
+/// Evict the least recently seen session (absent = 0, ties by key) until the
+/// cap holds; a current session is evicted only if nothing else is left.
+fn prune_session_map<T>(
+    map: &mut BTreeMap<String, T>,
+    current_session_ids: &[String],
+    seen: &BTreeMap<String, u64>,
+) {
     while map.len() > MAX_STATUSLINE_SESSIONS {
         let Some(session_id) = map
             .keys()
-            .find(|session_id| {
-                !current_session_ids
-                    .iter()
-                    .any(|current| current == *session_id)
+            .min_by_key(|id| {
+                (
+                    current_session_ids.contains(id),
+                    seen.get(*id).copied().unwrap_or(0),
+                )
             })
             .cloned()
-            .or_else(|| map.keys().next().cloned())
         else {
             break;
         };
@@ -2282,6 +2318,115 @@ mod tests {
         let saved = cache.load(Provider::Grok).unwrap().unwrap();
         assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
         assert_eq!(saved.session_contexts.len(), MAX_STATUSLINE_SESSIONS);
+    }
+
+    fn full_models(live: &[(&str, u64)]) -> ProviderSnapshot {
+        let mut snap = snapshot();
+        for (id, seen) in live {
+            snap.session_models.insert(id.to_string(), "m".into());
+            snap.session_seen_unix.insert(id.to_string(), *seen);
+        }
+        for index in 0..(MAX_STATUSLINE_SESSIONS - live.len()) {
+            snap.session_models
+                .insert(format!("9dead-{index:03}"), "m".into());
+        }
+        snap
+    }
+
+    fn statusline_save(cache: &CacheStore, id: &str) {
+        let observation = json!({"session_id": id});
+        cache
+            .save_statusline_observation(Provider::Grok, snapshot(), &observation)
+            .unwrap();
+    }
+
+    #[test]
+    fn statusline_save_evicts_least_recently_seen_not_smallest_id() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let now = CacheStore::now_unix();
+        let mut previous = full_models(&[("1088live", now - 60)]);
+        previous.session_seen_unix.insert("9dead-005".into(), 1); // oldest stamp, not smallest key
+        previous
+            .session_models
+            .insert("0882writer".into(), "m".into());
+        let observation = json!({"session_id": "0882writer"});
+        cache
+            .save_statusline_observation(Provider::Grok, previous.clone(), &observation)
+            .unwrap();
+        statusline_save(&cache, "0882writer");
+        let saved = cache
+            .load_statusline_observation(Provider::Grok)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
+        assert!(saved.session_models.contains_key("1088live"));
+        assert!(saved.session_models.contains_key("0882writer"));
+        assert!(!saved.session_models.contains_key("9dead-000"));
+        assert!(saved.session_seen_unix.len() <= saved.session_models.len());
+    }
+
+    #[test]
+    fn inventory_sessions_survive_and_seen_map_stays_bounded() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let mut previous = full_models(&[]);
+        previous.session_models.insert("a".into(), "m".into());
+        previous.session_models.insert("b".into(), "m".into());
+        cache.save(&previous).unwrap();
+        let mut latest = snapshot();
+        cache
+            .save_preserving_diagnostics_for_sessions(
+                &mut latest,
+                &["a".to_string(), "b".to_string()],
+                None,
+            )
+            .unwrap();
+        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
+        assert!(saved.session_models.contains_key("a"));
+        assert!(saved.session_models.contains_key("b"));
+        assert!(saved
+            .session_seen_unix
+            .keys()
+            .all(|id| saved.session_models.contains_key(id)));
+        assert_eq!(saved.session_seen_unix.len(), 2);
+    }
+
+    #[test]
+    fn cache_without_seen_field_loads_and_keeps_live_sessions() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let mut value = serde_json::to_value(full_models(&[("0001live", 0)])).unwrap();
+        value.as_object_mut().unwrap().remove("session_seen_unix");
+        let path = cache.snapshot_path(Provider::Grok);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = cache.load(Provider::Grok).unwrap().unwrap();
+        assert!(loaded.session_seen_unix.is_empty());
+        let mut latest = snapshot();
+        cache
+            .save_preserving_diagnostics_for_sessions(&mut latest, &["0001live".to_string()], None)
+            .unwrap();
+        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        assert!(saved.session_models.contains_key("0001live"));
+    }
+
+    #[test]
+    fn maps_under_the_cap_are_unchanged() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let mut previous = snapshot();
+        for id in ["a", "b", "c"] {
+            previous.session_models.insert(id.into(), "m".into());
+        }
+        cache.save(&previous).unwrap();
+        let mut latest = snapshot();
+        cache
+            .save_preserving_diagnostics_for_sessions(&mut latest, &["a".to_string()], None)
+            .unwrap();
+        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        assert_eq!(saved.session_models.len(), 3);
     }
 
     fn codex_windows(five_hour: Option<f64>, weekly: f64, fetched_at: u64) -> ProviderSnapshot {
