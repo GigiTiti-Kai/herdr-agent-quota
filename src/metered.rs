@@ -12,8 +12,7 @@ use crate::cli::SummaryFormat;
 use crate::model::Severity;
 use crate::presentation::{
     gauge_cells, meter, provider_model_label, AccountFamily, AccountSegment, AccountSummary,
-    MetadataTokens, RowStyle, SidebarShape, GAUGE_LABEL_WIDTH, LINES_PAD,
-    NARROW_IDENTITY_CONTENT_WIDTH,
+    MetadataTokens, RowStyle, SidebarShape, GAUGE_LABEL_WIDTH, NARROW_IDENTITY_CONTENT_WIDTH,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -326,9 +325,14 @@ pub fn overlay(
         // only the amount; the colour still carries the fuel level.
         let (bal, bal_severity) = balance_row(balance.as_ref(), now, SidebarShape::default());
         let lines = row.summary == SummaryFormat::Lines;
-        let pad = if lines { LINES_PAD } else { "" };
+        let family = backend.family();
+        let pad = if lines {
+            crate::presentation::lines_pad(family.icon)
+        } else {
+            String::new()
+        };
         values.account = Some(AccountSummary {
-            family: backend.family(),
+            family,
             segments: vec![
                 AccountSegment {
                     text: bal,
@@ -639,11 +643,18 @@ mod tests {
             segments,
             [
                 ("bal $1.50", Some(Severity::Warning)),
-                ("\u{2800} day $0.21", Some(Severity::Normal)),
-                ("\u{2800} mon $3.40", Some(Severity::Normal)),
+                ("\u{2800}     day $0.21", Some(Severity::Normal)),
+                ("\u{2800}     mon $3.40", Some(Severity::Normal)),
             ]
         );
         assert!(account.gap && account.reset.is_empty());
+        // Icon "DS" + 3 reserve cells = 5, plus Herdr's join space = 6.
+        for text in [&account.segments[1].text, &account.segments[2].text] {
+            assert_eq!(
+                text.chars().take_while(|c| *c != 'd' && *c != 'm').count(),
+                6
+            );
+        }
     }
 
     #[test]

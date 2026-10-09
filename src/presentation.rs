@@ -492,7 +492,7 @@ fn account_summary(
         .enumerate()
         .map(|(index, window)| {
             if lines {
-                line_segment(window, index, now_unix, row)
+                line_segment(window, index, family.icon, now_unix, row)
             } else {
                 summary_segment(window, now_unix, row.percent, cells)
             }
@@ -528,28 +528,46 @@ fn account_summary(
     }
 }
 
-/// Pad that aligns lines 2 and 3 under the 1-cell icon (R22).
-pub(crate) const LINES_PAD: &str = "\u{2800} ";
+/// The icon a lines footer publishes: the mark plus the blank reserve.
+pub(crate) fn lines_icon(icon: &str) -> String {
+    format!("{icon}{}", crate::icons::SIDEBAR_RESERVE)
+}
+
+/// Cells before line 1's text: the published icon and Herdr's join space.
+fn lines_indent(icon: &str) -> usize {
+    lines_icon(icon).chars().count() + 1
+}
+
+/// Pad that starts lines 2 and 3 under line 1's text (R22). The leading
+/// U+2800 survives Herdr's trim; the spaces after it are kept.
+pub(crate) fn lines_pad(icon: &str) -> String {
+    format!("\u{2800}{}", " ".repeat(lines_indent(icon) - 1))
+}
 
 /// One lines-mode footer row: the gauge text with its own reset, padded for
 /// index >= 1. The ETA is shortened so the row never passes the footer width.
 fn line_segment(
     window: &UsageWindow,
     index: usize,
+    icon: &str,
     now_unix: u64,
     row: RowStyle,
 ) -> AccountSegment {
     let shape = SidebarShape {
         layout: SidebarLayout::Gauges,
         meter_cells: Some(row.shape.meter_cells.unwrap_or(MIN_METER_CELLS)),
-        content_width: SUMMARY_ROW_WIDTH - 2,
+        content_width: SUMMARY_ROW_WIDTH - lines_indent(icon),
     };
     let mut parts = compact_window_parts(window, now_unix, row.percent, shape);
-    let pad = if index == 0 { "" } else { LINES_PAD };
+    let pad = if index == 0 {
+        String::new()
+    } else {
+        lines_pad(icon)
+    };
     let eta = std::mem::take(&mut parts.eta);
     let room = shape
         .content_width
-        .saturating_sub(pad.chars().count() + parts.rendered().chars().count() + 1);
+        .saturating_sub(parts.rendered().chars().count() + 1);
     parts.eta = fit_eta(eta, room);
     AccountSegment {
         text: format!("{pad}{}", parts.rendered()),
@@ -1237,8 +1255,8 @@ mod tests {
             texts[0].starts_with("5h ") && texts[0].contains("3h12m"),
             "{texts:?}"
         );
-        assert!(texts[1].starts_with("\u{2800} 7d ") && texts[1].contains("1d16h"));
-        assert!(texts[2].starts_with("\u{2800} Fab") && texts[2].contains("1d16h"));
+        assert!(texts[1].starts_with("\u{2800}    7d ") && texts[1].contains("1d16h"));
+        assert!(texts[2].starts_with("\u{2800}    Fab") && texts[2].contains("1d16h"));
         assert!(texts[0].contains(&meter(11, 12)), "{texts:?}");
         assert!(account.reset.is_empty() && account.gap);
         for text in texts {
@@ -1251,6 +1269,74 @@ mod tests {
         ] {
             assert!(!summarised(&snapshot, 0, format).account.unwrap().gap);
         }
+    }
+
+    /// Lines 2-3 start under line 1's text: the published icon is the mark
+    /// plus three reserve cells, and Herdr joins icon and line 1 with a space.
+    #[test]
+    fn lines_two_and_three_pad_to_the_reserved_icon_width() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 11.0, 11_520),
+                window(WindowKind::Weekly, 34.0, 144_000),
+                scoped_window(29.0),
+            ],
+            0,
+        );
+        let account = lines_of(&snapshot, 0);
+        let pad = "\u{2800}    ";
+        assert_eq!(pad.chars().count(), 5);
+        assert!(account.segments[0].text.starts_with("5h "));
+        for text in account.segments[1..].iter().map(|s| &s.text) {
+            assert!(
+                text.starts_with(pad) && !text.starts_with("\u{2800}     "),
+                "{text}"
+            );
+        }
+    }
+
+    /// Icon + Herdr's join space + line 1, and pad + lines 2-3, all fit.
+    #[test]
+    fn lines_rows_with_a_long_eta_fit_the_footer_width_with_the_reserve() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 99.0, 29 * 86_400 + 23 * 3_600),
+                window(WindowKind::Weekly, 100.0, 29 * 86_400 + 23 * 3_600),
+                scoped_window(100.0),
+            ],
+            0,
+        );
+        let account = lines_of(&snapshot, 0);
+        let icon_cells = crate::icons::sidebar_mark(Harness::Claude).chars().count();
+        assert_eq!(icon_cells, 4);
+        assert!(account.segments[0].text.contains("29d"), "{account:?}");
+        assert!(icon_cells + 1 + account.segments[0].text.chars().count() <= SUMMARY_ROW_WIDTH);
+        for segment in &account.segments[1..] {
+            assert!(
+                segment.text.chars().count() <= SUMMARY_ROW_WIDTH,
+                "{segment:?}"
+            );
+        }
+    }
+
+    /// A 2-cell text icon (DS/OR) reserves one cell more than a glyph mark.
+    #[test]
+    fn a_text_icon_widens_the_pad_and_still_fits_the_footer_width() {
+        let long = window(WindowKind::Monthly, 40.0, 29 * 86_400 + 23 * 3_600);
+        let row = RowStyle {
+            shape: SidebarShape::new(SidebarLayout::Gauges, 42),
+            ..summary_style(SummaryFormat::Lines)
+        };
+        let icon_cells = lines_icon("DS").chars().count();
+        assert_eq!((icon_cells, lines_pad("DS").chars().count()), (5, 6));
+        let first = line_segment(&long, 0, "DS", 0, row);
+        let later = line_segment(&long, 1, "DS", 0, row);
+        assert!(first.text.contains("29d23h"), "{first:?}");
+        assert!(icon_cells + 1 + first.text.chars().count() <= SUMMARY_ROW_WIDTH);
+        assert!(later.text.starts_with(&lines_pad("DS")));
+        assert!(later.text.chars().count() <= SUMMARY_ROW_WIDTH, "{later:?}");
     }
 
     #[test]

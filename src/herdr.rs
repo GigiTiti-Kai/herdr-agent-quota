@@ -1376,7 +1376,11 @@ fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String, String> {
     tokens.insert(SUMMARY_TITLE_TOKEN.to_string(), SUMMARY_TITLE.to_string());
     tokens.insert(
         format!("quota_acct_{id}_icon"),
-        account.family.icon.to_string(),
+        if account.gap {
+            crate::presentation::lines_icon(account.family.icon)
+        } else {
+            account.family.icon.to_string()
+        },
     );
     for (slot, segment) in account.segments.iter().take(3).enumerate() {
         insert_severity_token(
@@ -2041,6 +2045,19 @@ mod tests {
             );
         }
         assert!(!desired_summary_tokens(&claude_summary(0.0)).contains_key("quota_acct_cl_gap"));
+    }
+
+    #[test]
+    fn lines_mode_icon_carries_the_blank_reserve_and_other_formats_stay_bare() {
+        let mark = crate::icons::for_harness(Harness::Claude);
+        let lines = desired_summary_tokens(&lines_claude());
+        assert_eq!(lines["quota_acct_cl_icon"], format!("{mark}  \u{2800}"));
+        assert_eq!(
+            lines["quota_acct_cl_icon"],
+            crate::icons::sidebar_mark(Harness::Claude)
+        );
+        let compact = desired_summary_tokens(&claude_summary(90.0));
+        assert_eq!(compact["quota_acct_cl_icon"], mark.to_string());
     }
 
     #[test]
