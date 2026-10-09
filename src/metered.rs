@@ -8,10 +8,12 @@
 //! `CLAUDE_BILLING_BACKEND` を `session-backends.json` に書いて結びつける。
 //! 判定するのは `refresh::resolved_pane_tokens` の Claude 分岐だけ。
 
+use crate::cli::SummaryFormat;
 use crate::model::Severity;
 use crate::presentation::{
     gauge_cells, meter, provider_model_label, AccountFamily, AccountSegment, AccountSummary,
-    MetadataTokens, RowStyle, SidebarShape, GAUGE_LABEL_WIDTH, NARROW_IDENTITY_CONTENT_WIDTH,
+    MetadataTokens, RowStyle, SidebarShape, GAUGE_LABEL_WIDTH, LINES_PAD,
+    NARROW_IDENTITY_CONTENT_WIDTH,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -323,6 +325,8 @@ pub fn overlay(
         // The bar is a guess against the last top-up, so the footer keeps
         // only the amount; the colour still carries the fuel level.
         let (bal, bal_severity) = balance_row(balance.as_ref(), now, SidebarShape::default());
+        let lines = row.summary == SummaryFormat::Lines;
+        let pad = if lines { LINES_PAD } else { "" };
         values.account = Some(AccountSummary {
             family: backend.family(),
             segments: vec![
@@ -331,15 +335,16 @@ pub fn overlay(
                     severity: bal_severity,
                 },
                 AccountSegment {
-                    text: day_text,
+                    text: format!("{pad}{day_text}"),
                     severity: Some(Severity::Normal),
                 },
                 AccountSegment {
-                    text: month_text,
+                    text: format!("{pad}{month_text}"),
                     severity: Some(Severity::Normal),
                 },
             ],
             reset: String::new(),
+            gap: lines,
         });
         // R7: `ses` stays on the agent row (`quota_week_scoped`).
         values.quota_5h.clear();
@@ -352,7 +357,7 @@ pub fn overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{SidebarLayout, SummaryFormat};
+    use crate::cli::SidebarLayout;
     use crate::model::{Provider, Severity};
     use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
     use std::fs;
@@ -603,6 +608,42 @@ mod tests {
         );
         assert_eq!(values.quota_week_scoped, "ses $0.050");
         assert_eq!(overlaid(dir.path(), packed()).account, None);
+    }
+
+    /// R24: lines mode is the same three values, padded under the icon.
+    #[test]
+    fn lines_mode_pads_day_and_month_under_the_icon() {
+        let dir = tempdir().unwrap();
+        summary(dir.path(), "2026-09-24");
+        balance(dir.path(), "ok", 1.5, 10.0);
+        let mut values = base();
+        let row = RowStyle {
+            summary: SummaryFormat::Lines,
+            ..RowStyle::default()
+        };
+        overlay(
+            &mut values,
+            Backend::DeepSeek,
+            "sX",
+            Some(dir.path()),
+            NOW,
+            row,
+        );
+        let account = values.account.unwrap();
+        let segments: Vec<_> = account
+            .segments
+            .iter()
+            .map(|s| (s.text.as_str(), s.severity))
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                ("bal $1.50", Some(Severity::Warning)),
+                ("\u{2800} day $0.21", Some(Severity::Normal)),
+                ("\u{2800} mon $3.40", Some(Severity::Normal)),
+            ]
+        );
+        assert!(account.gap && account.reset.is_empty());
     }
 
     #[test]

@@ -1391,6 +1391,9 @@ fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String, String> {
         &format!("quota_acct_{id}_reset"),
         &account.reset,
     );
+    if account.gap {
+        tokens.insert(format!("quota_acct_{id}_gap"), "\u{2800}".to_string());
+    }
     tokens
 }
 
@@ -1819,6 +1822,36 @@ mod tests {
     };
     use serde_json::json;
 
+    fn lines_claude() -> MetadataTokens {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            [
+                WindowKind::FiveHour,
+                WindowKind::Weekly,
+                WindowKind::WeeklyScoped,
+            ]
+            .into_iter()
+            .map(|kind| {
+                UsageWindow::new(kind, 24.0, Some(ResetAt::from_unix_seconds(180_000)))
+                    .unwrap()
+                    .with_source_window("Fab", None)
+            })
+            .collect(),
+            0,
+        );
+        MetadataTokens::from_snapshot_for_pane_with_fields(
+            &snapshot,
+            0,
+            None,
+            RowStyle {
+                percent: PercentStyle::Used,
+                fields: FieldSet::all(),
+                summary: SummaryFormat::Lines,
+                ..RowStyle::default()
+            },
+        )
+    }
+
     fn claude_summary(used_5h: f64) -> MetadataTokens {
         let snapshot = ProviderSnapshot::new(
             Provider::Claude,
@@ -1966,7 +1999,7 @@ mod tests {
                 "topic",
                 SidebarShape::default(),
             );
-            let on_values = render(SummaryFormat::Compact);
+            let on_values = render(SummaryFormat::Lines);
             let on = desired_tokens(&on_values, "topic", SidebarShape::default());
             assert!(
                 on.keys().all(|name| off.contains_key(name)),
@@ -1981,6 +2014,38 @@ mod tests {
             // + group, gap, icon from `apply_group_and_icon`; 2 keys left for the user's own hooks.
             assert!(on.len() + 3 + summary.len() <= 30, "{provider:?}");
         }
+    }
+
+    #[test]
+    fn lines_mode_publishes_a_gap_and_no_reset_and_compact_publishes_no_gap() {
+        let lines = lines_claude();
+        let tokens = desired_summary_tokens(&lines);
+        let names: Vec<&str> = tokens.keys().map(String::as_str).collect();
+        assert_eq!(tokens["quota_acct_cl_gap"], "\u{2800}");
+        assert!(!names.contains(&"quota_acct_cl_reset"), "{names:?}");
+        assert!(names.contains(&SUMMARY_TITLE_TOKEN));
+        assert!(names.contains(&"quota_acct_cl_icon"));
+        for slot in 1..=3 {
+            let prefix = format!("quota_acct_cl_w{slot}_");
+            assert_eq!(
+                names.iter().filter(|n| n.starts_with(&prefix)).count(),
+                1,
+                "{names:?}"
+            );
+        }
+        assert!(!desired_summary_tokens(&claude_summary(0.0)).contains_key("quota_acct_cl_gap"));
+    }
+
+    #[test]
+    fn lines_mode_stays_within_the_report_and_pane_caps_when_switching() {
+        let lines = desired_summary_tokens(&lines_claude());
+        let compact = desired_summary_tokens(&claude_summary(90.0));
+        for (from, to) in [(&compact, &lines), (&lines, &compact), (&lines, &lines)] {
+            assert!(summary_report_names(from, to).len() <= MAX_METADATA_TOKENS);
+        }
+        let main = desired_tokens(&lines_claude(), "topic", SidebarShape::default());
+        assert!(main.len() + 3 + lines.len() <= 30);
+        assert!(lines.len() <= 6);
     }
 
     /// An idle sibling wakes when only its footer row is stale, and a pane

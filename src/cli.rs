@@ -768,6 +768,8 @@ pub enum SummaryFormat {
     Bars,
     /// `5h 0% 7d 24% 2d2h`: numbers and the reset.
     Numbers,
+    /// One footer line per window, each with its own reset.
+    Lines,
     /// Per-agent meters, no footer.
     #[default]
     Off,
@@ -775,13 +777,20 @@ pub enum SummaryFormat {
 
 impl SummaryFormat {
     /// The order the settings pane cycles through, the default first.
-    pub const CHOICES: [Self; 4] = [Self::Off, Self::Compact, Self::Bars, Self::Numbers];
+    pub const CHOICES: [Self; 5] = [
+        Self::Off,
+        Self::Compact,
+        Self::Bars,
+        Self::Numbers,
+        Self::Lines,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Compact => "compact",
             Self::Bars => "bars",
             Self::Numbers => "numbers",
+            Self::Lines => "lines",
             Self::Off => "off",
         }
     }

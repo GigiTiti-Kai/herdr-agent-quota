@@ -139,6 +139,8 @@ pub struct AccountSummary {
     /// At most three, in 5h / 7d / scoped / 30d order.
     pub segments: Vec<AccountSegment>,
     pub reset: String,
+    /// Lines mode: a blank line closes the provider block.
+    pub gap: bool,
 }
 
 impl From<SidebarLayout> for SidebarShape {
@@ -482,18 +484,26 @@ fn account_summary(
     let cells = match row.summary {
         SummaryFormat::Compact => Some(3),
         SummaryFormat::Bars => Some(4),
-        SummaryFormat::Numbers | SummaryFormat::Off => None,
+        SummaryFormat::Numbers | SummaryFormat::Lines | SummaryFormat::Off => None,
     };
+    let lines = row.summary == SummaryFormat::Lines;
     let segments: Vec<AccountSegment> = shown
         .iter()
-        .map(|window| summary_segment(window, now_unix, row.percent, cells))
+        .enumerate()
+        .map(|(index, window)| {
+            if lines {
+                line_segment(window, index, now_unix, row)
+            } else {
+                summary_segment(window, now_unix, row.percent, cells)
+            }
+        })
         .collect();
     let used = family.icon.chars().count()
         + segments
             .iter()
             .map(|segment| 1 + segment.text.chars().count())
             .sum::<usize>();
-    let reset = if row.summary == SummaryFormat::Bars {
+    let reset = if matches!(row.summary, SummaryFormat::Bars | SummaryFormat::Lines) {
         String::new()
     } else {
         shown
@@ -514,6 +524,38 @@ fn account_summary(
         family,
         segments,
         reset,
+        gap: lines,
+    }
+}
+
+/// Pad that aligns lines 2 and 3 under the 1-cell icon (R22).
+pub(crate) const LINES_PAD: &str = "\u{2800} ";
+
+/// One lines-mode footer row: the gauge text with its own reset, padded for
+/// index >= 1. The ETA is shortened so the row never passes the footer width.
+fn line_segment(
+    window: &UsageWindow,
+    index: usize,
+    now_unix: u64,
+    row: RowStyle,
+) -> AccountSegment {
+    let shape = SidebarShape {
+        layout: SidebarLayout::Gauges,
+        meter_cells: Some(row.shape.meter_cells.unwrap_or(MIN_METER_CELLS)),
+        content_width: SUMMARY_ROW_WIDTH - 2,
+    };
+    let mut parts = compact_window_parts(window, now_unix, row.percent, shape);
+    let pad = if index == 0 { "" } else { LINES_PAD };
+    let eta = std::mem::take(&mut parts.eta);
+    let room = shape
+        .content_width
+        .saturating_sub(pad.chars().count() + parts.rendered().chars().count() + 1);
+    parts.eta = fit_eta(eta, room);
+    AccountSegment {
+        text: format!("{pad}{}", parts.rendered()),
+        severity: window
+            .is_current(now_unix)
+            .then(|| Severity::for_window(window, now_unix)),
     }
 }
 
@@ -1160,6 +1202,106 @@ mod tests {
 
         let empty = ProviderSnapshot::new(Provider::Muse, vec![], 0);
         assert_eq!(summarised(&empty, 0, SummaryFormat::Compact).account, None);
+    }
+
+    fn lines_of(snapshot: &ProviderSnapshot, now: u64) -> AccountSummary {
+        let row = RowStyle {
+            shape: SidebarShape::new(SidebarLayout::Gauges, 42),
+            ..summary_style(SummaryFormat::Lines)
+        };
+        MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now, None, row)
+            .account
+            .unwrap()
+    }
+
+    #[test]
+    fn lines_mode_gives_each_window_its_own_padded_line_and_reset() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 11.0, 11_520),
+                window(WindowKind::Weekly, 34.0, 144_000),
+                UsageWindow::new(
+                    WindowKind::WeeklyScoped,
+                    29.0,
+                    Some(ResetAt::from_unix_seconds(144_000)),
+                )
+                .unwrap()
+                .with_source_window("Fab", None),
+            ],
+            0,
+        );
+        let account = lines_of(&snapshot, 0);
+        let texts: Vec<&str> = account.segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            texts[0].starts_with("5h ") && texts[0].contains("3h12m"),
+            "{texts:?}"
+        );
+        assert!(texts[1].starts_with("\u{2800} 7d ") && texts[1].contains("1d16h"));
+        assert!(texts[2].starts_with("\u{2800} Fab") && texts[2].contains("1d16h"));
+        assert!(texts[0].contains(&meter(11, 12)), "{texts:?}");
+        assert!(account.reset.is_empty() && account.gap);
+        for text in texts {
+            assert!(text.chars().count() <= SUMMARY_ROW_WIDTH - 2, "{text}");
+        }
+        for format in [
+            SummaryFormat::Compact,
+            SummaryFormat::Bars,
+            SummaryFormat::Numbers,
+        ] {
+            assert!(!summarised(&snapshot, 0, format).account.unwrap().gap);
+        }
+    }
+
+    #[test]
+    fn each_line_carries_its_own_windows_severity() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 10.0, 3_600),
+                window(WindowKind::Weekly, 99.0, 144_000),
+            ],
+            0,
+        );
+        let account = lines_of(&snapshot, 0);
+        let live = |kind| {
+            let w = snapshot.windows.iter().find(|w| w.kind == kind).unwrap();
+            Some(Severity::for_window(w, 0))
+        };
+        assert_eq!(account.segments[0].severity, live(WindowKind::FiveHour));
+        assert_eq!(account.segments[1].severity, live(WindowKind::Weekly));
+        assert_ne!(account.segments[0].severity, account.segments[1].severity);
+    }
+
+    #[test]
+    fn a_lapsed_window_reads_as_dashes_with_no_eta_in_lines_mode() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                window(WindowKind::FiveHour, 50.0, 100),
+                window(WindowKind::Weekly, 34.0, 144_000),
+            ],
+            0,
+        );
+        let account = lines_of(&snapshot, 200);
+        assert_eq!(
+            account.segments[0].text,
+            format!("5h  {}   --", meter(0, 12))
+        );
+        assert_eq!(account.segments[0].severity, None);
+        assert!(account.segments[1].severity.is_some());
+    }
+
+    #[test]
+    fn a_long_eta_still_fits_a_lines_row() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::OpenCodeGo,
+            vec![window(WindowKind::Monthly, 40.0, 29 * 86_400 + 23 * 3_600)],
+            0,
+        );
+        let account = lines_of(&snapshot, 0);
+        assert!(account.segments[0].text.chars().count() <= SUMMARY_ROW_WIDTH - 2);
+        assert!(account.segments[0].text.contains("29d"));
     }
 
     /// The footer shows the windows the field set shows, like `headroom`.
