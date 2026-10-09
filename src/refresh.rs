@@ -12,7 +12,7 @@ use crate::model::{
 };
 use crate::omp::OmpEvidence;
 use crate::opencode::OpenCodePaths;
-use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
+use crate::presentation::{AccountFamily, MetadataTokens, RowStyle, SidebarShape};
 use crate::providers::statusline::enrich_cache_session;
 use crate::providers::{codex, cursor, devin, grok, muse, omp as omp_provider, opencode_go};
 use crate::route;
@@ -195,6 +195,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             .filter(|pane| pane.icon_needs_update())
             .map(|pane| pane.pane_id.clone())
             .collect::<Vec<_>>();
+        refresh_paneless(&cache, &state.panes, providers);
         let _ = refresh_working_panes(&cache, &state.panes, &affected, &icon_dirty);
         let stale_icons = state.panes.iter().any(has_stale_done_icon);
         if active.is_empty()
@@ -262,6 +263,7 @@ fn watch_pass_ids(
     // Reading the row style costs the config file, so a pass with no idle
     // candidate at all must not pay for it.
     let mut style = None;
+    let mut workspace = None;
     for pane in panes {
         if !pane_in_watch_scope(pane, providers) || affected.contains(&pane.pane_id) {
             continue;
@@ -275,7 +277,11 @@ fn watch_pass_ids(
             }
             continue;
         }
-        if cached_quota_is_stale(cache, pane, now, row) {
+        let workspace = workspace.get_or_insert_with(|| {
+            let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+            desired_workspace_summary(cache, &always_on, now, row)
+        });
+        if cached_quota_is_stale(cache, pane, now, row, workspace) {
             affected.push(pane.pane_id.clone());
         }
     }
@@ -298,7 +304,13 @@ fn watch_pass_ids(
 ///
 /// This decides membership only. It loads the one snapshot the pass would read
 /// anyway and publishes nothing.
-fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: RowStyle) -> bool {
+fn cached_quota_is_stale(
+    cache: &CacheStore,
+    pane: &AgentPane,
+    now: u64,
+    row: RowStyle,
+    workspace: &BTreeMap<String, String>,
+) -> bool {
     let Resolution::Subscription(target) = route::resolve(pane) else {
         return false;
     };
@@ -317,8 +329,12 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
     if snapshot.displayed_quota_has_expired(session_id, now) {
         return true;
     }
-    let values =
+    let mut values =
         MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, now, session_id, row);
+    // Compare against what the pane is given, or a stripped row reads as drift.
+    if on_workspace(&values, workspace) {
+        values.account = None;
+    }
     crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape)
 }
 
@@ -802,7 +818,10 @@ fn publish_named_pane(
         identity: None,
         context: None,
     });
-    let tokens = vec![tokens];
+    let mut tokens = vec![tokens];
+    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+    let workspace = desired_workspace_summary(cache, &always_on, CacheStore::now_unix(), row);
+    drop_workspace_accounts(&mut tokens, &workspace);
     // Event and focus see one pane, not the whole inventory, which is exactly
     // what the alert needs: the entry is keyed by provider, and a provider
     // with no pane in the pass keeps whatever state it had. Warning here is
@@ -811,7 +830,7 @@ fn publish_named_pane(
     notify_low_quota(cache, &tokens);
     // Completion colour must land even if this pane is scrolled: the scroll
     // guard exists to protect reading transcript, not to leave a stale glyph.
-    publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row)
+    publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row, &workspace)
 }
 
 /// The layout the user chose and the meter size their sidebar affords,
@@ -1126,7 +1145,7 @@ fn refresh_omp_target(
 /// surfacing on every event.
 fn refresh_scoped_target(cache: &CacheStore, target: &BillingTarget, force: bool) {
     let now = CacheStore::now_unix();
-    if should_skip_fetch(cache, target.billing, force, now).unwrap_or(true) {
+    if should_skip_fetch(cache, target.billing, force, now, PANE_DEBOUNCE_SECONDS).unwrap_or(true) {
         return;
     }
     let Ok(Some(_lease)) = cache.try_lock_target_refresh(target) else {
@@ -1196,11 +1215,95 @@ fn refresh_selected(
     force: bool,
     panes: &[AgentPane],
 ) -> Result<Vec<ProviderOutcome>> {
+    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+    let backed = pane_backed_providers(panes);
     providers
         .iter()
         .copied()
-        .map(|provider| refresh_provider(cache, provider, force, panes))
+        .map(|provider| {
+            let interval = debounce_seconds(provider, &always_on, &backed);
+            refresh_provider(cache, provider, force, panes, interval)
+        })
         .collect()
+}
+
+/// Providers some pane in the pass is billed to.
+fn pane_backed_providers(panes: &[AgentPane]) -> Vec<Provider> {
+    let mut backed = Vec::new();
+    for pane in panes {
+        let provider = match route::resolve(pane) {
+            Resolution::Subscription(target) => target.original_provider(),
+            _ => pane.harness.billing(),
+        };
+        if let Some(provider) = provider.filter(|provider| !backed.contains(provider)) {
+            backed.push(provider);
+        }
+    }
+    backed
+}
+
+/// An enabled always-on provider with no pane in the pass is refreshed only
+/// every five minutes; one a pane backs keeps the pane's 60 seconds (R29).
+fn debounce_seconds(provider: Provider, always_on: &[Provider], backed: &[Provider]) -> u64 {
+    if always_on.contains(&provider) && !backed.contains(&provider) {
+        PANELESS_DEBOUNCE_SECONDS
+    } else {
+        PANE_DEBOUNCE_SECONDS
+    }
+}
+
+/// Always-on providers no pane backs whose 300 s window is open. Never forced.
+fn paneless_due(
+    cache: &CacheStore,
+    always_on: &[Provider],
+    backed: &[Provider],
+    now: u64,
+    gate: impl Fn(Provider) -> (Option<String>, Option<u64>),
+) -> Result<Vec<Provider>> {
+    let mut due = Vec::new();
+    for provider in always_on.iter().filter(|p| !backed.contains(p)) {
+        let (account, mtime) = gate(*provider);
+        let skip = should_skip_fetch_within(
+            cache,
+            *provider,
+            false,
+            now,
+            account.as_deref(),
+            mtime,
+            PANELESS_DEBOUNCE_SECONDS,
+        )?;
+        if !skip {
+            due.push(*provider);
+        }
+    }
+    Ok(due)
+}
+
+/// A watcher scoped to `--provider agy` must not fetch anything else.
+fn in_watch_scope(always_on: Vec<Provider>, scope: &[Provider]) -> Vec<Provider> {
+    if covers_every_collector(scope) {
+        return always_on;
+    }
+    always_on
+        .into_iter()
+        .filter(|p| scope.contains(p))
+        .collect()
+}
+
+/// Refresh the enabled always-on providers that have no pane in this pass, so
+/// the workspace rows do not go stale. Reads no pane; a failed fetch still
+/// counts as the attempt (marked before the fetch) and keeps the last snapshot.
+fn refresh_paneless(cache: &CacheStore, panes: &[AgentPane], scope: &[Provider]) {
+    let always_on = in_watch_scope(
+        always_on_providers(&AgentSelection::from_args_or_env(&[])),
+        scope,
+    );
+    let backed = pane_backed_providers(panes);
+    let now = CacheStore::now_unix();
+    let Ok(due) = paneless_due(cache, &always_on, &backed, now, current_account_gate) else {
+        return;
+    };
+    let _ = refresh_selected(cache, &due, false, panes);
 }
 
 fn refresh_provider(
@@ -1208,9 +1311,10 @@ fn refresh_provider(
     provider: Provider,
     force: bool,
     panes: &[AgentPane],
+    interval: u64,
 ) -> Result<ProviderOutcome> {
     let now = CacheStore::now_unix();
-    if should_skip_fetch(cache, provider, force, now)? {
+    if should_skip_fetch(cache, provider, force, now, interval)? {
         return Ok(ProviderOutcome {
             provider,
             available: load_usable_snapshot(cache, provider)?.is_some(),
@@ -1314,16 +1418,31 @@ fn refresh_provider(
     }
 }
 
+/// Debounce for a provider some pane in the pass is billed to.
+const PANE_DEBOUNCE_SECONDS: u64 = 60;
+/// Debounce for an enabled always-on provider no pane backs (R29).
+const PANELESS_DEBOUNCE_SECONDS: u64 = 300;
+
 fn should_skip_fetch(
     cache: &CacheStore,
     provider: Provider,
     force: bool,
     now_unix: u64,
+    interval: u64,
 ) -> Result<bool> {
     let (account, mtime) = current_account_gate(provider);
-    should_skip_fetch_for_account(cache, provider, force, now_unix, account.as_deref(), mtime)
+    should_skip_fetch_within(
+        cache,
+        provider,
+        force,
+        now_unix,
+        account.as_deref(),
+        mtime,
+        interval,
+    )
 }
 
+#[cfg(test)]
 fn should_skip_fetch_for_account(
     cache: &CacheStore,
     provider: Provider,
@@ -1332,10 +1451,44 @@ fn should_skip_fetch_for_account(
     account: Option<&str>,
     mtime: Option<u64>,
 ) -> Result<bool> {
+    should_skip_fetch_within(
+        cache,
+        provider,
+        force,
+        now_unix,
+        account,
+        mtime,
+        PANE_DEBOUNCE_SECONDS,
+    )
+}
+
+fn should_skip_fetch_within(
+    cache: &CacheStore,
+    provider: Provider,
+    force: bool,
+    now_unix: u64,
+    account: Option<&str>,
+    mtime: Option<u64>,
+    interval: u64,
+) -> Result<bool> {
     let snapshot = cache.load(provider)?;
+    let debounced = cache.should_debounce(provider, now_unix, interval)?;
+    // A pane-less provider is held to one attempt per interval even when its
+    // old windows have lapsed: a provider that keeps failing keeps its old
+    // snapshot, and the expired-window bypass would refetch it every tick.
+    // The pane path (60 s) keeps the bypass.
+    if !force
+        && debounced
+        && interval > PANE_DEBOUNCE_SECONDS
+        && cache
+            .last_refresh_account(provider)
+            .is_some_and(|attempted| attempted.as_deref() == account)
+    {
+        return Ok(true);
+    }
     if !debounce_reuses_snapshot(
         force,
-        cache.should_debounce(provider, now_unix, 60)?,
+        debounced,
         snapshot.as_ref(),
         account,
         mtime,
@@ -1587,11 +1740,105 @@ fn publish_resolved(
         );
     }
     notify_low_quota(cache, &tokens);
+    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+    // Every always-on family, not only the ones this pass's panes bill to.
+    let workspace = desired_workspace_summary(cache, &always_on, now, row);
+    drop_workspace_accounts(&mut tokens, &workspace);
+    let sequence = CacheStore::now_millis();
     if allow_icon_while_scrolled {
-        publish_pane_tokens_with_scrolled_icons(panes, &tokens, CacheStore::now_millis(), row)
+        publish_pane_tokens_with_scrolled_icons(panes, &tokens, sequence, row, &workspace)
     } else {
-        publish_pane_tokens(panes, &tokens, CacheStore::now_millis(), row)
+        publish_pane_tokens(panes, &tokens, sequence, row, &workspace)
     }
+}
+
+/// Herdr's per-workspace token cap (R30).
+const MAX_WORKSPACE_TOKENS: usize = 32;
+
+/// Billing providers of the enabled harnesses whose quota needs no pane
+/// (R27), in footer order. Their rows live on workspaces, not panes.
+fn always_on_providers(enabled: &[Harness]) -> Vec<Provider> {
+    AccountFamily::IDS
+        .into_iter()
+        .filter_map(|id| {
+            enabled
+                .iter()
+                .filter_map(|harness| harness.billing())
+                .find(|provider| AccountFamily::for_provider(*provider).id == id)
+        })
+        .collect()
+}
+
+/// Whether this pass's workspace map carries the pane's footer family.
+fn on_workspace(values: &MetadataTokens, workspace: &BTreeMap<String, String>) -> bool {
+    values.account.as_ref().is_some_and(|account| {
+        workspace.contains_key(&format!("quota_acct_{}_icon", account.family.id))
+    })
+}
+
+/// A pane gives up its footer row only once a workspace carries that family,
+/// so a family is never invisible and never duplicated. Metered `ds`/`or`,
+/// Hermes, OpenCode Go and omp are never on a workspace (R28), and an
+/// always-on family without account-level windows (Claude with only a
+/// statusLine reading) stays on its panes. The name diff clears old copies.
+fn drop_workspace_accounts(tokens: &mut [PaneTokens], workspace: &BTreeMap<String, String>) {
+    for pane in tokens {
+        if let PaneQuotaUpdate::Replace(values) = &mut pane.quota {
+            if on_workspace(values, workspace) {
+                values.account = None;
+            }
+        }
+    }
+}
+
+/// The footer rows every workspace carries, from each always-on provider's
+/// usable cached snapshot. Reads no pane and fetches nothing; summary `off`
+/// yields an empty map, which clears the workspace rows (R31).
+fn desired_workspace_summary(
+    cache: &CacheStore,
+    always_on: &[Provider],
+    now: u64,
+    row: RowStyle,
+) -> BTreeMap<String, String> {
+    if !row.summary.is_on() {
+        return BTreeMap::new();
+    }
+    let snapshots = always_on
+        .iter()
+        .filter_map(|provider| load_usable_snapshot(cache, *provider).ok().flatten())
+        .collect::<Vec<_>>();
+    workspace_summary(&snapshots, now, row)
+}
+
+/// Rendered by the same path a pane used, account-level windows only. Whole
+/// families past the 32-key budget are dropped from the end (R30).
+fn workspace_summary(
+    snapshots: &[ProviderSnapshot],
+    now: u64,
+    row: RowStyle,
+) -> BTreeMap<String, String> {
+    let mut summary = BTreeMap::new();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let values = MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now, None, row);
+        let family = crate::herdr::desired_summary_tokens(&values);
+        let added = family
+            .keys()
+            .filter(|name| !summary.contains_key(*name))
+            .count();
+        if summary.len() + added > MAX_WORKSPACE_TOKENS {
+            let dropped = snapshots[index..]
+                .iter()
+                .map(|snapshot| AccountFamily::for_provider(snapshot.provider).id)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "herdr-agent-quota: footer over {MAX_WORKSPACE_TOKENS} workspace tokens; dropped {}",
+                dropped.join(", ")
+            );
+            break;
+        }
+        summary.extend(family);
+    }
+    summary
 }
 
 /// The lowest headroom each provider is showing in this pass.
@@ -1896,6 +2143,203 @@ mod tests {
 
     fn window(kind: WindowKind, used: f64, reset: u64) -> UsageWindow {
         UsageWindow::new(kind, used, Some(ResetAt::from_unix_seconds(reset))).unwrap()
+    }
+
+    const SUMMARY_NOW: u64 = 1_800_000_000;
+
+    fn summary_row(format: crate::cli::SummaryFormat) -> RowStyle {
+        RowStyle {
+            summary: format,
+            ..RowStyle::new(PercentStyle::default(), SidebarShape::default())
+        }
+    }
+
+    /// Three live windows, so a family costs icon + w1..w3 + reset = 5 keys.
+    fn three_window_snapshot(provider: Provider) -> ProviderSnapshot {
+        ProviderSnapshot::new(
+            provider,
+            vec![
+                window(WindowKind::FiveHour, 10.0, SUMMARY_NOW + 3_600),
+                window(WindowKind::Weekly, 30.0, SUMMARY_NOW + 86_400),
+                window(WindowKind::Monthly, 50.0, SUMMARY_NOW + 864_000),
+            ],
+            SUMMARY_NOW,
+        )
+    }
+
+    fn family_names(summary: &BTreeMap<String, String>, id: &str) -> Vec<String> {
+        let prefix = format!("quota_acct_{id}_");
+        summary
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn always_on_providers_are_the_enabled_pane_independent_collectors_in_footer_order() {
+        let enabled = [
+            Harness::Pi,
+            Harness::Grok,
+            Harness::Omp,
+            Harness::OpenCode,
+            Harness::Hermes,
+            Harness::Codex,
+            Harness::Claude,
+        ];
+        assert_eq!(
+            always_on_providers(&enabled),
+            vec![Provider::Claude, Provider::Codex, Provider::Grok]
+        );
+        assert_eq!(
+            always_on_providers(&AgentSelection::SUPPORTED),
+            vec![
+                Provider::Claude,
+                Provider::Codex,
+                Provider::Grok,
+                Provider::Agy,
+                Provider::Devin,
+                Provider::Muse,
+                Provider::Cursor,
+            ]
+        );
+        assert!(always_on_providers(&[Harness::Omp, Harness::Hermes]).is_empty());
+    }
+
+    #[test]
+    fn workspace_summary_renders_each_family_and_a_lapsed_grok_reads_dashes() {
+        let row = summary_row(crate::cli::SummaryFormat::Compact);
+        let grok = ProviderSnapshot::new(
+            Provider::Grok,
+            vec![window(WindowKind::Weekly, 40.0, SUMMARY_NOW - 60)],
+            SUMMARY_NOW - 86_400,
+        );
+        let snapshots = [
+            three_window_snapshot(Provider::Claude),
+            three_window_snapshot(Provider::Codex),
+            grok.clone(),
+        ];
+        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row);
+        assert_eq!(
+            summary.get("quota_acct_title").map(String::as_str),
+            Some("quota")
+        );
+        // Exactly the tokens a pane of that family would have published.
+        for snapshot in &snapshots {
+            let values = MetadataTokens::from_snapshot_for_pane_with_fields(
+                snapshot,
+                SUMMARY_NOW,
+                None,
+                row,
+            );
+            for (name, value) in crate::herdr::desired_summary_tokens(&values) {
+                assert_eq!(summary.get(&name), Some(&value), "{name}");
+            }
+        }
+        assert!(!family_names(&summary, "cl").is_empty());
+        assert!(!family_names(&summary, "cx").is_empty());
+        let grok_line = summary
+            .iter()
+            .find(|(name, _)| name.starts_with("quota_acct_gk_w1_"))
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert!(grok_line.contains("--"), "{grok_line}");
+        assert!(!summary.contains_key("quota_acct_gk_reset"));
+        assert!(!summary.keys().any(|name| name.contains("error")));
+    }
+
+    #[test]
+    fn workspace_summary_drops_whole_families_from_the_end_past_32_keys() {
+        let row = summary_row(crate::cli::SummaryFormat::Compact);
+        let snapshots = always_on_providers(&AgentSelection::SUPPORTED)
+            .into_iter()
+            .map(three_window_snapshot)
+            .collect::<Vec<_>>();
+        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row);
+        assert!(summary.len() <= MAX_WORKSPACE_TOKENS, "{}", summary.len());
+        for id in ["cl", "cx", "gk", "ag", "dv", "mu"] {
+            assert_eq!(family_names(&summary, id).len(), 5, "{id}");
+        }
+        assert!(family_names(&summary, "cu").is_empty());
+    }
+
+    fn pane_summary(
+        values: &MetadataTokens,
+        workspace: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut tokens = vec![PaneTokens {
+            pane_id: "w1:p1".to_string(),
+            quota: PaneQuotaUpdate::Replace(Box::new(values.clone())),
+            identity: None,
+            context: None,
+        }];
+        drop_workspace_accounts(&mut tokens, workspace);
+        match &tokens[0].quota {
+            PaneQuotaUpdate::Replace(values) => crate::herdr::desired_summary_tokens(values),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_pane_drops_its_row_only_once_the_workspace_carries_that_family() {
+        let row = summary_row(crate::cli::SummaryFormat::Compact);
+        let windows = three_window_snapshot(Provider::Claude).windows;
+        // Account windows (usage API): the workspace has `cl`, the pane none.
+        let account = ProviderSnapshot::new(Provider::Claude, Vec::new(), SUMMARY_NOW)
+            .session_local()
+            .with_account_windows(windows.clone());
+        let workspace = workspace_summary(std::slice::from_ref(&account), SUMMARY_NOW, row);
+        assert!(!family_names(&workspace, "cl").is_empty());
+        let pane = MetadataTokens::from_snapshot_for_pane_with_fields(
+            &account,
+            SUMMARY_NOW,
+            Some("s1"),
+            row,
+        );
+        assert!(!crate::herdr::desired_summary_tokens(&pane).is_empty());
+        assert!(pane_summary(&pane, &workspace).is_empty());
+
+        // statusLine only: no `cl` on the workspace, so the pane keeps it.
+        let mut statusline =
+            ProviderSnapshot::new(Provider::Claude, Vec::new(), SUMMARY_NOW).session_local();
+        statusline.session_windows.insert("s1".to_string(), windows);
+        let workspace = workspace_summary(std::slice::from_ref(&statusline), SUMMARY_NOW, row);
+        assert!(family_names(&workspace, "cl").is_empty());
+        let pane = MetadataTokens::from_snapshot_for_pane_with_fields(
+            &statusline,
+            SUMMARY_NOW,
+            Some("s1"),
+            row,
+        );
+        let kept = pane_summary(&pane, &workspace);
+        assert!(
+            kept.keys().any(|name| name.starts_with("quota_acct_cl_")),
+            "{kept:?}"
+        );
+        assert_eq!(kept, crate::herdr::desired_summary_tokens(&pane));
+
+        // A metered row is never on a workspace and stays byte-identical.
+        let mut metered = pane.clone();
+        if let Some(account) = metered.account.as_mut() {
+            account.family = AccountFamily {
+                id: "ds",
+                icon: "DS",
+            };
+        }
+        let full = workspace_summary(std::slice::from_ref(&account), SUMMARY_NOW, row);
+        assert_eq!(
+            pane_summary(&metered, &full),
+            crate::herdr::desired_summary_tokens(&metered)
+        );
+    }
+
+    #[test]
+    fn summary_off_wants_no_workspace_rows() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        cache.save(&three_window_snapshot(Provider::Codex)).unwrap();
+        let off = summary_row(crate::cli::SummaryFormat::Off);
+        assert!(desired_workspace_summary(&cache, &[Provider::Codex], SUMMARY_NOW, off).is_empty());
     }
 
     fn low(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {
@@ -2909,6 +3353,151 @@ mod tests {
         }
     }
 
+    fn grok_gate(_: Provider) -> (Option<String>, Option<u64>) {
+        (Some("acc".into()), None)
+    }
+
+    fn grok_cache_attempted_at(dir: &std::path::Path, attempt: u64) -> CacheStore {
+        let cache = CacheStore::new(dir);
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 1_000_000)],
+                    900,
+                )
+                .with_account_id(Some("acc".into())),
+            )
+            .unwrap();
+        cache
+            .mark_refresh_account(Provider::Grok, attempt, Some("acc"))
+            .unwrap();
+        cache
+    }
+
+    #[test]
+    fn a_scoped_watcher_refreshes_only_paneless_providers_in_its_scope() {
+        let all = vec![Provider::Claude, Provider::Codex, Provider::Agy];
+        assert_eq!(
+            in_watch_scope(all.clone(), &[Provider::Agy]),
+            vec![Provider::Agy]
+        );
+        assert!(in_watch_scope(all.clone(), &[Provider::Grok]).is_empty());
+        assert_eq!(in_watch_scope(all.clone(), &Provider::ALL), all);
+    }
+
+    #[test]
+    fn a_paneless_always_on_provider_is_due_only_after_five_minutes() {
+        let directory = tempdir().unwrap();
+        let cache = grok_cache_attempted_at(directory.path(), 1_000);
+        let always_on = [Provider::Grok];
+        let due = |now| paneless_due(&cache, &always_on, &[], now, grok_gate).unwrap();
+        assert!(due(1_100).is_empty(), "inside 300 s the attempt is reused");
+        assert!(due(1_299).is_empty());
+        assert_eq!(due(1_300), vec![Provider::Grok]);
+    }
+
+    #[test]
+    fn a_provider_with_a_pane_keeps_the_sixty_second_rule() {
+        let directory = tempdir().unwrap();
+        let cache = grok_cache_attempted_at(directory.path(), 1_000);
+        let always_on = [Provider::Grok];
+        let backed = [Provider::Grok];
+        assert_eq!(debounce_seconds(Provider::Grok, &always_on, &backed), 60);
+        assert_eq!(debounce_seconds(Provider::Grok, &always_on, &[]), 300);
+        assert_eq!(debounce_seconds(Provider::Grok, &[], &[]), 60);
+        // The pane path is not the paneless selection, and its own window is 60.
+        assert!(paneless_due(&cache, &always_on, &backed, 1_100, grok_gate)
+            .unwrap()
+            .is_empty());
+        assert!(!should_skip_fetch_within(
+            &cache,
+            Provider::Grok,
+            false,
+            1_100,
+            Some("acc"),
+            None,
+            debounce_seconds(Provider::Grok, &always_on, &backed),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn a_paneless_provider_with_lapsed_windows_still_waits_out_five_minutes() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 500)],
+                    400,
+                )
+                .with_account_id(Some("acc".into())),
+            )
+            .unwrap();
+        cache
+            .mark_refresh_account(Provider::Grok, 1_000, Some("acc"))
+            .unwrap();
+        let due = |now| paneless_due(&cache, &[Provider::Grok], &[], now, grok_gate).unwrap();
+        assert!(
+            due(1_299).is_empty(),
+            "lapsed windows must not bypass 300 s"
+        );
+        assert_eq!(due(1_300), vec![Provider::Grok]);
+        // The pane path keeps the bypass.
+        assert!(!should_skip_fetch_for_account(
+            &cache,
+            Provider::Grok,
+            false,
+            1_030,
+            Some("acc"),
+            None
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn a_failed_paneless_refresh_records_the_attempt_and_keeps_the_snapshot() {
+        // No Grok auth file: the fetch fails locally, before any request.
+        let _env = crate::providers::test_support::env_guard();
+        let directory = tempdir().unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("GROK_AUTH_FILE", value),
+                    None => std::env::remove_var("GROK_AUTH_FILE"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("GROK_AUTH_FILE"));
+        std::env::set_var("GROK_AUTH_FILE", directory.path().join("missing.json"));
+        let cache = grok_cache_attempted_at(directory.path(), 1);
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 4_000_000_000)],
+                    900,
+                )
+                .with_account_id(None),
+            )
+            .unwrap();
+        let outcome = refresh_provider(&cache, Provider::Grok, false, &[], 300).unwrap();
+        assert!(outcome.error.is_some(), "the fetch must have failed");
+        let marked = std::fs::read_to_string(directory.path().join("grok.refresh")).ok();
+        let now = CacheStore::now_unix();
+        assert!(
+            cache.should_debounce(Provider::Grok, now, 300).unwrap(),
+            "the failed attempt must count as an attempt (marker: {marked:?})"
+        );
+        assert_eq!(
+            cache.load(Provider::Grok).unwrap().unwrap().fetched_at_unix,
+            900
+        );
+    }
+
     #[test]
     fn debounce_does_not_keep_another_accounts_grok_snapshot() {
         let directory = tempdir().unwrap();
@@ -2922,7 +3511,7 @@ mod tests {
         cache.save(&snapshot).unwrap();
         cache.mark_refresh(Provider::Grok, 100).unwrap();
         assert!(
-            !should_skip_fetch(&cache, Provider::Grok, false, 120).unwrap(),
+            !should_skip_fetch(&cache, Provider::Grok, false, 120, PANE_DEBOUNCE_SECONDS).unwrap(),
             "a snapshot for another Grok login must be fetched even inside the debounce window"
         );
     }

@@ -1,0 +1,14 @@
+# Tests spawn the plugin binary, and a watcher tick refreshes every enabled
+# always-on provider. Point every provider credential at an absent path so a
+# test never reaches a real login or a real provider endpoint. A test that
+# needs a credential sets its own value, which wins over this default.
+# This also applies to `cargo run`; export the real path to override.
+[env]
+CODEX_BIN_PATH = "/nonexistent/herdr-agent-quota-test/absent"
+CODEX_AUTH_FILE = "/nonexistent/herdr-agent-quota-test/absent"
+GROK_AUTH_FILE = "/nonexistent/herdr-agent-quota-test/absent"
+DEVIN_CREDENTIALS_FILE = "/nonexistent/herdr-agent-quota-test/absent"
+MUSE_AUTH_PATH = "/nonexistent/herdr-agent-quota-test/absent"
+CURSOR_AUTH_FILE = "/nonexistent/herdr-agent-quota-test/absent"
+CURSOR_STATE_DB = "/nonexistent/herdr-agent-quota-test/absent"
+CLAUDE_CREDENTIALS_FILE = "/nonexistent/herdr-agent-quota-test/absent"

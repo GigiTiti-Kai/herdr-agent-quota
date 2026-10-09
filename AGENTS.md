@@ -82,6 +82,14 @@ reconciles those changes without reading pane output or writing unchanged
 metadata. The watcher stays alive for unseen completions until they are seen.
 Local stop/connection checks interrupt sleeps. Uninstall writes a stop marker.
 
+An enabled always-on provider with no pane in the pass is refreshed by the
+`startup`, `refresh` and `watch` passes on a 300-second debounce (a provider
+with a pane keeps 60). Never forced; a failed attempt still counts, and the
+last usable snapshot survives it, even when its windows have lapsed. These rows
+refresh during watch, refresh and startup passes only (a watcher scoped with `--provider`
+refreshes only providers in that scope; `--provider all` covers every one); `event` does not do this: it stays on the
+named pane's budget.
+
 ## omp's quota does not come from a provider endpoint
 
 Every other collector either reads a local credential and calls the provider
@@ -318,10 +326,23 @@ number for it here. Rules:
 
 ## Herdr state this plugin owns outside a pane
 
-Two things reach past the pane metadata, and both are global to the Herdr
+Three things reach past the pane metadata, and all are global to the Herdr
 session rather than scoped to a pane. Low-quota notifications stay off until
 the user sets a threshold. The Agent view is on by default (`--agent-order
 quota`): Space grouping plus least-headroom ranking inside each space.
+
+**Workspace footer rows.** In summary mode, enabled providers with a
+pane-independent collector (Claude, Codex, Grok, Agy, Devin, Muse, Cursor)
+publish their `quota_acct_*` rows to every workspace under source
+`herdr-agent-quota-summary`, rendered from the usable cached snapshot, so a
+row stays without a running agent. A pane drops such a family only when
+this pass's workspace map carries it (Claude with only a statusLine reading
+has no account windows, so its panes keep the row); metered
+`ds`/`or`, Hermes, OpenCode Go and omp stay per pane. Every pane publish pass
+makes one `workspace list` and reports only to a workspace whose summary
+names differ (≤ 16 names per report, `--seq` + chunk index, ≤ 32 keys with
+whole families dropped from the end). `off` clears them. A failure there is
+logged and never fails the pane pass.
 
 **The Agent view** (`agent.view.set`, `src/herdr.rs`). Herdr keeps exactly
 one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:

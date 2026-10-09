@@ -1555,6 +1555,14 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        // A pane-less refresh must never reach a real credential file.
+        .env("CODEX_AUTH_FILE", state.path().join("absent"))
+        .env("GROK_AUTH_FILE", state.path().join("absent"))
+        .env("DEVIN_CREDENTIALS_FILE", state.path().join("absent"))
+        .env("MUSE_AUTH_PATH", state.path().join("absent"))
+        .env("CURSOR_AUTH_FILE", state.path().join("absent"))
+        .env("CURSOR_STATE_DB", state.path().join("absent"))
+        .env("CLAUDE_CREDENTIALS_FILE", state.path().join("absent"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1629,6 +1637,14 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
+        // A pane-less refresh must never reach a real credential file.
+        .env("CODEX_AUTH_FILE", state.path().join("absent"))
+        .env("GROK_AUTH_FILE", state.path().join("absent"))
+        .env("DEVIN_CREDENTIALS_FILE", state.path().join("absent"))
+        .env("MUSE_AUTH_PATH", state.path().join("absent"))
+        .env("CURSOR_AUTH_FILE", state.path().join("absent"))
+        .env("CURSOR_STATE_DB", state.path().join("absent"))
+        .env("CLAUDE_CREDENTIALS_FILE", state.path().join("absent"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -3785,6 +3801,8 @@ fn summary_mode_publishes_the_account_row_under_its_own_source() {
     );
     run_claude_refresh(state.path(), &herdr_stub);
 
+    // statusLine only: no account windows, so no workspace row exists and the
+    // pane keeps the Claude family under the summary source.
     let report = fs::read_to_string(herdr_log).unwrap();
     let summary = report
         .lines()

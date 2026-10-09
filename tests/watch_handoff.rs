@@ -110,6 +110,7 @@ fn every_supported_working_harness_keeps_the_watcher_alive() {
             .env("HERDR_BIN_PATH", herdr)
             .env("TEST_INVENTORY", dir.path().join("inventory"))
             .env("CODEX_BIN_PATH", dir.path().join("absent"))
+            .env("CODEX_AUTH_FILE", dir.path().join("absent"))
             .env("GROK_AUTH_FILE", dir.path().join("absent"))
             .env("DEVIN_CREDENTIALS_FILE", dir.path().join("absent"))
             .env("MUSE_AUTH_PATH", dir.path().join("absent"))

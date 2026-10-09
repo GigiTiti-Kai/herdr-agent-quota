@@ -759,8 +759,9 @@ pub fn publish_pane_tokens(
     tokens: &[PaneTokens],
     sequence: u64,
     row: RowStyle,
+    workspace_summary: &BTreeMap<String, String>,
 ) -> Result<()> {
-    publish_pane_tokens_inner(panes, tokens, sequence, row, false)
+    publish_pane_tokens_inner(panes, tokens, sequence, row, false, workspace_summary)
 }
 
 /// Watcher refreshes may need to clear a stale icon while its pane is scrolled.
@@ -771,8 +772,9 @@ pub fn publish_pane_tokens_with_scrolled_icons(
     tokens: &[PaneTokens],
     sequence: u64,
     row: RowStyle,
+    workspace_summary: &BTreeMap<String, String>,
 ) -> Result<()> {
-    publish_pane_tokens_inner(panes, tokens, sequence, row, true)
+    publish_pane_tokens_inner(panes, tokens, sequence, row, true, workspace_summary)
 }
 
 /// Sidebar icon colour must update on focus even if the terminal is scrolled —
@@ -783,8 +785,9 @@ pub fn publish_status_icons(
     tokens: &[PaneTokens],
     sequence: u64,
     row: RowStyle,
+    workspace_summary: &BTreeMap<String, String>,
 ) -> Result<()> {
-    publish_pane_tokens_inner(panes, tokens, sequence, row, true)
+    publish_pane_tokens_inner(panes, tokens, sequence, row, true, workspace_summary)
 }
 
 /// Focus and watcher reconciliation change only the three icon colour tokens.
@@ -826,9 +829,21 @@ fn publish_pane_tokens_inner(
     sequence: u64,
     row: RowStyle,
     allow_while_scrolled: bool,
+    workspace_summary: &BTreeMap<String, String>,
 ) -> Result<()> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-    let workspace_labels = list_workspace_labels().unwrap_or_default();
+    // One `workspace list` per pass serves both the Space labels and the
+    // workspace-scope footer comparison.
+    let workspaces = list_workspaces();
+    let workspace_labels = workspaces
+        .as_ref()
+        .map(|workspaces| {
+            workspaces
+                .iter()
+                .filter_map(|workspace| Some((workspace.id.clone(), workspace.label.clone()?)))
+                .collect()
+        })
+        .unwrap_or_default();
     // Event/focus publish one pane. Head selection and sibling clears need the
     // full Space membership — otherwise a lone pane preserves a stale
     // `$quota_group` and the Space name prints twice (radar writes `group:null`
@@ -889,8 +904,9 @@ fn publish_pane_tokens_inner(
         if !rows_match {
             reported += 1;
             let names = metadata_report_names(pane, &desired);
-            if !report_pane_metadata(
+            if !report_metadata(
                 &executable,
+                "pane",
                 &pane.pane_id,
                 "herdr-agent-quota",
                 names,
@@ -903,8 +919,9 @@ fn publish_pane_tokens_inner(
         if let Some(summary) = desired_summary.filter(|_| !summary_match) {
             reported += 1;
             let names = summary_report_names(&pane.tokens, &summary);
-            if !report_pane_metadata(
+            if !report_metadata(
                 &executable,
+                "pane",
                 &pane.pane_id,
                 SUMMARY_SOURCE,
                 names,
@@ -924,6 +941,13 @@ fn publish_pane_tokens_inner(
         sequence,
         &mut failed,
     )?;
+    // Workspace rows never fail the pass: the panes above are already out.
+    match &workspaces {
+        Ok(workspaces) => {
+            publish_workspace_summary(&executable, workspaces, workspace_summary, sequence)
+        }
+        Err(error) => eprintln!("herdr-agent-quota: workspace summary skipped: {error:#}"),
+    }
     // A pane can exit between `agent list` and this report, and the exit event
     // itself triggers a publish. One stale pane id must not stop the panes
     // that are still alive from being updated.
@@ -972,9 +996,11 @@ fn report_icon_metadata(
     Ok(output.status.success())
 }
 
-fn report_pane_metadata<S: AsRef<str>>(
+/// `scope` is `pane` or `workspace`; both take the same report arguments.
+fn report_metadata<S: AsRef<str>>(
     executable: &std::ffi::OsStr,
-    pane_id: &str,
+    scope: &str,
+    id: &str,
     source: &str,
     names: impl IntoIterator<Item = S>,
     desired: &BTreeMap<String, String>,
@@ -982,7 +1008,7 @@ fn report_pane_metadata<S: AsRef<str>>(
 ) -> Result<bool> {
     let mut command = Command::new(executable);
     command
-        .args(["pane", "report-metadata", pane_id, "--source", source])
+        .args([scope, "report-metadata", id, "--source", source])
         .args(["--seq", &sequence.to_string()])
         .args(["--ttl-ms", METADATA_TTL_MS]);
     for name in names {
@@ -1089,8 +1115,16 @@ fn workspace_id_from_pane_id(pane_id: &str) -> Option<String> {
     (!workspace.is_empty()).then(|| workspace.to_string())
 }
 
-/// Workspace id → label from one `herdr workspace list` call.
-fn list_workspace_labels() -> Result<BTreeMap<String, String>> {
+/// One entry of `herdr workspace list`. `tokens` is omitted by Herdr when
+/// empty, so absent reads as empty.
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspaceEntry {
+    id: String,
+    label: Option<String>,
+    tokens: BTreeMap<String, String>,
+}
+
+fn list_workspaces() -> Result<Vec<WorkspaceEntry>> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     let output = Command::new(&executable)
         .args(["workspace", "list"])
@@ -1100,33 +1134,102 @@ fn list_workspace_labels() -> Result<BTreeMap<String, String>> {
         anyhow::bail!("Herdr workspace list failed with {}", output.status);
     }
     let value: Value = serde_json::from_slice(&output.stdout).context("parse workspace list")?;
-    let mut labels = BTreeMap::new();
-    collect_workspace_labels(&value, &mut labels);
-    Ok(labels)
+    let mut workspaces = Vec::new();
+    collect_workspaces(&value, &mut workspaces);
+    Ok(workspaces)
 }
 
-fn collect_workspace_labels(value: &Value, labels: &mut BTreeMap<String, String>) {
+fn collect_workspaces(value: &Value, workspaces: &mut Vec<WorkspaceEntry>) {
     match value {
         Value::Object(map) => {
             let id = map
                 .get("workspace_id")
                 .or_else(|| map.get("workspaceId"))
                 .and_then(Value::as_str);
-            let label = map.get("label").and_then(Value::as_str);
-            if let (Some(id), Some(label)) = (id, label) {
-                labels.insert(id.to_string(), label.to_string());
+            if let Some(id) = id.filter(|_| map.contains_key("label")) {
+                workspaces.push(WorkspaceEntry {
+                    id: id.to_string(),
+                    label: map.get("label").and_then(Value::as_str).map(str::to_string),
+                    tokens: map
+                        .get("tokens")
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(name, value)| {
+                            Some((name.clone(), value.as_str()?.to_string()))
+                        })
+                        .collect(),
+                });
             }
             for child in map.values() {
-                collect_workspace_labels(child, labels);
+                collect_workspaces(child, workspaces);
             }
         }
         Value::Array(values) => {
             for child in values {
-                collect_workspace_labels(child, labels);
+                collect_workspaces(child, workspaces);
             }
         }
         _ => {}
     }
+}
+
+/// Always-on footer rows live on every workspace (R27). A workspace already
+/// carrying exactly `desired` is not written; a closed one fails its report
+/// and is skipped.
+fn publish_workspace_summary(
+    executable: &std::ffi::OsStr,
+    workspaces: &[WorkspaceEntry],
+    desired: &BTreeMap<String, String>,
+    sequence: u64,
+) {
+    let mut failed = Vec::new();
+    for workspace in workspaces {
+        if summary_tokens_match(&workspace.tokens, desired) {
+            continue;
+        }
+        // Herdr accepts a source's report only with a strictly newer `seq`.
+        for (offset, chunk) in (0u64..).zip(workspace_report_chunks(&workspace.tokens, desired)) {
+            let sent = report_metadata(
+                executable,
+                "workspace",
+                &workspace.id,
+                SUMMARY_SOURCE,
+                &chunk,
+                desired,
+                sequence + offset,
+            );
+            if !matches!(sent, Ok(true)) {
+                failed.push(workspace.id.as_str());
+                break;
+            }
+        }
+    }
+    if !failed.is_empty() {
+        eprintln!(
+            "herdr-agent-quota: workspace summary report failed for {}",
+            failed.join(", ")
+        );
+    }
+}
+
+/// Every desired summary name plus the clears, in reports of at most 16, when
+/// anything differs: Herdr renews a token's TTL only when it is re-sent, so an
+/// unchanged name must ride along. Clears go first so a workspace never passes
+/// Herdr's per-resource cap mid-update (re-sent names add no keys).
+fn workspace_report_chunks(
+    current: &BTreeMap<String, String>,
+    desired: &BTreeMap<String, String>,
+) -> Vec<Vec<String>> {
+    if summary_tokens_match(current, desired) {
+        return Vec::new();
+    }
+    let mut names = summary_report_names(current, desired);
+    names.sort_by_key(|name| desired.contains_key(name));
+    names
+        .chunks(MAX_METADATA_TOKENS)
+        .map(<[String]>::to_vec)
+        .collect()
 }
 
 /// Which pane carries the group header for each workspace.
@@ -1363,7 +1466,7 @@ fn desired_tokens(
 }
 
 /// The footer row this pane supplies, or nothing (summary off, or no window).
-fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String, String> {
+pub(crate) fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String, String> {
     let mut tokens = BTreeMap::new();
     let Some(account) = values
         .account
@@ -2118,6 +2221,72 @@ mod tests {
         let main = desired_tokens(&lines_claude(), "topic", SidebarShape::default());
         assert!(main.len() + 3 + lines.len() <= 30);
         assert!(lines.len() <= 6);
+    }
+
+    #[test]
+    fn workspace_list_reads_tokens_and_treats_an_absent_map_as_empty() {
+        let value = serde_json::json!({"result":{"workspaces":[
+            {"workspace_id":"w1","label":"api","focused":true,
+             "tokens":{"quota_acct_title":"quota","other":"x"}},
+            {"workspace_id":"w2","label":"web","focused":false}
+        ]}});
+        let mut workspaces = Vec::new();
+        collect_workspaces(&value, &mut workspaces);
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].id, "w1");
+        assert_eq!(workspaces[0].label.as_deref(), Some("api"));
+        assert_eq!(workspaces[0].tokens.len(), 2);
+        assert!(workspaces[1].tokens.is_empty());
+    }
+
+    #[test]
+    fn workspace_reports_clear_first_resend_every_name_and_fit_sixteen_names() {
+        let desired = (0..30)
+            .map(|index| (format!("quota_acct_x{index:02}"), "v".to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let mut current = desired.clone();
+        current.insert("quota_acct_x00".into(), "old".into());
+        current.insert("quota_acct_gone".into(), "old".into());
+        current.insert("unrelated".into(), "kept".into());
+        assert!(!summary_tokens_match(&current, &desired));
+        let chunks = workspace_report_chunks(&current, &desired);
+        assert_eq!(
+            chunks,
+            vec![
+                std::iter::once("quota_acct_gone".to_string())
+                    .chain((0..15).map(|index| format!("quota_acct_x{index:02}")))
+                    .collect::<Vec<_>>(),
+                (15..30)
+                    .map(|index| format!("quota_acct_x{index:02}"))
+                    .collect::<Vec<_>>(),
+            ]
+        );
+        // The clear leads, and every desired name is re-sent, changed or not.
+        let names = chunks.concat();
+        assert_eq!(names.len(), 31);
+        assert!(desired.keys().all(|name| names.contains(name)));
+
+        let empty = BTreeMap::new();
+        let chunks = workspace_report_chunks(&empty, &desired);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= MAX_METADATA_TOKENS));
+
+        // `off`: every summary name is cleared, nothing else is touched.
+        let chunks = workspace_report_chunks(&current, &empty);
+        let names = chunks.concat();
+        assert_eq!(names.len(), 31);
+        assert!(names
+            .iter()
+            .all(|name| is_summary_token(name) && !empty.contains_key(name)));
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= MAX_METADATA_TOKENS));
+
+        let matching = desired.clone();
+        assert!(summary_tokens_match(&matching, &desired));
+        assert!(workspace_report_chunks(&matching, &desired).is_empty());
     }
 
     /// An idle sibling wakes when only its footer row is stale, and a pane
