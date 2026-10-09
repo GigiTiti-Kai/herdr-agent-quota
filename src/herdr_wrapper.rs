@@ -2,7 +2,9 @@ use crate::model::Harness;
 use anyhow::Result;
 
 pub use crate::herdr_base::*;
-pub(crate) use crate::herdr_base::{plugin_quota_present, quota_rows_have_drifted};
+pub(crate) use crate::herdr_base::{
+    desired_summary_tokens, plugin_quota_present, quota_rows_have_drifted,
+};
 
 /// Agy statusLine observations are keyed by the Herdr pane id, not by
 /// Antigravity's conversation id. Herdr's own `agent_session` remains untouched

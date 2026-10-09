@@ -12,7 +12,7 @@ use crate::model::{
 };
 use crate::omp::OmpEvidence;
 use crate::opencode::OpenCodePaths;
-use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
+use crate::presentation::{AccountFamily, MetadataTokens, RowStyle, SidebarShape};
 use crate::providers::statusline::enrich_cache_session;
 use crate::providers::{codex, cursor, devin, grok, muse, omp as omp_provider, opencode_go};
 use crate::route;
@@ -317,8 +317,15 @@ fn cached_quota_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: Ro
     if snapshot.displayed_quota_has_expired(session_id, now) {
         return true;
     }
-    let values =
+    let mut values =
         MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, now, session_id, row);
+    // Compare against what the pane is given, or a stripped row reads as drift.
+    if is_always_on(
+        &values,
+        &always_on_providers(&AgentSelection::from_args_or_env(&[])),
+    ) {
+        values.account = None;
+    }
     crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape)
 }
 
@@ -802,7 +809,9 @@ fn publish_named_pane(
         identity: None,
         context: None,
     });
-    let tokens = vec![tokens];
+    let mut tokens = vec![tokens];
+    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+    drop_always_on_accounts(&mut tokens, &always_on);
     // Event and focus see one pane, not the whole inventory, which is exactly
     // what the alert needs: the entry is keyed by provider, and a provider
     // with no pane in the pass keeps whatever state it had. Warning here is
@@ -811,7 +820,8 @@ fn publish_named_pane(
     notify_low_quota(cache, &tokens);
     // Completion colour must land even if this pane is scrolled: the scroll
     // guard exists to protect reading transcript, not to leave a stale glyph.
-    publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row)
+    let workspace = desired_workspace_summary(cache, &always_on, CacheStore::now_unix(), row);
+    publish_status_icons(&panes, &tokens, CacheStore::now_millis(), row, &workspace)
 }
 
 /// The layout the user chose and the meter size their sidebar affords,
@@ -1587,11 +1597,104 @@ fn publish_resolved(
         );
     }
     notify_low_quota(cache, &tokens);
+    let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
+    drop_always_on_accounts(&mut tokens, &always_on);
+    // Every always-on family, not only the ones this pass's panes bill to.
+    let workspace = desired_workspace_summary(cache, &always_on, now, row);
+    let sequence = CacheStore::now_millis();
     if allow_icon_while_scrolled {
-        publish_pane_tokens_with_scrolled_icons(panes, &tokens, CacheStore::now_millis(), row)
+        publish_pane_tokens_with_scrolled_icons(panes, &tokens, sequence, row, &workspace)
     } else {
-        publish_pane_tokens(panes, &tokens, CacheStore::now_millis(), row)
+        publish_pane_tokens(panes, &tokens, sequence, row, &workspace)
     }
+}
+
+/// Herdr's per-workspace token cap (R30).
+const MAX_WORKSPACE_TOKENS: usize = 32;
+
+/// Billing providers of the enabled harnesses whose quota needs no pane
+/// (R27), in footer order. Their rows live on workspaces, not panes.
+fn always_on_providers(enabled: &[Harness]) -> Vec<Provider> {
+    AccountFamily::IDS
+        .into_iter()
+        .filter_map(|id| {
+            enabled
+                .iter()
+                .filter_map(|harness| harness.billing())
+                .find(|provider| AccountFamily::for_provider(*provider).id == id)
+        })
+        .collect()
+}
+
+fn is_always_on(values: &MetadataTokens, always_on: &[Provider]) -> bool {
+    values.account.as_ref().is_some_and(|account| {
+        always_on
+            .iter()
+            .any(|provider| AccountFamily::for_provider(*provider).id == account.family.id)
+    })
+}
+
+/// A pane keeps only footer rows no workspace carries: metered `ds`/`or`,
+/// Hermes, OpenCode Go and omp (R28). Keyed by family, so a metered Claude
+/// pane keeps its row. The existing name diff clears the old pane copies.
+fn drop_always_on_accounts(tokens: &mut [PaneTokens], always_on: &[Provider]) {
+    for pane in tokens {
+        if let PaneQuotaUpdate::Replace(values) = &mut pane.quota {
+            if is_always_on(values, always_on) {
+                values.account = None;
+            }
+        }
+    }
+}
+
+/// The footer rows every workspace carries, from each always-on provider's
+/// usable cached snapshot. Reads no pane and fetches nothing; summary `off`
+/// yields an empty map, which clears the workspace rows (R31).
+fn desired_workspace_summary(
+    cache: &CacheStore,
+    always_on: &[Provider],
+    now: u64,
+    row: RowStyle,
+) -> BTreeMap<String, String> {
+    if !row.summary.is_on() {
+        return BTreeMap::new();
+    }
+    let snapshots = always_on
+        .iter()
+        .filter_map(|provider| load_usable_snapshot(cache, *provider).ok().flatten())
+        .collect::<Vec<_>>();
+    workspace_summary(&snapshots, now, row)
+}
+
+/// Rendered by the same path a pane used, account-level windows only. Whole
+/// families past the 32-key budget are dropped from the end (R30).
+fn workspace_summary(
+    snapshots: &[ProviderSnapshot],
+    now: u64,
+    row: RowStyle,
+) -> BTreeMap<String, String> {
+    let mut summary = BTreeMap::new();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let values = MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now, None, row);
+        let family = crate::herdr::desired_summary_tokens(&values);
+        let added = family
+            .keys()
+            .filter(|name| !summary.contains_key(*name))
+            .count();
+        if summary.len() + added > MAX_WORKSPACE_TOKENS {
+            let dropped = snapshots[index..]
+                .iter()
+                .map(|snapshot| AccountFamily::for_provider(snapshot.provider).id)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "herdr-agent-quota: footer over {MAX_WORKSPACE_TOKENS} workspace tokens; dropped {}",
+                dropped.join(", ")
+            );
+            break;
+        }
+        summary.extend(family);
+    }
+    summary
 }
 
 /// The lowest headroom each provider is showing in this pass.
@@ -1896,6 +1999,179 @@ mod tests {
 
     fn window(kind: WindowKind, used: f64, reset: u64) -> UsageWindow {
         UsageWindow::new(kind, used, Some(ResetAt::from_unix_seconds(reset))).unwrap()
+    }
+
+    const SUMMARY_NOW: u64 = 1_800_000_000;
+
+    fn summary_row(format: crate::cli::SummaryFormat) -> RowStyle {
+        RowStyle {
+            summary: format,
+            ..RowStyle::new(PercentStyle::default(), SidebarShape::default())
+        }
+    }
+
+    /// Three live windows, so a family costs icon + w1..w3 + reset = 5 keys.
+    fn three_window_snapshot(provider: Provider) -> ProviderSnapshot {
+        ProviderSnapshot::new(
+            provider,
+            vec![
+                window(WindowKind::FiveHour, 10.0, SUMMARY_NOW + 3_600),
+                window(WindowKind::Weekly, 30.0, SUMMARY_NOW + 86_400),
+                window(WindowKind::Monthly, 50.0, SUMMARY_NOW + 864_000),
+            ],
+            SUMMARY_NOW,
+        )
+    }
+
+    fn family_names(summary: &BTreeMap<String, String>, id: &str) -> Vec<String> {
+        let prefix = format!("quota_acct_{id}_");
+        summary
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn always_on_providers_are_the_enabled_pane_independent_collectors_in_footer_order() {
+        let enabled = [
+            Harness::Pi,
+            Harness::Grok,
+            Harness::Omp,
+            Harness::OpenCode,
+            Harness::Hermes,
+            Harness::Codex,
+            Harness::Claude,
+        ];
+        assert_eq!(
+            always_on_providers(&enabled),
+            vec![Provider::Claude, Provider::Codex, Provider::Grok]
+        );
+        assert_eq!(
+            always_on_providers(&AgentSelection::SUPPORTED),
+            vec![
+                Provider::Claude,
+                Provider::Codex,
+                Provider::Grok,
+                Provider::Agy,
+                Provider::Devin,
+                Provider::Muse,
+                Provider::Cursor,
+            ]
+        );
+        assert!(always_on_providers(&[Harness::Omp, Harness::Hermes]).is_empty());
+    }
+
+    #[test]
+    fn workspace_summary_renders_each_family_and_a_lapsed_grok_reads_dashes() {
+        let row = summary_row(crate::cli::SummaryFormat::Compact);
+        let grok = ProviderSnapshot::new(
+            Provider::Grok,
+            vec![window(WindowKind::Weekly, 40.0, SUMMARY_NOW - 60)],
+            SUMMARY_NOW - 86_400,
+        );
+        let snapshots = [
+            three_window_snapshot(Provider::Claude),
+            three_window_snapshot(Provider::Codex),
+            grok.clone(),
+        ];
+        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row);
+        assert_eq!(
+            summary.get("quota_acct_title").map(String::as_str),
+            Some("quota")
+        );
+        // Exactly the tokens a pane of that family would have published.
+        for snapshot in &snapshots {
+            let values = MetadataTokens::from_snapshot_for_pane_with_fields(
+                snapshot,
+                SUMMARY_NOW,
+                None,
+                row,
+            );
+            for (name, value) in crate::herdr::desired_summary_tokens(&values) {
+                assert_eq!(summary.get(&name), Some(&value), "{name}");
+            }
+        }
+        assert!(!family_names(&summary, "cl").is_empty());
+        assert!(!family_names(&summary, "cx").is_empty());
+        let grok_line = summary
+            .iter()
+            .find(|(name, _)| name.starts_with("quota_acct_gk_w1_"))
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert!(grok_line.contains("--"), "{grok_line}");
+        assert!(!summary.contains_key("quota_acct_gk_reset"));
+        assert!(!summary.keys().any(|name| name.contains("error")));
+    }
+
+    #[test]
+    fn workspace_summary_drops_whole_families_from_the_end_past_32_keys() {
+        let row = summary_row(crate::cli::SummaryFormat::Compact);
+        let snapshots = always_on_providers(&AgentSelection::SUPPORTED)
+            .into_iter()
+            .map(three_window_snapshot)
+            .collect::<Vec<_>>();
+        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row);
+        assert!(summary.len() <= MAX_WORKSPACE_TOKENS, "{}", summary.len());
+        for id in ["cl", "cx", "gk", "ag", "dv", "mu"] {
+            assert_eq!(family_names(&summary, id).len(), 5, "{id}");
+        }
+        assert!(family_names(&summary, "cu").is_empty());
+    }
+
+    #[test]
+    fn panes_drop_always_on_rows_and_keep_metered_ones() {
+        let row = summary_row(crate::cli::SummaryFormat::Compact);
+        let claude = MetadataTokens::from_snapshot_for_pane_with_fields(
+            &three_window_snapshot(Provider::Claude),
+            SUMMARY_NOW,
+            None,
+            row,
+        );
+        assert!(!crate::herdr::desired_summary_tokens(&claude).is_empty());
+        let mut metered = claude.clone();
+        if let Some(account) = metered.account.as_mut() {
+            account.family = AccountFamily {
+                id: "ds",
+                icon: "DS",
+            };
+        }
+        let metered_summary = crate::herdr::desired_summary_tokens(&metered);
+        let pane = |values: &MetadataTokens| PaneTokens {
+            pane_id: "w1:p1".to_string(),
+            quota: PaneQuotaUpdate::Replace(Box::new(values.clone())),
+            identity: None,
+            context: None,
+        };
+        let mut tokens = vec![pane(&claude), pane(&metered)];
+        drop_always_on_accounts(&mut tokens, &[Provider::Claude, Provider::Codex]);
+        let summaries = tokens
+            .iter()
+            .map(|tokens| match &tokens.quota {
+                PaneQuotaUpdate::Replace(values) => crate::herdr::desired_summary_tokens(values),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!summaries[0]
+            .keys()
+            .any(|name| name.starts_with("quota_acct_cl_")));
+        assert!(summaries[0].is_empty());
+        assert_eq!(summaries[1], metered_summary);
+        // Not always-on: the pane keeps its own row exactly as before.
+        let mut kept = vec![pane(&claude)];
+        drop_always_on_accounts(&mut kept, &[Provider::Codex]);
+        assert!(
+            matches!(&kept[0].quota, PaneQuotaUpdate::Replace(values) if values.account == claude.account)
+        );
+    }
+
+    #[test]
+    fn summary_off_wants_no_workspace_rows() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        cache.save(&three_window_snapshot(Provider::Codex)).unwrap();
+        let off = summary_row(crate::cli::SummaryFormat::Off);
+        assert!(desired_workspace_summary(&cache, &[Provider::Codex], SUMMARY_NOW, off).is_empty());
     }
 
     fn low(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {

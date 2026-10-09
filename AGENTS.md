@@ -318,10 +318,21 @@ number for it here. Rules:
 
 ## Herdr state this plugin owns outside a pane
 
-Two things reach past the pane metadata, and both are global to the Herdr
+Three things reach past the pane metadata, and all are global to the Herdr
 session rather than scoped to a pane. Low-quota notifications stay off until
 the user sets a threshold. The Agent view is on by default (`--agent-order
 quota`): Space grouping plus least-headroom ranking inside each space.
+
+**Workspace footer rows.** In summary mode, enabled providers with a
+pane-independent collector (Claude, Codex, Grok, Agy, Devin, Muse, Cursor)
+publish their `quota_acct_*` rows to every workspace under source
+`herdr-agent-quota-summary`, rendered from the usable cached snapshot, so a
+row stays without a running agent. Panes drop those families; metered
+`ds`/`or`, Hermes, OpenCode Go and omp stay per pane. Every pane publish pass
+makes one `workspace list` and reports only to a workspace whose summary
+names differ (≤ 16 names per report, `--seq` + chunk index, ≤ 32 keys with
+whole families dropped from the end). `off` clears them. A failure there is
+logged and never fails the pane pass.
 
 **The Agent view** (`agent.view.set`, `src/herdr.rs`). Herdr keeps exactly
 one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:

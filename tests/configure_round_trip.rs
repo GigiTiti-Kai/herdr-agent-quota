@@ -3767,7 +3767,7 @@ fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
 }
 
 #[test]
-fn summary_mode_publishes_the_account_row_under_its_own_source() {
+fn summary_mode_keeps_the_always_on_claude_row_off_the_pane() {
     let state = tempdir().unwrap();
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
@@ -3785,23 +3785,13 @@ fn summary_mode_publishes_the_account_row_under_its_own_source() {
     );
     run_claude_refresh(state.path(), &herdr_stub);
 
+    // Claude's footer row lives on workspaces now (R27), never on a pane.
     let report = fs::read_to_string(herdr_log).unwrap();
-    let summary = report
-        .lines()
-        .find(|line| line.contains("--source herdr-agent-quota-summary"))
-        .unwrap_or_else(|| panic!("no summary report:\n{report}"));
     assert!(
-        summary.contains("--token quota_acct_cl_w1_warning=5h▰▱▱ 42%"),
-        "{summary}"
+        !report.contains("--source herdr-agent-quota-summary"),
+        "{report}"
     );
-    assert!(
-        summary.contains("--token quota_acct_cl_w2_normal=7d▰▰▱ 73%"),
-        "{summary}"
-    );
-    assert!(
-        summary.contains("--token quota_acct_title=quota"),
-        "{summary}"
-    );
+    assert!(!report.contains("quota_acct_"), "{report}");
     let rows = report
         .lines()
         .find(|line| line.contains("--source herdr-agent-quota "))
