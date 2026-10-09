@@ -3462,6 +3462,16 @@ mod tests {
         // No Grok auth file: the fetch fails locally, before any request.
         let _env = crate::providers::test_support::env_guard();
         let directory = tempdir().unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("GROK_AUTH_FILE", value),
+                    None => std::env::remove_var("GROK_AUTH_FILE"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("GROK_AUTH_FILE"));
         std::env::set_var("GROK_AUTH_FILE", directory.path().join("missing.json"));
         let cache = grok_cache_attempted_at(directory.path(), 1);
         cache
@@ -3475,7 +3485,6 @@ mod tests {
             )
             .unwrap();
         let outcome = refresh_provider(&cache, Provider::Grok, false, &[], 300).unwrap();
-        std::env::remove_var("GROK_AUTH_FILE");
         assert!(outcome.error.is_some(), "the fetch must have failed");
         let marked = std::fs::read_to_string(directory.path().join("grok.refresh")).ok();
         let now = CacheStore::now_unix();

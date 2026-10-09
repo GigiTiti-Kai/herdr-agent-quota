@@ -1213,16 +1213,18 @@ fn publish_workspace_summary(
     }
 }
 
-/// Changed summary names in reports of at most 16. Clears go first so a
-/// workspace never passes Herdr's per-resource cap mid-update.
+/// Every desired summary name plus the clears, in reports of at most 16, when
+/// anything differs: Herdr renews a token's TTL only when it is re-sent, so an
+/// unchanged name must ride along. Clears go first so a workspace never passes
+/// Herdr's per-resource cap mid-update (re-sent names add no keys).
 fn workspace_report_chunks(
     current: &BTreeMap<String, String>,
     desired: &BTreeMap<String, String>,
 ) -> Vec<Vec<String>> {
-    let mut names = summary_report_names(current, desired)
-        .into_iter()
-        .filter(|name| current.get(name) != desired.get(name))
-        .collect::<Vec<_>>();
+    if summary_tokens_match(current, desired) {
+        return Vec::new();
+    }
+    let mut names = summary_report_names(current, desired);
     names.sort_by_key(|name| desired.contains_key(name));
     names
         .chunks(MAX_METADATA_TOKENS)
@@ -2221,8 +2223,6 @@ mod tests {
         assert!(lines.len() <= 6);
     }
 
-    /// An idle sibling wakes when only its footer row is stale, and a pane
-    /// never published to still does not count as drift.
     #[test]
     fn workspace_list_reads_tokens_and_treats_an_absent_map_as_empty() {
         let value = serde_json::json!({"result":{"workspaces":[
@@ -2240,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_reports_clear_first_send_only_changes_and_fit_sixteen_names() {
+    fn workspace_reports_clear_first_resend_every_name_and_fit_sixteen_names() {
         let desired = (0..30)
             .map(|index| (format!("quota_acct_x{index:02}"), "v".to_string()))
             .collect::<BTreeMap<_, _>>();
@@ -2252,11 +2252,19 @@ mod tests {
         let chunks = workspace_report_chunks(&current, &desired);
         assert_eq!(
             chunks,
-            vec![vec![
-                "quota_acct_gone".to_string(),
-                "quota_acct_x00".to_string()
-            ]]
+            vec![
+                std::iter::once("quota_acct_gone".to_string())
+                    .chain((0..15).map(|index| format!("quota_acct_x{index:02}")))
+                    .collect::<Vec<_>>(),
+                (15..30)
+                    .map(|index| format!("quota_acct_x{index:02}"))
+                    .collect::<Vec<_>>(),
+            ]
         );
+        // The clear leads, and every desired name is re-sent, changed or not.
+        let names = chunks.concat();
+        assert_eq!(names.len(), 31);
+        assert!(desired.keys().all(|name| names.contains(name)));
 
         let empty = BTreeMap::new();
         let chunks = workspace_report_chunks(&empty, &desired);
@@ -2281,6 +2289,8 @@ mod tests {
         assert!(workspace_report_chunks(&matching, &desired).is_empty());
     }
 
+    /// An idle sibling wakes when only its footer row is stale, and a pane
+    /// never published to still does not count as drift.
     #[test]
     fn a_summary_only_change_counts_as_drift() {
         let published = claude_summary(0.0);
