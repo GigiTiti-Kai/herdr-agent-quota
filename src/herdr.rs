@@ -23,9 +23,10 @@ const SUMMARY_TITLE: &str = "quota";
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 39] = [
+const METADATA_TOKEN_NAMES: [&str; 40] = [
     "quota_group",
     "quota_group_gap",
+    "quota_group_tail",
     "quota_pad",
     "quota_icon",
     "quota_icon_working",
@@ -142,9 +143,10 @@ const CONTEXT_TOKEN_NAMES: [&str; 4] = [
 /// Values that must reach the pane in the *same* report that changed them,
 /// even when the budget is tight: the identity, the live diagnostics, and the
 /// inline week variants, whose styling flips as soon as a 5h window appears.
-const ROWS_THAT_MUST_NOT_LAG: [&str; 18] = [
+const ROWS_THAT_MUST_NOT_LAG: [&str; 19] = [
     "quota_group",
     "quota_group_gap",
+    "quota_group_tail",
     "quota_icon",
     "quota_provider",
     "quota_model",
@@ -799,13 +801,19 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     // `report_icon_metadata` writes only `ICON_TOKEN_NAMES`, so head election
     // here would be dead work (one `agent list` per focus event). Pass no
-    // heads; the `quota_group` it removes from `desired` is never reported.
+    // heads; the group tokens it changes in `desired` are never reported.
     let group_heads = BTreeMap::new();
     let mut reported = 0;
     let mut failed = Vec::new();
     for pane in panes {
         let mut desired = pane.tokens.clone();
-        apply_group_and_icon(&mut desired, pane, &group_heads, &BTreeMap::new());
+        apply_group_and_icon(
+            &mut desired,
+            pane,
+            &group_heads,
+            &group_heads,
+            &BTreeMap::new(),
+        );
         if icon_tokens_match(&pane.tokens, &desired) {
             continue;
         }
@@ -852,8 +860,9 @@ fn publish_pane_tokens_inner(
         Ok(all) if !all.is_empty() => all,
         _ => panes.to_vec(),
     };
-    let group_heads =
-        group_head_pane_ids(&inventory, panes, tokens, group_head_ranks_by_headroom());
+    let rank_by_headroom = group_head_ranks_by_headroom();
+    let group_heads = group_head_pane_ids(&inventory, panes, tokens, rank_by_headroom);
+    let group_tails = group_tail_pane_ids(&inventory, panes, tokens, rank_by_headroom);
     let mut reported = 0usize;
     let mut failed = Vec::new();
     for pane in panes {
@@ -873,7 +882,13 @@ fn publish_pane_tokens_inner(
             apply_context(&mut desired, context, sequence / 1_000, row);
         }
         fold_cache_row(&mut desired, row);
-        apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels);
+        apply_group_and_icon(
+            &mut desired,
+            pane,
+            &group_heads,
+            &group_tails,
+            &workspace_labels,
+        );
         // Summary rows: their own source and comparison. Preserve leaves them.
         let desired_summary = match &pane_tokens.quota {
             PaneQuotaUpdate::Replace(values) => Some(desired_summary_tokens(values)),
@@ -937,6 +952,7 @@ fn publish_pane_tokens_inner(
         &inventory,
         panes,
         &group_heads,
+        &group_tails,
         &workspace_labels,
         sequence,
         &mut failed,
@@ -1023,44 +1039,29 @@ fn report_metadata<S: AsRef<str>>(
     Ok(output.status.success())
 }
 
-/// Clear or set `$quota_group` on siblings in the same Space that this pass
+/// Clear or set the group tokens on siblings in the same Space that this pass
 /// did not otherwise touch. Without this, a one-pane event leaves the old
-/// head's header in place after headroom moves the title to another pane.
+/// head's header (or the old tail's blank row) in place after headroom or a
+/// closed pane moves it to another pane.
+#[allow(clippy::too_many_arguments)]
 fn sync_sibling_group_headers(
     executable: &std::ffi::OsStr,
     inventory: &[AgentPane],
     published: &[AgentPane],
     group_heads: &BTreeMap<String, String>,
+    group_tails: &BTreeMap<String, String>,
     workspace_labels: &BTreeMap<String, String>,
     sequence: u64,
     failed: &mut Vec<String>,
 ) -> Result<usize> {
-    let published_ids = published
-        .iter()
-        .map(|pane| pane.pane_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let touched = published
-        .iter()
-        .map(|pane| pane.workspace_id.as_str())
-        .filter(|workspace| !workspace.is_empty())
-        .collect::<BTreeSet<_>>();
     let mut reported = 0usize;
-    for sibling in inventory {
-        if published_ids.contains(sibling.pane_id.as_str()) {
-            continue;
-        }
-        if !touched.contains(sibling.workspace_id.as_str()) {
-            continue;
-        }
-        let want = group_label_for(sibling, group_heads, workspace_labels);
-        let have = sibling
-            .tokens
-            .get("quota_group")
-            .filter(|value| !value.is_empty())
-            .cloned();
-        if want == have {
-            continue;
-        }
+    for (sibling, want) in sibling_group_updates(
+        inventory,
+        published,
+        group_heads,
+        group_tails,
+        workspace_labels,
+    ) {
         if pane_is_scrolled(executable, &sibling.pane_id) {
             continue;
         }
@@ -1076,10 +1077,12 @@ fn sync_sibling_group_headers(
             ])
             .args(["--seq", &sequence.to_string()])
             .args(["--ttl-ms", METADATA_TTL_MS]);
-        if let Some(label) = &want {
-            command.args(["--token", &format!("quota_group={label}")]);
-        } else {
-            command.args(["--clear-token", "quota_group"]);
+        for (name, value) in want {
+            if let Some(value) = value {
+                command.args(["--token", &format!("{name}={value}")]);
+            } else {
+                command.args(["--clear-token", name]);
+            }
         }
         let output = command.output().context("report group header to Herdr")?;
         if !output.status.success() {
@@ -1087,6 +1090,38 @@ fn sync_sibling_group_headers(
         }
     }
     Ok(reported)
+}
+
+/// Siblings in a Space this pass touched, not published themselves, whose
+/// group tokens differ from what the current head and tail call for.
+fn sibling_group_updates<'a>(
+    inventory: &'a [AgentPane],
+    published: &[AgentPane],
+    group_heads: &BTreeMap<String, String>,
+    group_tails: &BTreeMap<String, String>,
+    workspace_labels: &BTreeMap<String, String>,
+) -> Vec<(&'a AgentPane, GroupTokens)> {
+    let published_ids = published
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let touched = published
+        .iter()
+        .map(|pane| pane.workspace_id.as_str())
+        .filter(|workspace| !workspace.is_empty())
+        .collect::<BTreeSet<_>>();
+    inventory
+        .iter()
+        .filter(|sibling| !published_ids.contains(sibling.pane_id.as_str()))
+        .filter(|sibling| touched.contains(sibling.workspace_id.as_str()))
+        .filter_map(|sibling| {
+            let want = group_tokens(sibling, group_heads, group_tails, workspace_labels);
+            let unchanged = want.iter().all(|(name, value)| {
+                sibling.tokens.get(*name).filter(|value| !value.is_empty()) == value.as_ref()
+            });
+            (!unchanged).then_some((sibling, want))
+        })
+        .collect()
 }
 
 fn pane_is_scrolled(executable: &std::ffi::OsStr, pane_id: &str) -> bool {
@@ -1253,6 +1288,28 @@ fn group_head_pane_ids(
     tokens: &[PaneTokens],
     rank_by_headroom: bool,
 ) -> BTreeMap<String, String> {
+    group_edge_pane_ids(inventory, publishing, tokens, rank_by_headroom, false)
+}
+
+/// Which pane carries `$quota_group_tail`: the last pane of each Space in the
+/// same order [`group_head_pane_ids`] takes the first from, so the same known
+/// limits apply. A one-pane Space has its head and tail on one pane.
+fn group_tail_pane_ids(
+    inventory: &[AgentPane],
+    publishing: &[AgentPane],
+    tokens: &[PaneTokens],
+    rank_by_headroom: bool,
+) -> BTreeMap<String, String> {
+    group_edge_pane_ids(inventory, publishing, tokens, rank_by_headroom, true)
+}
+
+fn group_edge_pane_ids(
+    inventory: &[AgentPane],
+    publishing: &[AgentPane],
+    tokens: &[PaneTokens],
+    rank_by_headroom: bool,
+    last: bool,
+) -> BTreeMap<String, String> {
     let publishing_ids = publishing
         .iter()
         .map(|pane| pane.pane_id.as_str())
@@ -1274,7 +1331,7 @@ fn group_head_pane_ids(
         };
         let candidate = (headroom, index, pane.pane_id.as_str());
         match heads.get(&pane.workspace_id) {
-            Some(current) if *current <= candidate => {}
+            Some(current) if (*current <= candidate) != last => {}
             _ => {
                 heads.insert(pane.workspace_id.clone(), candidate);
             }
@@ -1282,8 +1339,9 @@ fn group_head_pane_ids(
     }
     // A pane present only in this pass (inventory read failed) still needs a
     // head entry so its Space is not left without a label.
+    let listed = heads.keys().cloned().collect::<BTreeSet<_>>();
     for (index, pane) in publishing.iter().enumerate() {
-        if pane.workspace_id.is_empty() || heads.contains_key(&pane.workspace_id) {
+        if pane.workspace_id.is_empty() || listed.contains(&pane.workspace_id) {
             continue;
         }
         let headroom = if rank_by_headroom {
@@ -1291,10 +1349,13 @@ fn group_head_pane_ids(
         } else {
             0
         };
-        heads.insert(
-            pane.workspace_id.clone(),
-            (headroom, inventory.len() + index, pane.pane_id.as_str()),
-        );
+        let candidate = (headroom, inventory.len() + index, pane.pane_id.as_str());
+        match heads.get(&pane.workspace_id) {
+            Some(current) if (*current <= candidate) != last => {}
+            _ => {
+                heads.insert(pane.workspace_id.clone(), candidate);
+            }
+        }
     }
     heads
         .into_iter()
@@ -1376,6 +1437,7 @@ fn apply_group_and_icon(
     desired: &mut BTreeMap<String, String>,
     pane: &AgentPane,
     group_heads: &BTreeMap<String, String>,
+    group_tails: &BTreeMap<String, String>,
     workspace_labels: &BTreeMap<String, String>,
 ) {
     let mark = crate::icons::sidebar_mark(pane.harness);
@@ -1388,26 +1450,54 @@ fn apply_group_and_icon(
         }
     }
     desired.remove("quota_pad");
-    // Never preserve a previous header: non-heads must omit the token so the
-    // report clears it. Blind preserve is what left `ifs` on two panes.
-    // On every pane, header or not: see `GROUP_GAP_TOKEN`.
-    desired.insert(GROUP_GAP_TOKEN.to_string(), GROUP_GAP.to_string());
-    if let Some(label) = group_label_for(pane, group_heads, workspace_labels) {
-        desired.insert("quota_group".to_string(), label);
-    } else {
-        desired.remove("quota_group");
+    // Never preserve a previous header or tail: panes that are not the head
+    // or tail must omit the token so the report clears it. Blind preserve is
+    // what left `ifs` on two panes.
+    for (name, value) in group_tokens(pane, group_heads, group_tails, workspace_labels) {
+        if let Some(value) = value {
+            desired.insert(name.to_string(), value);
+        } else {
+            desired.remove(name);
+        }
     }
 }
 
-/// The blank row above the icon, which the enlarged mark draws up into.
+/// `quota_group`, `quota_group_gap`, `quota_group_tail`, each set or absent.
+type GroupTokens = [(&'static str, Option<String>); 3];
+
+/// Header on the head, gap on every other pane (see [`GROUP_GAP_TOKEN`]),
+/// tail on the last pane.
+fn group_tokens(
+    pane: &AgentPane,
+    group_heads: &BTreeMap<String, String>,
+    group_tails: &BTreeMap<String, String>,
+    workspace_labels: &BTreeMap<String, String>,
+) -> GroupTokens {
+    let label = group_label_for(pane, group_heads, workspace_labels);
+    let gap = label.is_none().then(|| GROUP_GAP.to_string());
+    let is_tail =
+        !pane.workspace_id.is_empty() && group_tails.get(&pane.workspace_id) == Some(&pane.pane_id);
+    [
+        ("quota_group", label),
+        (GROUP_GAP_TOKEN, gap),
+        (GROUP_TAIL_TOKEN, is_tail.then(|| GROUP_TAIL.to_string())),
+    ]
+}
+
+/// The blank row above a member's icon, which the enlarged mark draws up into.
 ///
-/// Every pane carries it, not only a Space head. Herdr drops empty rows first
+/// Every pane except the Space head carries it. Herdr drops empty rows first
 /// and then indents row 0 by one column and every later row by three; a member
 /// without the gap would have its icon on row 0, two columns left of the
-/// head's. A whitespace value is dropped by Herdr, so the row holds one U+2800
-/// (see [`crate::icons::SIDEBAR_RESERVE`]).
+/// head's. On the head the Space name is row 0, so the icon row follows it
+/// directly. A whitespace value is dropped by Herdr, so the row holds one
+/// U+2800 (see [`crate::icons::SIDEBAR_RESERVE`]).
 const GROUP_GAP_TOKEN: &str = "quota_group_gap";
 const GROUP_GAP: &str = "\u{2800}";
+/// The blank row after a Space's last pane, which sets the next Space name
+/// apart from it. Configure puts its row last in every managed layout.
+const GROUP_TAIL_TOKEN: &str = "quota_group_tail";
+const GROUP_TAIL: &str = "\u{2800}";
 
 fn desired_tokens(
     values: &MetadataTokens,
@@ -2431,25 +2521,25 @@ mod tests {
         assert_eq!(heads.get("w1").map(String::as_str), Some("w1:p1"));
 
         let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
+        let tails = BTreeMap::new();
         let mut head_desired = BTreeMap::new();
-        apply_group_and_icon(&mut head_desired, &head, &heads, &labels);
+        apply_group_and_icon(&mut head_desired, &head, &heads, &tails, &labels);
         assert_eq!(
             head_desired.get("quota_group").map(String::as_str),
             Some("ifs")
         );
-        assert_eq!(
-            head_desired.get(GROUP_GAP_TOKEN).map(String::as_str),
-            Some(GROUP_GAP),
-            "the blank row between the header and the icon it draws into"
+        assert!(
+            !head_desired.contains_key(GROUP_GAP_TOKEN),
+            "no blank row between the Space name and its first agent"
         );
 
         let mut sibling_desired = sibling.tokens.clone();
-        apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &labels);
+        apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &tails, &labels);
         assert!(!sibling_desired.contains_key("quota_group"));
         assert_eq!(
             sibling_desired.get(GROUP_GAP_TOKEN).map(String::as_str),
             Some(GROUP_GAP),
-            "a member keeps the gap too: Herdr indents by row index after \
+            "a member keeps the gap: Herdr indents by row index after \
              dropping empty rows, so without it a member's icon row is row 0"
         );
         assert_eq!(
@@ -2497,7 +2587,7 @@ mod tests {
             ("quota_icon".to_string(), "stale".to_string()),
             ("quota_icon_done".to_string(), "stale".to_string()),
         ]);
-        apply_group_and_icon(&mut working_desired, &working, &heads, &labels);
+        apply_group_and_icon(&mut working_desired, &working, &heads, &tails, &labels);
         assert_eq!(
             working_desired
                 .get("quota_icon_working")
@@ -2511,7 +2601,7 @@ mod tests {
         let mut done = sibling.clone();
         done.status = AgentStatus::Done;
         let mut done_desired = BTreeMap::new();
-        apply_group_and_icon(&mut done_desired, &done, &heads, &labels);
+        apply_group_and_icon(&mut done_desired, &done, &heads, &tails, &labels);
         assert!(done_desired.contains_key("quota_icon_done"));
         assert!(!done_desired.contains_key("quota_icon"));
         assert!(!done_desired.contains_key("quota_icon_working"));
@@ -2520,7 +2610,7 @@ mod tests {
         let mut seen = done.clone();
         seen.focused = true;
         let mut seen_desired = BTreeMap::new();
-        apply_group_and_icon(&mut seen_desired, &seen, &heads, &labels);
+        apply_group_and_icon(&mut seen_desired, &seen, &heads, &tails, &labels);
         assert!(
             seen_desired.contains_key("quota_icon_done"),
             "focused completion stays teal until the focus hook acknowledges it"
@@ -2534,7 +2624,7 @@ mod tests {
         other.status = AgentStatus::Done;
         other.focused = false;
         let mut other_desired = BTreeMap::new();
-        apply_group_and_icon(&mut other_desired, &other, &heads, &labels);
+        apply_group_and_icon(&mut other_desired, &other, &heads, &tails, &labels);
         assert!(
             other_desired.contains_key("quota_icon_done"),
             "unfocused completion keeps teal until that pane is focused"
@@ -2550,7 +2640,7 @@ mod tests {
             .tokens
             .insert("quota_icon_done".to_string(), "teal".to_string());
         let mut stale_desired = BTreeMap::new();
-        apply_group_and_icon(&mut stale_desired, &stale_token, &heads, &labels);
+        apply_group_and_icon(&mut stale_desired, &stale_token, &heads, &tails, &labels);
         assert!(
             stale_desired.contains_key("quota_icon"),
             "idle + leftover done token must not restore teal"
@@ -2575,6 +2665,7 @@ mod tests {
             focused,
         };
         let heads = BTreeMap::from([("w1".to_string(), "w1:p1".to_string())]);
+        let tails = BTreeMap::from([("w1".to_string(), "w1:p2".to_string())]);
         let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
         let mark = crate::icons::sidebar_mark(Harness::Hermes);
         for id in ["w1:p1", "w1:p2"] {
@@ -2582,7 +2673,7 @@ mod tests {
                 for focused in [false, true] {
                     let mut current = pane(id, status, focused);
                     let mut desired = BTreeMap::new();
-                    apply_group_and_icon(&mut desired, &current, &heads, &labels);
+                    apply_group_and_icon(&mut desired, &current, &heads, &tails, &labels);
                     let icons = ICON_TOKEN_NAMES
                         .into_iter()
                         .filter_map(|name| desired.get(name))
@@ -2590,15 +2681,19 @@ mod tests {
                     assert_eq!(icons, [&mark], "{id} {status:?} focused={focused}");
                     assert_eq!(
                         desired.get(GROUP_GAP_TOKEN).map(String::as_str),
-                        Some(GROUP_GAP)
+                        (id != "w1:p1").then_some(GROUP_GAP)
                     );
                     assert_eq!(desired.contains_key("quota_group"), id == "w1:p1");
+                    assert_eq!(
+                        desired.get(GROUP_TAIL_TOKEN).map(String::as_str),
+                        (id == "w1:p2").then_some(GROUP_TAIL)
+                    );
 
                     // Herdr returns the values unchanged (U+2800 survives its
                     // trim), so the next pass writes nothing.
                     current.tokens = desired.clone();
                     let mut again = current.tokens.clone();
-                    apply_group_and_icon(&mut again, &current, &heads, &labels);
+                    apply_group_and_icon(&mut again, &current, &heads, &tails, &labels);
                     assert!(metadata_matches(&current.tokens, &again));
                     assert!(icon_tokens_match(&current.tokens, &again));
                 }
@@ -2612,13 +2707,157 @@ mod tests {
             crate::icons::for_harness(Harness::Hermes).to_string(),
         )]);
         let mut desired = old.tokens.clone();
-        apply_group_and_icon(&mut desired, &old, &heads, &labels);
+        apply_group_and_icon(&mut desired, &old, &heads, &tails, &labels);
         assert!(!metadata_matches(&old.tokens, &desired));
         assert!(!icon_tokens_match(&old.tokens, &desired));
         let names = metadata_report_names(&old, &desired);
         assert!(names.contains(&GROUP_GAP_TOKEN) && names.contains(&"quota_icon"));
         assert!(METADATA_TOKEN_NAMES.contains(&GROUP_GAP_TOKEN));
         assert!(ROWS_THAT_MUST_NOT_LAG.contains(&GROUP_GAP_TOKEN));
+        assert!(METADATA_TOKEN_NAMES.contains(&GROUP_TAIL_TOKEN));
+        assert!(ROWS_THAT_MUST_NOT_LAG.contains(&GROUP_TAIL_TOKEN));
+    }
+
+    fn group_pane(id: &str, headroom: &str) -> AgentPane {
+        AgentPane {
+            pane_id: id.to_string(),
+            workspace_id: workspace_id_from_pane_id(id).unwrap(),
+            harness: Harness::Codex,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::from([(HEADROOM_TOKEN.to_string(), headroom.to_string())]),
+            status: AgentStatus::Idle,
+            focused: false,
+        }
+    }
+
+    /// The tail is the last pane in the order the head is the first of; a
+    /// one-pane Space has header and tail on the same pane. When the tail
+    /// moves, the old pane's tail is cleared by name.
+    #[test]
+    fn group_tail_lands_on_the_last_pane_and_moves_off_the_old_one() {
+        let inventory = vec![
+            group_pane("w1:p3", "050"),
+            group_pane("w1:p1", "000"),
+            group_pane("w1:p2", "016"),
+            group_pane("w2:p1", "040"),
+        ];
+        let tails = group_tail_pane_ids(&inventory, &[], &[], true);
+        assert_eq!(tails.get("w1").map(String::as_str), Some("w1:p3"));
+        assert_eq!(tails.get("w2").map(String::as_str), Some("w2:p1"));
+        let tails_by_layout = group_tail_pane_ids(&inventory, &[], &[], false);
+        assert_eq!(tails_by_layout.get("w1").map(String::as_str), Some("w1:p2"));
+
+        let heads = group_head_pane_ids(&inventory, &[], &[], true);
+        let labels = BTreeMap::new();
+        let desired = |pane: &AgentPane, tails: &BTreeMap<String, String>| {
+            let mut desired = pane.tokens.clone();
+            apply_group_and_icon(&mut desired, pane, &heads, tails, &labels);
+            desired
+        };
+        let only = desired(&inventory[3], &tails);
+        assert_eq!(only.get("quota_group").map(String::as_str), Some("w2"));
+        assert_eq!(
+            only.get(GROUP_TAIL_TOKEN).map(String::as_str),
+            Some("\u{2800}")
+        );
+        assert!(!only.contains_key(GROUP_GAP_TOKEN));
+        let head = desired(&inventory[1], &tails);
+        assert!(head.contains_key("quota_group") && !head.contains_key(GROUP_TAIL_TOKEN));
+        let middle = desired(&inventory[2], &tails);
+        assert!(!middle.contains_key("quota_group") && !middle.contains_key(GROUP_TAIL_TOKEN));
+        assert_eq!(
+            middle.get(GROUP_GAP_TOKEN).map(String::as_str),
+            Some(GROUP_GAP)
+        );
+
+        // p3 carries the tail; p2's headroom rises past it, so p2 is last now.
+        let mut old_tail = inventory[0].clone();
+        old_tail.tokens = desired(&old_tail, &tails);
+        let mut moved = inventory.clone();
+        moved[0] = old_tail.clone();
+        moved[2]
+            .tokens
+            .insert(HEADROOM_TOKEN.to_string(), "090".to_string());
+        let new_tails = group_tail_pane_ids(&moved, &[], &[], true);
+        assert_eq!(new_tails.get("w1").map(String::as_str), Some("w1:p2"));
+        let cleared = desired(&old_tail, &new_tails);
+        assert!(!cleared.contains_key(GROUP_TAIL_TOKEN));
+        assert!(!metadata_matches(&old_tail.tokens, &cleared));
+        assert!(metadata_report_names(&old_tail, &cleared).contains(&GROUP_TAIL_TOKEN));
+        // A pass that published only p1 still moves the tail on its siblings.
+        let updates = sibling_group_updates(&moved, &moved[1..2], &heads, &new_tails, &labels);
+        let ids = updates
+            .iter()
+            .map(|(pane, _)| pane.pane_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"w1:p3") && ids.contains(&"w1:p2"), "{ids:?}");
+    }
+
+    /// Unchanged groups write nothing: neither the published pane nor the
+    /// siblings this pass did not otherwise touch.
+    #[test]
+    fn unchanged_groups_produce_no_write() {
+        let mut inventory = vec![
+            group_pane("w1:p1", "000"),
+            group_pane("w1:p2", "016"),
+            group_pane("w1:p3", "050"),
+        ];
+        let heads = group_head_pane_ids(&inventory, &[], &[], true);
+        let tails = group_tail_pane_ids(&inventory, &[], &[], true);
+        let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
+        for pane in &mut inventory {
+            let mut desired = pane.tokens.clone();
+            apply_group_and_icon(&mut desired, pane, &heads, &tails, &labels);
+            pane.tokens = desired;
+        }
+        for pane in &inventory {
+            let mut again = pane.tokens.clone();
+            apply_group_and_icon(&mut again, pane, &heads, &tails, &labels);
+            assert!(metadata_matches(&pane.tokens, &again), "{}", pane.pane_id);
+        }
+        assert!(
+            sibling_group_updates(&inventory, &inventory[..1], &heads, &tails, &labels).is_empty()
+        );
+    }
+
+    /// Worst case for Herdr's 16-name report: a head-and-tail pane with every
+    /// optional token set, upgrading from a build that put the gap on it.
+    #[test]
+    fn a_head_and_tail_pane_report_stays_within_the_name_budget() {
+        let mut pane = group_pane("w1:p1", "000");
+        pane.tokens
+            .insert(GROUP_GAP_TOKEN.to_string(), GROUP_GAP.to_string());
+        pane.tokens
+            .insert("quota_context".to_string(), "old".to_string());
+        // One name per row: each severity/variant family fills exactly one.
+        let mut desired = [
+            "quota_provider",
+            "quota_model",
+            "quota_provider_model",
+            "quota_context_warning",
+            "quota_cache",
+            "quota_cache_ttl",
+            "quota_cache_state",
+            "quota_5h_normal",
+            "quota_week_normal",
+            "quota_week_scoped_normal",
+            "quota_month_normal",
+            "quota_topic",
+            "quota_error",
+            HEADROOM_TOKEN,
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), "x".to_string()))
+        .collect::<BTreeMap<_, _>>();
+        let heads = BTreeMap::from([("w1".to_string(), "w1:p1".to_string())]);
+        apply_group_and_icon(&mut desired, &pane, &heads, &heads, &BTreeMap::new());
+        let names = metadata_report_names(&pane, &desired);
+        assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
+        for name in ["quota_group", GROUP_TAIL_TOKEN, GROUP_GAP_TOKEN] {
+            assert!(names.contains(&name), "{name} lagged: {names:?}");
+        }
     }
 
     #[test]

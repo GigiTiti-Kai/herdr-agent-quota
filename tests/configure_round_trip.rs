@@ -334,7 +334,12 @@ fn context_is_the_penultimate_row_and_model_shares_provider_style() {
         })
         .unwrap();
     assert_eq!(context_index + 1, limit_index);
-    assert_eq!(limit_index + 1, rows.len());
+    // Only the Space tail row, which ends every managed layout, follows.
+    assert_eq!(limit_index + 2, rows.len());
+    assert!(row_contains_token(
+        rows.get(limit_index + 1).unwrap(),
+        "$quota_group_tail"
+    ));
 
     let identity = rows
         .iter()
@@ -2203,9 +2208,9 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
         &format!(
-            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_group_gap":"{}","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}}]}}}}"#,
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_group_tail":"{}","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}}]}}}}"#,
             // What Herdr hands back after a publish: the icon with its reserved
-            // cells and the head's gap row, both as published.
+            // cells and the one-pane Space's tail row, both as published.
             "\u{2800}",
             "\u{e1a0}  \u{2800}"
         ),

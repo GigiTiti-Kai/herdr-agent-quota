@@ -361,7 +361,12 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
 4. **Quota order keeps Spaces contiguous.** The sort is
    `workspace_order` ascending, then `quota_headroom` ascending — never a
    flat headroom list that scatters one project's panes across the panel.
-   `$quota_group` names the Space on the tightest pane in that workspace;
+   `$quota_group` names the Space on the tightest pane in that workspace
+   (bold, ink-white, directly above that pane's icon row);
+   `$quota_group_gap` goes on every other pane and `$quota_group_tail` on
+   the last pane in the same order, filling the final row of every managed
+   layout so one blank row ends each Space. Sibling sync keeps all three in
+   step;
    `$quota_icon` / `_working` / `_done` is the vendor mark on every identity
    row (bundled icon font; Muse uses a text glyph). Colour replaces Herdr's `state_icon`
    ring: yellow while working, teal for an unseen completion, white after

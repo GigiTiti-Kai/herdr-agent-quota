@@ -10,7 +10,8 @@ Space, with brand icons that carry agent status.
 
 <img src="docs/screenshots/sidebar-gauges.png" alt="Space-grouped gauges sidebar" width="320">
 
-Agents are grouped under their Space. Each row leads with this plugin's brand
+Agents are grouped under their Space: a bold Space name directly above its
+first agent, and a blank row before the next Space. Each row leads with this plugin's brand
 icon — not Herdr's status ring. The icon colour tracks the agent: yellow while
 working, teal while done (until you focus it or move focus away from it), ink-white when idle.
 Provider and model stay ink-white; severity colours on the meters still mean
