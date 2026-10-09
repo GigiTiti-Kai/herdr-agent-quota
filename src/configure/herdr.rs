@@ -1371,11 +1371,17 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
             Some(false),
         ));
         if summary == SummaryFormat::Lines {
-            // R23: one row per window, with the icon on the first.
+            // The blank row keeps tall provider marks from overlapping.
             for slot in 1..=3 {
                 append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
                 rows.push(Value::Array(std::mem::take(&mut row)));
             }
+            rows.push(Value::Array(styled_row(
+                &format!("$quota_acct_{id}_gap"),
+                None,
+                None,
+                None,
+            )));
             continue;
         }
         for slot in 1..=3 {
@@ -1572,7 +1578,7 @@ fn print_diff_hint(
     if summary.is_on() {
         if summary == SummaryFormat::Lines {
             println!(
-                "  move 5h, 7d and 30d into one footer line per window per account, blank line below the title; agent rows keep cache, TTL and metered ses"
+                "  move 5h, 7d and 30d into one footer line per window per account, blank line below the title and between accounts; agent rows keep cache, TTL and metered ses"
             );
         } else {
             println!(
@@ -3490,9 +3496,9 @@ mod field_tests {
     }
 
     #[test]
-    fn the_lines_footer_has_a_header_gap_and_three_rows_per_family() {
+    fn the_lines_footer_has_a_header_gap_and_four_rows_per_family() {
         let (updated, rows) = written_footer(SummaryFormat::Lines);
-        assert_eq!(rows.len(), 2 + 3 * AccountFamily::IDS.len(), "{updated}");
+        assert_eq!(rows.len(), 2 + 4 * AccountFamily::IDS.len(), "{updated}");
         assert_eq!(rows[0], ["$quota_acct_title"]);
         assert_eq!(
             rows[1],
@@ -3505,12 +3511,13 @@ mod field_tests {
                 .to_vec()
         };
         for (index, id) in AccountFamily::IDS.into_iter().enumerate() {
-            let at = 2 + 3 * index;
+            let at = 2 + 4 * index;
             let mut first = vec![format!("$quota_acct_{id}_icon")];
             first.extend(windows(id, 1));
             assert_eq!(rows[at], first, "{id}");
             assert_eq!(rows[at + 1], windows(id, 2), "{id}");
             assert_eq!(rows[at + 2], windows(id, 3), "{id}");
+            assert_eq!(rows[at + 3], [format!("$quota_acct_{id}_gap")], "{id}");
         }
     }
 
