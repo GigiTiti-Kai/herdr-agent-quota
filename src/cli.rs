@@ -138,7 +138,7 @@ pub enum Command {
         /// Agent panel footer: off (default) keeps meters on every agent row;
         /// compact, bars, or numbers move 5h/7d/30d into one footer row per
         /// account; lines gives one footer line per window with its own reset,
-        /// blank line between accounts (needs a Herdr footer cap of 64 rows).
+        /// blank line below the title (needs a Herdr footer cap of 64 rows).
         /// Needs a Herdr build that understands `footer`.
         #[arg(long, value_enum)]
         account_summary: Option<SummaryFormat>,
