@@ -327,7 +327,9 @@ quota`): Space grouping plus least-headroom ranking inside each space.
 pane-independent collector (Claude, Codex, Grok, Agy, Devin, Muse, Cursor)
 publish their `quota_acct_*` rows to every workspace under source
 `herdr-agent-quota-summary`, rendered from the usable cached snapshot, so a
-row stays without a running agent. Panes drop those families; metered
+row stays without a running agent. A pane drops such a family only when
+this pass's workspace map carries it (Claude with only a statusLine reading
+has no account windows, so its panes keep the row); metered
 `ds`/`or`, Hermes, OpenCode Go and omp stay per pane. Every pane publish pass
 makes one `workspace list` and reports only to a workspace whose summary
 names differ (≤ 16 names per report, `--seq` + chunk index, ≤ 32 keys with
