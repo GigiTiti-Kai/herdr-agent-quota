@@ -1293,7 +1293,8 @@ fn group_head_pane_ids(
 
 /// Which pane carries `$quota_group_tail`: the last pane of each Space in the
 /// same order [`group_head_pane_ids`] takes the first from, so the same known
-/// limits apply. A one-pane Space has its head and tail on one pane.
+/// limits apply: an untracked agent that Herdr draws last puts the tail one
+/// pane early. A one-pane Space has its head and tail on one pane.
 fn group_tail_pane_ids(
     inventory: &[AgentPane],
     publishing: &[AgentPane],
@@ -1835,16 +1836,25 @@ fn metadata_report_names(
     // names first so an upgraded pane can actually clear them; an unchanged
     // value is re-sent on the next bounded report instead.
     let active_capacity = MAX_METADATA_TOKENS.saturating_sub(cleanup_names.len());
+    let droppable = |name: &&str| {
+        // Dropping a name the pane still carries but no longer wants would
+        // leave that row on screen forever, so those are never given up.
+        // Icon twins are never dropped either — a stale colour is worse
+        // than a briefly lagged quota digit.
+        let must_clear = pane.tokens.contains_key(*name) && !desired.contains_key(*name);
+        let is_icon = ICON_TOKEN_NAMES.contains(name);
+        !must_clear && !is_icon && !ROWS_THAT_MUST_NOT_LAG.contains(name)
+    };
+    // Unchanged values go first: dropping a changed one by position would
+    // never deliver it, so the pane would never match and every pass would
+    // write again.
+    let unchanged = |name: &&str| pane.tokens.get(*name) == desired.get(*name);
     while names.len() > active_capacity {
-        let Some(index) = names.iter().position(|name| {
-            // Dropping a name the pane still carries but no longer wants would
-            // leave that row on screen forever, so those are never given up.
-            // Icon twins are never dropped either — a stale colour is worse
-            // than a briefly lagged quota digit.
-            let must_clear = pane.tokens.contains_key(*name) && !desired.contains_key(*name);
-            let is_icon = ICON_TOKEN_NAMES.contains(name);
-            !must_clear && !is_icon && !ROWS_THAT_MUST_NOT_LAG.contains(name)
-        }) else {
+        let Some(index) = names
+            .iter()
+            .position(|name| droppable(name) && unchanged(name))
+            .or_else(|| names.iter().position(droppable))
+        else {
             break;
         };
         names.remove(index);
@@ -2853,11 +2863,89 @@ mod tests {
         .collect::<BTreeMap<_, _>>();
         let heads = BTreeMap::from([("w1".to_string(), "w1:p1".to_string())]);
         apply_group_and_icon(&mut desired, &pane, &heads, &heads, &BTreeMap::new());
+        // Everything else already applied; only the 5h window moved.
+        for (name, value) in &desired {
+            pane.tokens.insert(name.clone(), value.clone());
+        }
+        pane.tokens
+            .insert("quota_5h_normal".to_string(), "old".to_string());
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
-        for name in ["quota_group", GROUP_TAIL_TOKEN, GROUP_GAP_TOKEN] {
+        for name in [
+            "quota_group",
+            GROUP_TAIL_TOKEN,
+            GROUP_GAP_TOKEN,
+            "quota_context",
+            "quota_5h_normal",
+        ] {
             assert!(names.contains(&name), "{name} lagged: {names:?}");
         }
+        assert_eq!(apply_report(&pane, &names, &desired), desired);
+    }
+
+    /// What Herdr holds after `names` was reported from `desired`.
+    fn apply_report(
+        pane: &AgentPane,
+        names: &[&str],
+        desired: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut tokens = pane.tokens.clone();
+        for name in names {
+            match desired.get(*name) {
+                Some(value) => tokens.insert(name.to_string(), value.clone()),
+                None => tokens.remove(*name),
+            };
+        }
+        tokens
+    }
+
+    /// Packed with provider, model, cache, TTL, 5h, 7d and scoped weekly on,
+    /// plus context and topic: a Space's tail pane names 17 tokens. A changed
+    /// window value must still reach Herdr, or the pane never matches and
+    /// every pass writes again.
+    #[test]
+    fn an_over_budget_report_drops_unchanged_values_before_a_changed_one() {
+        let mut pane = group_pane("w1:p2", "042");
+        let heads = BTreeMap::from([("w1".to_string(), "w1:p1".to_string())]);
+        let tails = BTreeMap::from([("w1".to_string(), "w1:p2".to_string())]);
+        let mut desired = [
+            "quota_provider",
+            "quota_model",
+            "quota_provider_model",
+            "quota_context",
+            "quota_cache",
+            "quota_cache_ttl",
+            "quota_cache_state",
+            "quota_5h_normal",
+            "quota_week_normal",
+            "quota_week_scoped_normal",
+            "quota_topic",
+            HEADROOM_TOKEN,
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), "x".to_string()))
+        .collect::<BTreeMap<_, _>>();
+        apply_group_and_icon(&mut desired, &pane, &heads, &tails, &BTreeMap::new());
+        pane.tokens = desired.clone();
+        pane.tokens
+            .insert("quota_5h_normal".to_string(), "5h 41%".to_string());
+        desired.insert("quota_5h_normal".to_string(), "5h 40%".to_string());
+        assert!(!metadata_matches(&pane.tokens, &desired));
+
+        let names = metadata_report_names(&pane, &desired);
+        assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
+        assert!(names.contains(&"quota_5h_normal"), "{names:?}");
+        for name in ROWS_THAT_MUST_NOT_LAG
+            .into_iter()
+            .chain(ICON_TOKEN_NAMES)
+            .filter(|name| desired.contains_key(*name))
+        {
+            assert!(names.contains(&name), "{name} lagged: {names:?}");
+        }
+
+        // Second pass: Herdr now holds every value, so nothing is written.
+        pane.tokens = apply_report(&pane, &names, &desired);
+        assert!(metadata_matches(&pane.tokens, &desired));
     }
 
     #[test]
