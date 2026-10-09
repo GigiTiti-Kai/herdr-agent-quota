@@ -10,7 +10,7 @@ agent 状态。
 
 <img src="docs/screenshots/sidebar-gauges.png" alt="按 Space 分组的 gauges 侧栏" width="320">
 
-Agent 按所属 Space 分组。每一行只用本插件的品牌图标，不再画 Herdr 原生状态圈；
+Agent 按所属 Space 分组：加粗的 Space 名紧贴第一个 agent，下一个 Space 前空一行（默认 `row_gap = 1` 时为两行；在 `[ui.sidebar.agents]` 设 `row_gap = 0` 即为一行）。每一行只用本插件的品牌图标，不再画 Herdr 原生状态圈；
 图标颜色跟随 agent——工作中为黄、完成后为青绿；聚焦该 pane，或焦点从它移走后变为墨白。其他未读的绿色 pane 不受影响。
 Provider／模型保持墨白色；进度条上的严重程度色仍表示剩余额度。
 

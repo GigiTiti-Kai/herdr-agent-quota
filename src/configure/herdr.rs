@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 56] = [
+const QUOTA_ROW_MARKERS: [&str; 57] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -17,6 +17,7 @@ const QUOTA_ROW_MARKERS: [&str; 56] = [
     "$quota_icon_done",
     "$quota_group",
     "$quota_group_gap",
+    "$quota_group_tail",
     "$quota_pad",
     "$quota_provider",
     "$quota_model",
@@ -641,6 +642,14 @@ fn build_managed_rows(
         updated_rows = reordered;
     }
     retain_selected_fields(&mut updated_rows, fields);
+    // Last of all, after user extras: the blank row that ends a Space. Only
+    // the Space's last pane fills it; everywhere else Herdr drops it.
+    updated_rows.push(Value::Array(styled_row(
+        "$quota_group_tail",
+        None,
+        Some(false),
+        Some(false),
+    )));
     Ok(updated_rows)
 }
 
@@ -1013,12 +1022,15 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     // made the list look ungrouped.
     rows.push(Value::Array(styled_row(
         "$quota_group",
-        None,
+        // Ink-white like the idle logo and the name beside it, bold so the
+        // Space name reads as a heading above its agents.
+        Some(IDLE_ICON_COLOR),
         Some(true),
         Some(false),
     )));
-    // A blank row on every pane: the enlarged icon draws up into it, and it
-    // keeps the icon row a continuation row (same indent) on heads and members.
+    // A blank row on every member (empty on the head, so Herdr drops it): the
+    // enlarged icon draws up into it, and it keeps the icon row a continuation
+    // row (same indent) on heads and members.
     rows.push(Value::Array(styled_row(
         "$quota_group_gap",
         None,
@@ -1793,6 +1805,105 @@ mod tests {
         assert_eq!(add_quota_row(&updated).unwrap(), updated);
     }
 
+    /// Every managed layout (shared `rows` on takeover, `rows_by_agent` when
+    /// the shared rows are user-owned) leads with a bold ink-white Space header and
+    /// ends with `$quota_group_tail`, after any user extras. A config written
+    /// by the previous version is moved into that shape, not duplicated.
+    #[test]
+    fn space_header_is_bold_and_every_managed_layout_ends_with_the_tail() {
+        fn managed_layouts(document: &DocumentMut) -> Vec<Array> {
+            let agents = &document["ui"]["sidebar"]["agents"];
+            let mut layouts = Vec::new();
+            if agents["rows"].as_value().is_some_and(has_rows_marker) {
+                layouts.push(agents["rows"].as_array().unwrap().clone());
+            }
+            if let Some(by_agent) = agents.get("rows_by_agent").and_then(Item::as_table) {
+                for (_, rows) in by_agent.iter() {
+                    layouts.push(rows.as_array().unwrap().clone());
+                }
+            }
+            layouts
+        }
+        // What the previous version wrote: no tail row, header without a hue.
+        fn downgrade(updated: &str) -> String {
+            let mut document = updated.parse::<DocumentMut>().unwrap();
+            let agents = document["ui"]["sidebar"]["agents"].as_table_mut().unwrap();
+            let mut arrays: Vec<&mut Array> = Vec::new();
+            for (key, item) in agents.iter_mut() {
+                match key.get() {
+                    "rows" if item.as_value().is_some_and(has_rows_marker) => {
+                        arrays.push(item.as_array_mut().unwrap())
+                    }
+                    "rows_by_agent" => {
+                        for (_, rows) in item.as_table_mut().unwrap().iter_mut() {
+                            arrays.push(rows.as_array_mut().unwrap());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for rows in arrays {
+                rows.remove(rows.len() - 1);
+                rows.replace(
+                    0,
+                    Value::Array(styled_row("$quota_group", None, Some(true), Some(false))),
+                );
+            }
+            document.to_string()
+        }
+
+        let user_extras =
+            "[ui.sidebar.agents]\nrows = [[\"pane\", \"$git_branch\"]] # herdr-agent-quota-row\n";
+        let preserved = "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"workspace\", fg = \"#123456\" }, \"tab\"], [\"agent\"]]\n";
+        for original in ["", user_extras, preserved] {
+            for layout in SidebarLayout::CHOICES {
+                let apply = |input: &str| add_quota_row_for(input, &[Harness::Claude], layout);
+                let updated = apply(original).unwrap();
+                let document = updated.parse::<DocumentMut>().unwrap();
+                let layouts = managed_layouts(&document);
+                assert!(!layouts.is_empty(), "{updated}");
+                for rows in &layouts {
+                    let names = rows.iter().map(token_names).collect::<Vec<_>>();
+                    assert_eq!(names.first().unwrap(), &["$quota_group"], "{updated}");
+                    assert_eq!(names.last().unwrap(), &["$quota_group_tail"], "{updated}");
+                    let flat = names.iter().flatten().collect::<Vec<_>>();
+                    assert_eq!(
+                        flat.iter()
+                            .filter(|name| **name == "$quota_group_tail")
+                            .count(),
+                        1
+                    );
+                    let header = rows.get(0).unwrap().as_array().unwrap().get(0).unwrap();
+                    let header = header.as_inline_table().unwrap();
+                    assert_eq!(
+                        header.get("fg").and_then(Value::as_str),
+                        Some(IDLE_ICON_COLOR)
+                    );
+                    assert_eq!(header.get("bold").and_then(Value::as_bool), Some(true));
+                    assert_eq!(header.get("dim").and_then(Value::as_bool), Some(false));
+                    if original == user_extras {
+                        // User rows stay right under the icon; the tail
+                        // follows every row, theirs included.
+                        assert_eq!(names[HEAD_QUOTA_ROWS], ["pane", "$git_branch"]);
+                    }
+                }
+                assert_eq!(apply(&updated).unwrap(), updated, "idempotent");
+                let old = downgrade(&updated);
+                assert!(!old.contains("$quota_group_tail"), "{old}");
+                assert_eq!(apply(&old).unwrap(), updated, "upgrade moves rows");
+
+                let removed = remove_quota_row(&updated).unwrap();
+                assert!(!removed.contains("$quota_group"), "{removed}");
+                if original == preserved {
+                    // The agent's own layout goes with it, tail included.
+                    let narrowed =
+                        remove_quota_row_for(&updated, &[Harness::Claude], false).unwrap();
+                    assert!(!narrowed.contains("$quota_group"), "{narrowed}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn adds_quota_rows_with_group_header_and_vendor_icon() {
         let original = r#"[ui.sidebar.agents]
@@ -2182,22 +2293,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "caa0e56ca29d6c7dc47023bac0e41262510a1194c074ea3e21cde244b4b78745",
-                    "97b3d87b6ba39cf831f8ac083f94cce6ce968e52f147d9928dc8baedda816bed",
+                    "ba84ca935fe7c230d54f35b5c55868eeb7e2bb37706d4368e21bc8a1e4b3681a",
+                    "1645c9e0f925e9bbc8eaaafc867c8f191ebb8044ec59612b4b1d3430a1b0dfc2",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "2effe7bc7c6d750c941e862c67b514ae70678bbaab6953f49b8ba6e69f4d80f1",
-                    "e93023080873ecb19f7141bbb12112fef1e7762938669d0be32bc4a697c234e3",
+                    "382a0ed34a1961691e1437c66459e3abd4b721956e1f879b5136ab57569f3bdf",
+                    "6e7e9f126a94e2c2d47a249639e92d0f99703483511417c83ae763c97d8791a0",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "2effe7bc7c6d750c941e862c67b514ae70678bbaab6953f49b8ba6e69f4d80f1",
-                    "e93023080873ecb19f7141bbb12112fef1e7762938669d0be32bc4a697c234e3",
+                    "382a0ed34a1961691e1437c66459e3abd4b721956e1f879b5136ab57569f3bdf",
+                    "6e7e9f126a94e2c2d47a249639e92d0f99703483511417c83ae763c97d8791a0",
                 ],
             ),
         ] {

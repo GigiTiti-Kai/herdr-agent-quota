@@ -28,6 +28,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and drops the 5h/7d/30d rows from agent rows; a metered pane keeps `ses`.
   Needs a Herdr build that understands `footer`.
 
+### Changed
+
+- Space headers: the Space name is bold and sits directly above its first
+  agent, and one blank row ends each Space before the next name. `configure`
+  appends a `$quota_group_tail` row last in every managed layout and moves
+  an older layout's rows into place.
+
 ## [1.6.0] - 2026-09-17
 
 ### Changed
