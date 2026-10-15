@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Account summary: a Hermes session that bills the same ChatGPT account as
+  the Codex row no longer gets a duplicate Hermes footer row. The Codex row
+  carries a Hermes badge instead (the Hermes mark and the number of live
+  Hermes sessions on that account), last on its first line. The bridge
+  plugin now records a domain-separated sha256 of the account its live
+  access token names; the badge appears only when it equals the same stamp of
+  the account the Codex reading was fetched for. Other accounts keep their
+  Hermes row; the Claude row has no badge. Run `configure` to add the badge
+  token to the footer; Hermes processes pick up the new bridge on restart.
+
 ### Added
 
 - Hermes Agent panes: vendor icon, Space grouping, topic, and the session's

@@ -269,18 +269,18 @@ fn watch_pass_ids(
             continue;
         }
         let row = *style.get_or_insert_with(|| publish_row(cache));
-        if pane.harness == Harness::Hermes {
-            // Never a cached target; staleness is against its session row and
-            // its bridge mailbox.
-            if hermes_pane_is_stale(cache, pane, now, row) {
-                affected.push(pane.pane_id.clone());
-            }
-            continue;
-        }
         let workspace = workspace.get_or_insert_with(|| {
             let always_on = always_on_providers(&AgentSelection::from_args_or_env(&[]));
             desired_workspace_summary(cache, &always_on, now, row)
         });
+        if pane.harness == Harness::Hermes {
+            // Never a cached target; staleness is against its session row and
+            // its bridge mailbox.
+            if hermes_pane_is_stale(cache, pane, now, row, workspace) {
+                affected.push(pane.pane_id.clone());
+            }
+            continue;
+        }
         if cached_quota_is_stale(cache, pane, now, row, workspace) {
             affected.push(pane.pane_id.clone());
         }
@@ -347,9 +347,24 @@ fn cached_quota_is_stale(
 /// bridge plugin nudges this plugin when it sees a change; this check is what
 /// catches the same change from a watcher pass when the nudge did not land.
 /// It is one read-only row lookup and one small file read, no provider call.
-fn hermes_pane_is_stale(cache: &CacheStore, pane: &AgentPane, now: u64, row: RowStyle) -> bool {
+/// `workspace` is this pass's footer map: a row the pane gives up to a badged
+/// workspace row is compared as given up, or it would read as drift forever.
+fn hermes_pane_is_stale(
+    cache: &CacheStore,
+    pane: &AgentPane,
+    now: u64,
+    row: RowStyle,
+    workspace: &BTreeMap<String, String>,
+) -> bool {
     pane.harness == Harness::Hermes
-        && hermes_resolved_is_stale(cache, pane, &route::resolve_with_identity(pane), now, row)
+        && hermes_resolved_is_stale(
+            cache,
+            pane,
+            &route::resolve_with_identity(pane),
+            now,
+            row,
+            workspace,
+        )
 }
 
 fn hermes_resolved_is_stale(
@@ -358,6 +373,7 @@ fn hermes_resolved_is_stale(
     resolved: &route::ResolvedPane,
     now: u64,
     row: RowStyle,
+    workspace: &BTreeMap<String, String>,
 ) -> bool {
     if resolved
         .identity
@@ -371,7 +387,12 @@ fn hermes_resolved_is_stale(
         .as_ref()
         .and_then(|session| hermes_bridge_tokens(cache, pane, session, now, row));
     match bridged {
-        Some(values) => crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape),
+        Some(mut values) => {
+            if on_workspace(&values, workspace) {
+                values.account = None;
+            }
+            crate::herdr::quota_rows_have_drifted(&pane.tokens, &values, row.shape)
+        }
         // Without a reading every bar on a Hermes pane is left over: from an
         // earlier credential, an earlier provider, or another harness.
         None => crate::herdr::quota_rows_present(&pane.tokens),
@@ -380,6 +401,11 @@ fn hermes_resolved_is_stale(
 
 /// What the bridge mailbox says the credential serving this pane's session
 /// has left, or `None` when any link in that proof is missing.
+///
+/// When the session's live token names the same ChatGPT account the Codex
+/// snapshot was fetched for, the footer row is marked as that account's
+/// (`same_account_as`); the publish pass drops it once the Codex row on the
+/// workspace carries the Hermes badge.
 fn hermes_bridge_tokens(
     cache: &CacheStore,
     pane: &AgentPane,
@@ -387,14 +413,35 @@ fn hermes_bridge_tokens(
     now: u64,
     row: RowStyle,
 ) -> Option<MetadataTokens> {
-    let snapshot = crate::providers::hermes::load(
+    let reading = crate::providers::hermes::load(
         cache.root(),
         &pane.pane_id,
         pane.session.as_ref().and_then(|session| session.id())?,
         session.provider_id.as_deref()?,
         now,
     )?;
-    tokens_for_provider(Some(&snapshot), now, None, row)
+    let mut values = tokens_for_provider(Some(&reading.snapshot), now, None, row)?;
+    if values.account.is_some() && reading.account.is_some() {
+        let codex = load_usable_snapshot(cache, Provider::Codex).ok().flatten();
+        mark_same_account(&mut values, reading.account.as_deref(), codex.as_ref());
+    }
+    Some(values)
+}
+
+/// Mark a Hermes pane's footer row as the Codex account's when the session's
+/// live token names the account the usable Codex snapshot was fetched for.
+fn mark_same_account(
+    values: &mut MetadataTokens,
+    session_account: Option<&str>,
+    codex: Option<&ProviderSnapshot>,
+) {
+    let Some(account) = values.account.as_mut() else {
+        return;
+    };
+    let codex_account = codex.and_then(snapshot_account_stamp);
+    account.same_account_as = session_account
+        .filter(|stamp| codex_account.as_deref() == Some(*stamp))
+        .map(|_| AccountFamily::for_provider(Provider::Codex).id);
 }
 
 fn identity_has_drifted(pane: &AgentPane, identity: &crate::herdr::PaneIdentity) -> bool {
@@ -1769,10 +1816,14 @@ fn always_on_providers(enabled: &[Harness]) -> Vec<Provider> {
         .collect()
 }
 
-/// Whether this pass's workspace map carries the pane's footer family.
+/// Whether this pass's workspace map carries the pane's footer family, or
+/// carries the Hermes badge on the row that shows the same billing account.
 fn on_workspace(values: &MetadataTokens, workspace: &BTreeMap<String, String>) -> bool {
     values.account.as_ref().is_some_and(|account| {
         workspace.contains_key(&format!("quota_acct_{}_icon", account.family.id))
+            || account
+                .same_account_as
+                .is_some_and(|id| workspace.contains_key(&format!("quota_acct_{id}_hermes")))
     })
 }
 
@@ -1780,7 +1831,9 @@ fn on_workspace(values: &MetadataTokens, workspace: &BTreeMap<String, String>) -
 /// so a family is never invisible and never duplicated. Metered `ds`/`or`,
 /// Hermes, OpenCode Go and omp are never on a workspace (R28), and an
 /// always-on family without account-level windows (Claude with only a
-/// statusLine reading) stays on its panes. The name diff clears old copies.
+/// statusLine reading) stays on its panes. A Hermes pane gives up its row
+/// when the workspace row of the account its session is proven to bill
+/// carries the Hermes badge instead. The name diff clears old copies.
 fn drop_workspace_accounts(tokens: &mut [PaneTokens], workspace: &BTreeMap<String, String>) {
     for pane in tokens {
         if let PaneQuotaUpdate::Replace(values) = &mut pane.quota {
@@ -1807,19 +1860,83 @@ fn desired_workspace_summary(
         .iter()
         .filter_map(|provider| load_usable_snapshot(cache, *provider).ok().flatten())
         .collect::<Vec<_>>();
-    workspace_summary(&snapshots, now, row)
+    let hermes = hermes_sessions_by_provider(cache, &snapshots, now);
+    workspace_summary(&snapshots, now, row, &hermes)
+}
+
+/// How many live Hermes sessions are proven to bill each footer row's
+/// account. A session counts only when the account stamp its own process
+/// published equals the stamp of the account the row's snapshot was fetched
+/// for. Only the Codex row has such an account (`AccountFamily::HERMES_BADGED`);
+/// nothing is counted while Hermes is not an enabled agent.
+fn hermes_sessions_by_provider(
+    cache: &CacheStore,
+    snapshots: &[ProviderSnapshot],
+    now: u64,
+) -> Vec<(Provider, usize)> {
+    if !AgentSelection::from_args_or_env(&[]).contains(&Harness::Hermes) {
+        return Vec::new();
+    }
+    hermes_sessions_on_rows(snapshots, || {
+        crate::providers::hermes::live_accounts(cache.root(), now)
+    })
+}
+
+/// [`hermes_sessions_by_provider`] once Hermes is known to be enabled. The
+/// mailbox is scanned only when a row has an account to compare with.
+fn hermes_sessions_on_rows(
+    snapshots: &[ProviderSnapshot],
+    live_accounts: impl FnOnce() -> Vec<String>,
+) -> Vec<(Provider, usize)> {
+    let Some(codex) = snapshots
+        .iter()
+        .find(|snapshot| snapshot.provider == Provider::Codex)
+        .and_then(snapshot_account_stamp)
+    else {
+        return Vec::new();
+    };
+    let sessions = live_accounts()
+        .iter()
+        .filter(|account| **account == codex)
+        .count();
+    if sessions == 0 {
+        return Vec::new();
+    }
+    vec![(Provider::Codex, sessions)]
+}
+
+/// The comparable stamp of the account a footer row's snapshot was fetched
+/// for. Codex snapshots carry the ChatGPT account id; no other row has an
+/// account a Hermes session could be compared with.
+fn snapshot_account_stamp(snapshot: &ProviderSnapshot) -> Option<String> {
+    (snapshot.provider == Provider::Codex)
+        .then_some(snapshot.account_id.as_deref())
+        .flatten()
+        .map(crate::providers::hermes::chatgpt_account_stamp)
 }
 
 /// Rendered by the same path a pane used, account-level windows only. Whole
-/// families past the 32-key budget are dropped from the end (R30).
+/// families past the 32-key budget are dropped from the end (R30). A row in
+/// `hermes` carries the Hermes badge for that many sessions.
 fn workspace_summary(
     snapshots: &[ProviderSnapshot],
     now: u64,
     row: RowStyle,
+    hermes: &[(Provider, usize)],
 ) -> BTreeMap<String, String> {
     let mut summary = BTreeMap::new();
     for (index, snapshot) in snapshots.iter().enumerate() {
-        let values = MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now, None, row);
+        let mut values =
+            MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now, None, row);
+        let sessions = hermes
+            .iter()
+            .find(|(provider, _)| *provider == snapshot.provider)
+            .map(|(_, sessions)| *sessions);
+        if let Some(account) = sessions.and_then(|sessions| {
+            crate::presentation::hermes_badged_account(snapshot, now, row, sessions)
+        }) {
+            values.account = Some(account);
+        }
         let family = crate::herdr::desired_summary_tokens(&values);
         let added = family
             .keys()
@@ -2219,7 +2336,7 @@ mod tests {
             three_window_snapshot(Provider::Codex),
             grok.clone(),
         ];
-        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row);
+        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row, &[]);
         assert_eq!(
             summary.get("quota_acct_title").map(String::as_str),
             Some("quota")
@@ -2255,7 +2372,7 @@ mod tests {
             .into_iter()
             .map(three_window_snapshot)
             .collect::<Vec<_>>();
-        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row);
+        let summary = workspace_summary(&snapshots, SUMMARY_NOW, row, &[]);
         assert!(summary.len() <= MAX_WORKSPACE_TOKENS, "{}", summary.len());
         for id in ["cl", "cx", "gk", "ag", "dv", "mu"] {
             assert_eq!(family_names(&summary, id).len(), 5, "{id}");
@@ -2288,7 +2405,7 @@ mod tests {
         let account = ProviderSnapshot::new(Provider::Claude, Vec::new(), SUMMARY_NOW)
             .session_local()
             .with_account_windows(windows.clone());
-        let workspace = workspace_summary(std::slice::from_ref(&account), SUMMARY_NOW, row);
+        let workspace = workspace_summary(std::slice::from_ref(&account), SUMMARY_NOW, row, &[]);
         assert!(!family_names(&workspace, "cl").is_empty());
         let pane = MetadataTokens::from_snapshot_for_pane_with_fields(
             &account,
@@ -2303,7 +2420,7 @@ mod tests {
         let mut statusline =
             ProviderSnapshot::new(Provider::Claude, Vec::new(), SUMMARY_NOW).session_local();
         statusline.session_windows.insert("s1".to_string(), windows);
-        let workspace = workspace_summary(std::slice::from_ref(&statusline), SUMMARY_NOW, row);
+        let workspace = workspace_summary(std::slice::from_ref(&statusline), SUMMARY_NOW, row, &[]);
         assert!(family_names(&workspace, "cl").is_empty());
         let pane = MetadataTokens::from_snapshot_for_pane_with_fields(
             &statusline,
@@ -2326,7 +2443,7 @@ mod tests {
                 icon: "DS",
             };
         }
-        let full = workspace_summary(std::slice::from_ref(&account), SUMMARY_NOW, row);
+        let full = workspace_summary(std::slice::from_ref(&account), SUMMARY_NOW, row, &[]);
         assert_eq!(
             pane_summary(&metered, &full),
             crate::herdr::desired_summary_tokens(&metered)
@@ -2340,6 +2457,156 @@ mod tests {
         cache.save(&three_window_snapshot(Provider::Codex)).unwrap();
         let off = summary_row(crate::cli::SummaryFormat::Off);
         assert!(desired_workspace_summary(&cache, &[Provider::Codex], SUMMARY_NOW, off).is_empty());
+    }
+
+    /// Codex reports 5h and 7d only.
+    fn stamped_codex(account_id: &str) -> ProviderSnapshot {
+        let mut codex = ProviderSnapshot::new(
+            Provider::Codex,
+            vec![
+                window(WindowKind::FiveHour, 10.0, SUMMARY_NOW + 3_600),
+                window(WindowKind::Weekly, 30.0, SUMMARY_NOW + 86_400),
+            ],
+            SUMMARY_NOW,
+        );
+        codex.account_id = Some(account_id.to_string());
+        codex
+    }
+
+    /// Live Hermes sessions count toward a row only by account stamp, and
+    /// only the Codex row has an account to compare. An unstamped Codex
+    /// snapshot proves nothing, and the mailbox is not even scanned for it.
+    #[test]
+    fn hermes_sessions_count_toward_the_codex_row_only_by_account_stamp() {
+        use crate::providers::hermes::chatgpt_account_stamp;
+        let codex = stamped_codex("acc-1");
+        let mine = chatgpt_account_stamp("acc-1");
+        let other = chatgpt_account_stamp("acc-2");
+        let live = || vec![mine.clone(), other.clone(), mine.clone()];
+        assert_eq!(
+            hermes_sessions_on_rows(std::slice::from_ref(&codex), live),
+            vec![(Provider::Codex, 2)]
+        );
+        assert!(
+            hermes_sessions_on_rows(std::slice::from_ref(&codex), || vec![other.clone()])
+                .is_empty()
+        );
+        assert!(hermes_sessions_on_rows(&[codex], Vec::new).is_empty());
+        // The raw id is never what is compared.
+        assert!(
+            hermes_sessions_on_rows(&[stamped_codex("acc-1")], || vec!["acc-1".to_string()])
+                .is_empty()
+        );
+        let unstamped = three_window_snapshot(Provider::Codex);
+        let claude = three_window_snapshot(Provider::Claude);
+        for rows in [vec![unstamped], vec![claude], Vec::new()] {
+            assert!(
+                hermes_sessions_on_rows(&rows, || panic!("scanned without an account")).is_empty()
+            );
+        }
+    }
+
+    /// The badge rides the Codex row only, carries the session count, and
+    /// costs one workspace key; without sessions the row is unchanged.
+    #[test]
+    fn workspace_summary_marks_the_codex_row_with_the_hermes_badge() {
+        let hermes_mark = crate::icons::for_harness(Harness::Hermes);
+        for format in crate::cli::SummaryFormat::CHOICES
+            .into_iter()
+            .filter(|format| format.is_on())
+        {
+            let row = summary_row(format);
+            let snapshots = [
+                three_window_snapshot(Provider::Claude),
+                stamped_codex("acc-1"),
+            ];
+            let plain = workspace_summary(&snapshots, SUMMARY_NOW, row, &[]);
+            assert!(!plain.contains_key("quota_acct_cx_hermes"), "{format:?}");
+            let badged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[(Provider::Codex, 2)]);
+            assert_eq!(
+                badged.get("quota_acct_cx_hermes"),
+                Some(&format!("{hermes_mark} 2")),
+                "{format:?}"
+            );
+            assert!(!badged.contains_key("quota_acct_cl_hermes"), "{format:?}");
+            assert_eq!(
+                family_names(&badged, "cl"),
+                family_names(&plain, "cl"),
+                "{format:?}"
+            );
+            assert_eq!(
+                family_names(&badged, "cx").len(),
+                family_names(&plain, "cx").len() + 1,
+                "{format:?}"
+            );
+        }
+    }
+
+    fn hermes_pane_values(row: RowStyle) -> MetadataTokens {
+        let reading = ProviderSnapshot::new(
+            Provider::Hermes,
+            vec![window(WindowKind::Weekly, 2.0, SUMMARY_NOW + 86_400)],
+            SUMMARY_NOW,
+        );
+        MetadataTokens::from_snapshot_for_pane_with_fields(&reading, SUMMARY_NOW, None, row)
+    }
+
+    /// A Hermes pane's own row is marked as the Codex account's only when its
+    /// session's stamp equals the stamp of the account the Codex snapshot was
+    /// fetched for.
+    #[test]
+    fn a_hermes_row_is_the_codex_accounts_only_on_an_equal_stamp() {
+        use crate::providers::hermes::chatgpt_account_stamp;
+        let row = summary_row(crate::cli::SummaryFormat::Lines);
+        let codex = stamped_codex("acc-1");
+        let marked = |session: Option<&str>, codex: Option<&ProviderSnapshot>| {
+            let mut values = hermes_pane_values(row);
+            mark_same_account(&mut values, session, codex);
+            values.account.expect("a footer row").same_account_as
+        };
+        let mine = chatgpt_account_stamp("acc-1");
+        let other = chatgpt_account_stamp("acc-2");
+        assert_eq!(marked(Some(&mine), Some(&codex)), Some("cx"));
+        assert_eq!(marked(Some(&other), Some(&codex)), None);
+        assert_eq!(marked(None, Some(&codex)), None);
+        assert_eq!(marked(Some(&mine), None), None);
+        assert_eq!(
+            marked(Some(&mine), Some(&three_window_snapshot(Provider::Codex))),
+            None
+        );
+        assert_eq!(marked(Some("acc-1"), Some(&codex)), None);
+        // Summary off: there is no footer row to mark.
+        let mut off = hermes_pane_values(summary_row(crate::cli::SummaryFormat::Off));
+        mark_same_account(&mut off, Some(&mine), Some(&codex));
+        assert_eq!(off.account, None);
+    }
+
+    /// The Hermes meter row leaves the footer exactly when the Codex row on
+    /// the workspace carries the badge for the same account; otherwise it is
+    /// the only place that account's quota shows, and it stays.
+    #[test]
+    fn a_hermes_pane_drops_its_row_only_for_a_badged_row_of_the_same_account() {
+        let row = summary_row(crate::cli::SummaryFormat::Lines);
+        let snapshots = [stamped_codex("acc-1")];
+        let badged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[(Provider::Codex, 1)]);
+        let unbadged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[]);
+        let mut same = hermes_pane_values(row);
+        same.account.as_mut().unwrap().same_account_as = Some("cx");
+        let unproven = hermes_pane_values(row);
+        assert!(pane_summary(&same, &badged).is_empty());
+        let hm = |summary: &BTreeMap<String, String>| {
+            summary
+                .keys()
+                .any(|name| name.starts_with("quota_acct_hm_"))
+        };
+        assert!(hm(&pane_summary(&same, &unbadged)));
+        assert!(hm(&pane_summary(&unproven, &badged)));
+        assert!(hm(&pane_summary(&unproven, &unbadged)));
+        // `same_account_as` never leaks into what Herdr is sent.
+        assert_eq!(
+            crate::herdr::desired_summary_tokens(&same),
+            crate::herdr::desired_summary_tokens(&unproven)
+        );
     }
 
     fn low(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {
@@ -4139,7 +4406,14 @@ mod tests {
             let home = hermes_home("openai-codex", "model-a");
             let row = publish_row(&cache);
             let stale = |pane: &AgentPane| {
-                hermes_resolved_is_stale(&cache, pane, &resolved(pane, home.path()), NOW, row)
+                hermes_resolved_is_stale(
+                    &cache,
+                    pane,
+                    &resolved(pane, home.path()),
+                    NOW,
+                    row,
+                    &BTreeMap::new(),
+                )
             };
 
             // Bars with no reading behind them.
@@ -4181,7 +4455,13 @@ mod tests {
             // Another harness never takes this path, whatever it carries.
             let mut claude = pane_with_bars();
             claude.harness = Harness::Claude;
-            assert!(!hermes_pane_is_stale(&cache, &claude, NOW, row));
+            assert!(!hermes_pane_is_stale(
+                &cache,
+                &claude,
+                NOW,
+                row,
+                &BTreeMap::new()
+            ));
         }
     }
 

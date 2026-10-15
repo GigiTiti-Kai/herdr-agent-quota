@@ -164,3 +164,158 @@ fn a_pane_less_claude_footer_reaches_every_workspace_and_matching_ones_are_left_
     let left = apply_report(&w1_tokens, &cleared);
     assert_eq!(left.keys().collect::<Vec<_>>(), ["foreign"]);
 }
+
+/// A refresh of the Codex row with Hermes enabled: the real binary, a fake
+/// Herdr, a Codex login fixture, and bridge records written the way the
+/// Hermes plugin writes them.
+fn refresh_codex(root: &Path) -> BTreeMap<String, String> {
+    fs::write(
+        root.join("workspaces.json"),
+        json!({"result":{"workspaces":[{"workspace_id":"w1","label":"api"}]}}).to_string(),
+    )
+    .unwrap();
+    fs::write(root.join("calls"), "").unwrap();
+    let _ = fs::remove_dir_all(root.join("reports"));
+    fs::create_dir(root.join("reports")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .args(["refresh", "--provider", "codex"])
+        .env("HERDR_PLUGIN_STATE_DIR", root)
+        .env("HERDR_PLUGIN_CONFIG_DIR", root)
+        .env("HERDR_BIN_PATH", root.join("herdr"))
+        .env("HERDR_CONFIG_FILE", root.join("config.toml"))
+        .env("HERDR_SOCKET_PATH", root.join("herdr.sock"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("CODEX_AUTH_FILE", root.join("codex-auth.json"))
+        .env("CODEX_HOME", root.join("codex-home"))
+        // Absent on purpose: never start a real Codex app-server.
+        .env("CODEX_BIN_PATH", root.join("absent-codex"))
+        .env("HERMES_HOME", root.join("hermes-home"))
+        .env("HERDR_AGENT_QUOTA_AGENTS", "codex,hermes")
+        .env("TEST_WORKSPACES", root.join("workspaces.json"))
+        .env("TEST_CALLS", root.join("calls"))
+        .env("TEST_REPORTS", root.join("reports"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = fs::read_to_string(root.join("reports/w1")).unwrap_or_default();
+    apply_report(&BTreeMap::new(), &report)
+}
+
+/// A bridge record for `session`, as the Hermes plugin writes it, held by a
+/// live producer for as long as the returned lock is open.
+fn hermes_session(root: &Path, session: &str, account: &str, now: u64) -> fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mailbox = root.join("hermes-bridge");
+    fs::create_dir_all(&mailbox).unwrap();
+    fs::set_permissions(&mailbox, fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = "0123456789abcdef".repeat(4);
+    let record = json!({
+        "schema": 1, "session_id": session, "pane_id": "w9:p1", "profile": "default", "pid": 1,
+        "route": {"epoch": 1, "provider": "openai-codex", "supported": true,
+                  "identity": identity, "account": account, "observed_at": now},
+        "quota": null,
+    });
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    let file = options
+        .open(mailbox.join(format!("{session}.json")))
+        .unwrap();
+    serde_json::to_writer(file, &record).unwrap();
+    let lock = options
+        .open(mailbox.join(format!("{session}.lock")))
+        .unwrap();
+    lock.try_lock().unwrap();
+    lock
+}
+
+#[test]
+fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_account() {
+    use herdr_agent_quota::providers::hermes::chatgpt_account_stamp;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let cache = CacheStore::new(root);
+    cache.set_account_summary(SummaryFormat::Lines).unwrap();
+    let now = CacheStore::now_unix();
+    let windows = vec![
+        UsageWindow::new(
+            WindowKind::FiveHour,
+            20.0,
+            Some(ResetAt::from_unix_seconds(now + 3_600)),
+        )
+        .unwrap(),
+        UsageWindow::new(
+            WindowKind::Weekly,
+            2.0,
+            Some(ResetAt::from_unix_seconds(now + 6 * 86_400)),
+        )
+        .unwrap(),
+    ];
+    cache
+        .save(
+            &ProviderSnapshot::new(Provider::Codex, windows, now)
+                .with_account_id(Some("acc-test-1".to_string())),
+        )
+        .unwrap();
+    // The Codex login the snapshot belongs to; written before the snapshot's
+    // fetch time is irrelevant, the account id is what gates it.
+    fs::write(
+        root.join("codex-auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acc-test-1"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("herdr"), FAKE_HERDR).unwrap();
+    fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
+    let badge = |count: usize| format!("\u{e1aa} {count}");
+
+    // No Hermes session: the Codex row, no badge.
+    let published = refresh_codex(root);
+    assert!(
+        published.contains_key("quota_acct_cx_icon"),
+        "{published:?}"
+    );
+    assert!(
+        !published.contains_key("quota_acct_cx_hermes"),
+        "{published:?}"
+    );
+
+    // Two live sessions on the Codex account, one on another account.
+    let mine = chatgpt_account_stamp("acc-test-1");
+    let first = hermes_session(root, "s1", &mine, now);
+    let second = hermes_session(root, "s2", &mine, now);
+    let other = hermes_session(root, "s3", &chatgpt_account_stamp("acc-test-2"), now);
+    let published = refresh_codex(root);
+    assert_eq!(
+        published.get("quota_acct_cx_hermes"),
+        Some(&badge(2)),
+        "{published:?}"
+    );
+    // Neither the raw account id nor its stamp ever reaches Herdr.
+    let report = fs::read_to_string(root.join("reports/w1")).unwrap();
+    assert!(
+        !report.contains("acc-test-1") && !report.contains(&mine),
+        "{report}"
+    );
+
+    // A session that ends (its producer releases the lock) stops counting.
+    drop(second);
+    assert_eq!(
+        refresh_codex(root).get("quota_acct_cx_hermes"),
+        Some(&badge(1))
+    );
+    drop(first);
+    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
+
+    // Another Codex login: the snapshot no longer proves anything.
+    let _again = hermes_session(root, "s4", &mine, now);
+    fs::write(
+        root.join("codex-auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acc-test-2"}}"#,
+    )
+    .unwrap();
+    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
+    drop(other);
+}

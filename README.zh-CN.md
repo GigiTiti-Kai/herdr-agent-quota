@@ -66,7 +66,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Agent order | 按 Space 分组，组内剩余额度最少优先（默认）；或使用 Herdr 自己的排序 |
 | Low quota alert | 关闭，或设置 1%–100% 的提醒阈值 |
 | Icon size | 侧栏图标小、中（默认）、大。仅 WezTerm：尺寸名写入 WezTerm 配置目录的 `herdr-icon-size.local.json`，应用后按 Ctrl+Shift+R。其他终端保持原有图标大小；正文字号不变 |
-| Account summary | `off`（默认）在每个 agent 行显示额度条。`compact`（3 格条 + 重置时间）、`bars`（4 格条）或 `numbers` 改为在 Agent 面板底部按账号各显示一行；`lines` 则每个额度窗口各占一行并带各自的重置倒计时，标题下及账号之间各空一行。都需要支持 `[ui.sidebar.agents] footer` 的 Herdr；`lines` 还要求 footer 允许 64 行（`MAX_AGENT_FOOTER_ROWS`），旧版客户端遇到超过 16 行的 footer 会拒绝整个配置。已启用的 Claude、Codex、Grok、Agy、Devin、Muse、Cursor 的行按缓存读数发布到每个 workspace，没有运行中的 agent 也会保留（需要 footer 能回退到 workspace token 的 Herdr）；Agy 的行显示最近一次 Agy 读数的窗口，Claude 在 usage API 提供账号级窗口之前仍留在各自的 pane 上；计量型 DS/OR、Hermes、OpenCode Go、omp 的行仍来自各自的 pane。已知限制：Herdr 从该账号第一个带有某行的 pane 填充每条按 pane 发布的行，因此两个窗口数不同的此类 pane 可能在同一块中混合显示 |
+| Account summary | `off`（默认）在每个 agent 行显示额度条。`compact`（3 格条 + 重置时间）、`bars`（4 格条）或 `numbers` 改为在 Agent 面板底部按账号各显示一行；`lines` 则每个额度窗口各占一行并带各自的重置倒计时，标题下及账号之间各空一行。都需要支持 `[ui.sidebar.agents] footer` 的 Herdr；`lines` 还要求 footer 允许 64 行（`MAX_AGENT_FOOTER_ROWS`），旧版客户端遇到超过 16 行的 footer 会拒绝整个配置。已启用的 Claude、Codex、Grok、Agy、Devin、Muse、Cursor 的行按缓存读数发布到每个 workspace，没有运行中的 agent 也会保留（需要 footer 能回退到 workspace token 的 Herdr）；Agy 的行显示最近一次 Agy 读数的窗口，Claude 在 usage API 提供账号级窗口之前仍留在各自的 pane 上；计量型 DS/OR、Hermes、OpenCode Go、omp 的行仍来自各自的 pane；但已证实与 Codex 行使用同一 ChatGPT 账号的 Hermes 会话不再单独占一行，而是在 Codex 行上显示带会话数的 Hermes 徽标。已知限制：Herdr 从该账号第一个带有某行的 pane 填充每条按 pane 发布的行，因此两个窗口数不同的此类 pane 可能在同一块中混合显示 |
 | Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor、Hermes |
 
 方向键或空格修改，`a` 应用，`q` 关闭。脚本配置选项见 `./install.sh --help`。
@@ -107,6 +107,13 @@ Hermes 插件（`~/.hermes/plugins/herdr-agent-quota`），并用 `hermes plugin
 usage 获取逻辑查询当前会话所持的密钥，每个会话最多每分钟一次，再通过一个不含 token 和账号名的
 私有文件把 5h、7d 百分比交给侧栏。`/model` 或账号切换会在几秒内清除额度条，窗格闲置时
 也一样；只有 ChatGPT/Codex 路由才会重新显示。
+
+开启账号汇总时，与 Codex 行使用同一 ChatGPT 账号的 Hermes 会话不再有自己的 footer 行，
+而是在 Codex 行第一行末尾显示 Hermes 徽标：Hermes 标志加上该账号上存活的 Hermes 会话数。
+只有当会话当前 access token 所指的账号就是 Codex 读数所属的账号时才显示；双方只比较账号 ID
+的域分离 sha256，从不比较 ID 本身。使用其他 ChatGPT 账号的 Hermes 会话保留自己的 Hermes 行，
+其他 provider 的会话不显示徽标。Claude 行从不显示徽标：Claude Code 的 statusLine 和 usage
+读数都没有可与 Hermes 凭据比较的账号。bridge 更新前启动的 Hermes 进程在重启前不会报告账号。
 
 原生 Codex、Grok、Devin、Muse、Cursor collector 跟随插件的当前登录，不为每个窗格分别识别账号。
 Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。

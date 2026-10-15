@@ -349,6 +349,8 @@ pub fn overlay(
             ],
             reset: String::new(),
             gap: lines,
+            hermes_badge: None,
+            same_account_as: None,
         });
         // R7: `ses` stays on the agent row (`quota_week_scoped`).
         values.quota_5h.clear();

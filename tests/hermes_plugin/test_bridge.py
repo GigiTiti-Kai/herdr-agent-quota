@@ -6,6 +6,7 @@ by scanning the mailbox directory for those made-up credentials.
 Run: python3 tests/hermes_plugin/test_bridge.py
 """
 
+import base64
 import fcntl
 import importlib.util
 import json
@@ -24,9 +25,24 @@ spec = importlib.util.spec_from_file_location("herdr_agent_quota_bridge", PLUGIN
 bridge_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge_module)
 
+
+def fake_jwt(account_id, signature="fake-signature"):
+    """A made-up access token shaped like a ChatGPT one: only its account claim matters here."""
+    def segment(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    claims = {"sub": "fake-subject", "https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    return ".".join((segment({"alg": "none"}), segment(claims), signature))
+
+
 KEY_A = "fake-token-AAAAAAAAAAAAAAAAAAAAAAAA"
 KEY_B = "fake-token-BBBBBBBBBBBBBBBBBBBBBBBB"
-SECRETS = (KEY_A, KEY_B)
+ACCOUNT_X = "fake-account-XXXXXXXXXXXX"
+ACCOUNT_Y = "fake-account-YYYYYYYYYYYY"
+JWT_X = fake_jwt(ACCOUNT_X)
+JWT_X2 = fake_jwt(ACCOUNT_X, signature="fake-signature-refreshed")
+JWT_Y = fake_jwt(ACCOUNT_Y)
+SECRETS = (KEY_A, KEY_B, ACCOUNT_X, ACCOUNT_Y, JWT_X, JWT_X2, JWT_Y)
 CODEX_BASE = "https://chatgpt.com/backend-api/codex"
 HMAC_KEY = b"k" * 32
 WEEK = [{"kind": "7d", "used_percent": 12.0, "resets_at": 4_000_000_000}]
@@ -181,6 +197,57 @@ class RouteTests(unittest.TestCase):
         signature, _model, secret = bridge_module.read_route(Swapping(), HMAC_KEY)
         self.assertEqual((signature, secret), (bridge_module._UNKNOWN, None))
 
+    def test_the_account_stamp_is_pinned(self):
+        # src/providers/hermes.rs `the_account_stamp_is_pinned` asserts the same digest.
+        self.assertEqual(
+            bridge_module.chatgpt_account_stamp("acc-1"),
+            "b8696038180fa40aecce9f9182a0b8428b6e4d50866868696c6f8368ff59831c",
+        )
+
+    def test_a_codex_token_names_its_account_only_as_a_stamp(self):
+        signature, _model, secret = bridge_module.read_route(FakeAgent(key=JWT_X), HMAC_KEY)
+        self.assertTrue(signature.supported)
+        self.assertEqual(signature.account, bridge_module.chatgpt_account_stamp(ACCOUNT_X))
+        self.assertRegex(signature.account, r"^[0-9a-f]{64}$")
+        self.assertNotIn(ACCOUNT_X, signature.account)
+        self.assertEqual(secret, (CODEX_BASE, JWT_X))
+        # The stamp names the account, not the process: unlike the identity it is comparable.
+        other_process = bridge_module.read_route(FakeAgent(key=JWT_X), b"z" * 32)[0]
+        self.assertEqual(other_process.account, signature.account)
+        self.assertNotEqual(other_process.identity, signature.identity)
+        # A refreshed token for the same account is a new identity with the same account.
+        refreshed = bridge_module.read_route(FakeAgent(key=JWT_X2), HMAC_KEY)[0]
+        self.assertNotEqual(refreshed.identity, signature.identity)
+        self.assertEqual(refreshed.account, signature.account)
+        other = bridge_module.read_route(FakeAgent(key=JWT_Y), HMAC_KEY)[0]
+        self.assertNotEqual(other.account, signature.account)
+
+    def test_a_token_that_names_no_account_has_no_stamp(self):
+        def segment(raw):
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+        no_claim = ".".join(("e30", segment(b'{"sub": "fake-subject"}'), "sig"))
+        empty = fake_jwt("")
+        not_a_string = ".".join(("e30", segment(b'{"https://api.openai.com/auth": {"chatgpt_account_id": 7}}'), "sig"))
+        not_json = ".".join(("e30", segment(b"not json"), "sig"))
+        not_base64 = "e30.@@@@.sig"
+        nested = ".".join(("e30", segment(b"[" * 5000), "sig"))
+        too_long = fake_jwt(ACCOUNT_X, signature="s" * bridge_module.MAX_TOKEN_CHARS)
+        for key in (KEY_A, no_claim, empty, not_a_string, not_json, not_base64, nested, too_long,
+                    "a.b", "a.b.c.d"):
+            self.assertIsNone(bridge_module.token_account_stamp(key), key[:40])
+        signature, _model, secret = bridge_module.read_route(FakeAgent(key=no_claim), HMAC_KEY)
+        self.assertTrue(signature.supported)
+        self.assertIsNone(signature.account)
+        self.assertIsNotNone(secret)
+
+    def test_another_route_never_stamps_an_account(self):
+        for overrides in (dict(provider="anthropic"), dict(base_url="https://relay.example/v1")):
+            signature, _model, _secret = bridge_module.read_route(
+                FakeAgent(key=JWT_X, **overrides), HMAC_KEY
+            )
+            self.assertEqual((signature.supported, signature.account), (False, None))
+
 
 class MailboxTests(BridgeCase):
     def test_the_first_observation_writes_a_route_and_the_first_tick_its_quota(self):
@@ -196,7 +263,9 @@ class MailboxTests(BridgeCase):
         self.assertEqual(
             set(record), {"schema", "session_id", "pane_id", "profile", "pid", "route", "quota"}
         )
-        self.assertEqual(set(record["route"]), {"epoch", "provider", "supported", "identity", "observed_at"})
+        self.assertEqual(set(record["route"]), {"epoch", "provider", "supported", "identity", "account", "observed_at"})
+        # A token that is not a ChatGPT access token names no account.
+        self.assertIsNone(record["route"]["account"])
         self.assertEqual(set(record["quota"]), {"epoch", "identity", "fetched_at", "windows"})
         self.assertEqual((record["schema"], record["session_id"], record["pane_id"]), (1, "s1", "w1:p1"))
         self.assertEqual(record["quota"]["epoch"], record["route"]["epoch"])
@@ -300,6 +369,35 @@ class MailboxTests(BridgeCase):
         record = self.record()
         self.assertEqual(record["route"]["epoch"], 2)
         self.assertIsNone(record["quota"])
+
+    def test_the_record_names_the_live_tokens_account_as_a_stamp(self):
+        self.agents["s1"].set_key(JWT_X)
+        self.bridge.observe("s1")
+        self.bridge.tick()
+        record = self.record()
+        stamp_x = bridge_module.chatgpt_account_stamp(ACCOUNT_X)
+        self.assertEqual(record["route"]["account"], stamp_x)
+        self.assertEqual(record["quota"]["windows"], WEEK)
+        # A refreshed token is a new epoch, still on the same account.
+        self.agents["s1"].set_key(JWT_X2)
+        self.bridge.observe("s1")
+        refreshed = self.record()
+        self.assertEqual(refreshed["route"]["epoch"], 2)
+        self.assertEqual(refreshed["route"]["account"], stamp_x)
+        # The pool moves to another account: the record names that one at once.
+        self.agents["s1"].set_key(JWT_Y, entry_id="entry-2")
+        self.bridge.observe("s1")
+        moved = self.record()
+        self.assertEqual(moved["route"]["epoch"], 3)
+        self.assertEqual(moved["route"]["account"], bridge_module.chatgpt_account_stamp(ACCOUNT_Y))
+        self.assertIsNone(moved["quota"])
+        # Another provider names no account, whatever token the session held before.
+        agent = self.agents["s1"]
+        agent.provider, agent.api_mode = "anthropic", "anthropic_messages"
+        self.bridge.tick()
+        self.assertEqual(
+            (self.record()["route"]["supported"], self.record()["route"]["account"]), (False, None)
+        )
 
     def test_a_provider_switch_records_an_unsupported_route_and_never_fetches_for_it(self):
         self.bridge.observe("s1")

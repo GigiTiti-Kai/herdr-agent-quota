@@ -13,9 +13,16 @@
 //! holds an exclusive lock on `<session id>.lock` for as long as it tracks
 //! the session. A reading is used only when every gate below holds; anything
 //! else is no reading at all, never an older or a neighbouring one.
+//!
+//! A supported route may also carry `account`: [`chatgpt_account_stamp`] of
+//! the ChatGPT account the live access token names. It is the only value in
+//! a record that another process can compare, and it is compared with the
+//! same stamp of the account the Codex snapshot was fetched for, never with
+//! a raw id.
 
 use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub const MAILBOX_DIR: &str = "hermes-bridge";
@@ -29,6 +36,45 @@ const FUTURE_SLACK_SECONDS: u64 = 120;
 /// How long a route check stays good. The producer re-stamps `observed_at`
 /// every 30 seconds while its poller or a hook still looks at the live agent.
 const ROUTE_TTL_SECONDS: u64 = 120;
+/// Mailbox entries one scan looks at. Each live session owns two files, and
+/// the producer prunes what dead ones leave behind.
+const MAX_SCANNED_ENTRIES: usize = 512;
+/// Domain of [`chatgpt_account_stamp`]. The bridge plugin hashes the same
+/// bytes; `the_account_stamp_is_pinned` keeps the two from drifting apart.
+const ACCOUNT_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/chatgpt-account\0";
+
+/// The comparable form of a ChatGPT account id: lowercase hex of
+/// `sha256("herdr-agent-quota/chatgpt-account\0" || account id)`.
+///
+/// The raw id never leaves the process that read it. The bridge stamps the
+/// id its live access token names; this plugin stamps the id the Codex
+/// snapshot was fetched for. Equal stamps are the same account.
+pub fn chatgpt_account_stamp(account_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ACCOUNT_STAMP_DOMAIN);
+    hasher.update(account_id.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// One mailbox record that passed every gate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    pub snapshot: ProviderSnapshot,
+    /// [`chatgpt_account_stamp`] of the account the session's live token
+    /// names, when it names one.
+    pub account: Option<String>,
+}
+
+/// The current route of a record, once its route-level gates hold.
+struct Route {
+    epoch: u64,
+    identity: String,
+    account: Option<String>,
+}
 
 /// The quota of the credential serving `session_id` in `pane_id` right now.
 ///
@@ -41,7 +87,7 @@ pub fn load(
     session_id: &str,
     provider_id: &str,
     now_unix: u64,
-) -> Option<ProviderSnapshot> {
+) -> Option<Reading> {
     if provider_id != BRIDGED_PROVIDER || !is_session_id(session_id) {
         return None;
     }
@@ -49,12 +95,55 @@ pub fn load(
     if !files::is_private_directory(&directory) {
         return None;
     }
+    let record = live_record(&directory, session_id)?;
+    parse_record(&record, pane_id, session_id, provider_id, now_unix)
+}
+
+/// The account stamp of every Hermes session a live producer is watching on
+/// the bridged route right now, one entry per session.
+///
+/// This is what the footer's Hermes badge counts. It reads only this
+/// plugin's own mailbox, never a pane: a session counts while its producer
+/// holds the lock and re-checked its route within [`ROUTE_TTL_SECONDS`],
+/// whichever pane it reports from. A session whose token names no account,
+/// or that is on any other route, is not counted.
+pub fn live_accounts(state: &Path, now_unix: u64) -> Vec<String> {
+    let directory = state.join(MAILBOX_DIR);
+    if !files::is_private_directory(&directory) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<String> = entries
+        .take(MAX_SCANNED_ENTRIES)
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            let session_id = name.strip_suffix(".json")?;
+            is_session_id(session_id).then(|| session_id.to_owned())
+        })
+        .collect();
+    sessions.sort();
+    sessions
+        .iter()
+        .filter_map(|session_id| {
+            let record = live_record(&directory, session_id)?;
+            let pane_id = record
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .filter(|pane| is_pane_id(pane))?;
+            parse_route(&record, pane_id, session_id, BRIDGED_PROVIDER, now_unix)?.account
+        })
+        .collect()
+}
+
+/// The record of `session_id`, only while its producer still holds the lock.
+fn live_record(directory: &Path, session_id: &str) -> Option<Value> {
     if !files::producer_is_alive(&directory.join(format!("{session_id}.lock"))) {
         return None;
     }
     let bytes = files::read_private(&directory.join(format!("{session_id}.json")))?;
-    let record: Value = serde_json::from_slice(&bytes).ok()?;
-    parse_record(&record, pane_id, session_id, provider_id, now_unix)
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Validate one mailbox record against the pane that wants to show it.
@@ -64,7 +153,12 @@ pub fn parse_record(
     session_id: &str,
     provider_id: &str,
     now_unix: u64,
-) -> Option<ProviderSnapshot> {
+) -> Option<Reading> {
+    let Route {
+        epoch,
+        identity,
+        account,
+    } = parse_route(record, pane_id, session_id, provider_id, now_unix)?;
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     let not_future = |value: &Value, key: &str| {
         value
@@ -72,28 +166,6 @@ pub fn parse_record(
             .and_then(Value::as_u64)
             .filter(|time| *time <= now_unix.saturating_add(FUTURE_SLACK_SECONDS))
     };
-    if record.get("schema").and_then(Value::as_u64) != Some(SCHEMA)
-        || text(record, "session_id").as_deref() != Some(session_id)
-        || text(record, "pane_id").as_deref() != Some(pane_id)
-        || text(record, "profile").as_deref() != Some("default")
-    {
-        return None;
-    }
-    let route = record.get("route")?;
-    let epoch = route.get("epoch").and_then(Value::as_u64)?;
-    let identity = text(route, "identity").filter(|identity| is_identity(identity))?;
-    if text(route, "provider").as_deref() != Some(provider_id)
-        || route.get("supported").and_then(Value::as_bool) != Some(true)
-    {
-        return None;
-    }
-    // A producer whose poller died or hangs still holds its lock, but no longer
-    // sees an idle `/model` or account switch. Its last check goes stale; how
-    // long ago the quota itself was fetched does not matter here.
-    let observed_at = not_future(route, "observed_at")?;
-    if now_unix.saturating_sub(observed_at) > ROUTE_TTL_SECONDS {
-        return None;
-    }
     // The quota must have been fetched under the route the producer is on now.
     let quota = record.get("quota").filter(|quota| quota.is_object())?;
     if quota.get("epoch").and_then(Value::as_u64) != Some(epoch)
@@ -124,7 +196,63 @@ pub fn parse_record(
         // Out-of-range or non-finite is a malformed record, not a full bar.
         windows.push(UsageWindow::new(kind, used, resets_at).ok()?);
     }
-    Some(ProviderSnapshot::new(Provider::Hermes, windows, fetched_at))
+    Some(Reading {
+        snapshot: ProviderSnapshot::new(Provider::Hermes, windows, fetched_at),
+        account,
+    })
+}
+
+/// The route-level gates: who the record is for, and the route its producer
+/// checked recently. The quota is not looked at.
+fn parse_route(
+    record: &Value,
+    pane_id: &str,
+    session_id: &str,
+    provider_id: &str,
+    now_unix: u64,
+) -> Option<Route> {
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    if record.get("schema").and_then(Value::as_u64) != Some(SCHEMA)
+        || text(record, "session_id").as_deref() != Some(session_id)
+        || text(record, "pane_id").as_deref() != Some(pane_id)
+        || text(record, "profile").as_deref() != Some("default")
+    {
+        return None;
+    }
+    let route = record.get("route")?;
+    let epoch = route.get("epoch").and_then(Value::as_u64)?;
+    let identity = text(route, "identity").filter(|identity| is_identity(identity))?;
+    if text(route, "provider").as_deref() != Some(provider_id)
+        || route.get("supported").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    // A producer whose poller died or hangs still holds its lock, but no longer
+    // sees an idle `/model` or account switch. Its last check goes stale; how
+    // long ago the quota itself was fetched does not matter here.
+    let observed_at = route
+        .get("observed_at")
+        .and_then(Value::as_u64)
+        .filter(|time| *time <= now_unix.saturating_add(FUTURE_SLACK_SECONDS))?;
+    if now_unix.saturating_sub(observed_at) > ROUTE_TTL_SECONDS {
+        return None;
+    }
+    // Absent from records written before the stamp existed, and null when the
+    // token names no account. Anything else that is not a stamp is malformed.
+    let account = match route.get("account") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|stamp| is_identity(stamp))?
+                .to_owned(),
+        ),
+    };
+    Some(Route {
+        epoch,
+        identity,
+        account,
+    })
 }
 
 /// A Hermes session id that is safe to use as a file name.
@@ -134,6 +262,15 @@ fn is_session_id(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The pane id shape the producer accepts from `HERDR_PANE_ID`.
+fn is_pane_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'))
 }
 
 fn is_identity(value: &str) -> bool {
@@ -272,11 +409,117 @@ mod tests {
     const NOW: u64 = 2_000;
 
     fn parsed(record: &Value) -> Option<ProviderSnapshot> {
-        parse_record(record, "w1:p1", "s1", BRIDGED_PROVIDER, NOW)
+        parse_record(record, "w1:p1", "s1", BRIDGED_PROVIDER, NOW).map(|reading| reading.snapshot)
     }
 
     fn loaded(state: &Path) -> Option<ProviderSnapshot> {
-        load(state, "w1:p1", "s1", BRIDGED_PROVIDER, NOW)
+        load(state, "w1:p1", "s1", BRIDGED_PROVIDER, NOW).map(|reading| reading.snapshot)
+    }
+
+    /// The bridge plugin hashes the same bytes (`test_the_account_stamp_is_pinned`
+    /// in `tests/hermes_plugin/test_bridge.py` asserts this exact digest). If
+    /// either side changes, every badge silently stops matching.
+    #[test]
+    fn the_account_stamp_is_pinned() {
+        assert_eq!(
+            chatgpt_account_stamp("acc-1"),
+            "b8696038180fa40aecce9f9182a0b8428b6e4d50866868696c6f8368ff59831c"
+        );
+        assert_ne!(
+            chatgpt_account_stamp("acc-1"),
+            chatgpt_account_stamp("acc-2")
+        );
+        assert!(!chatgpt_account_stamp("acc-1").contains("acc-1"));
+    }
+
+    /// A route names its account only as a stamp. A record written before the
+    /// stamp existed, or for a token that names no account, still reads; a
+    /// value that is not a stamp is a malformed record.
+    #[test]
+    fn a_route_names_its_account_only_as_a_stamp() {
+        let read = |account: Option<Value>| {
+            let mut value = record("w1:p1", "s1", 12.0);
+            match account {
+                Some(account) => value["route"]["account"] = account,
+                None => {
+                    value["route"].as_object_mut().unwrap().remove("account");
+                }
+            }
+            parse_record(&value, "w1:p1", "s1", BRIDGED_PROVIDER, NOW)
+        };
+        let stamp = chatgpt_account_stamp("acc-1");
+        assert_eq!(
+            read(Some(json!(stamp))).expect("reading").account,
+            Some(stamp)
+        );
+        assert_eq!(read(Some(Value::Null)).expect("reading").account, None);
+        assert_eq!(read(None).expect("reading").account, None);
+        for malformed in [
+            json!("acc-1"),
+            json!("short"),
+            json!(IDENTITY.to_uppercase()),
+            json!(5),
+            json!({"id": "acc-1"}),
+        ] {
+            assert!(read(Some(malformed.clone())).is_none(), "{malformed}");
+        }
+    }
+
+    /// The badge counts sessions, not panes: every live producer on the
+    /// bridged route whose token names an account, whatever its quota.
+    #[test]
+    fn live_accounts_are_the_stamps_of_live_bridged_sessions() {
+        let state = tempfile::tempdir().unwrap();
+        let a = chatgpt_account_stamp("acc-1");
+        let b = chatgpt_account_stamp("acc-2");
+        let with = |pane: &str, session: &str, account: Option<&str>| {
+            let mut value = record(pane, session, 12.0);
+            value["route"]["account"] = account.map_or(Value::Null, |stamp| json!(stamp));
+            value
+        };
+        let mut producers = Vec::new();
+        producers.push(write(state.path(), "s1", &with("w1:p1", "s1", Some(&a))));
+        // Another pane on the same account, with no quota fetched yet.
+        let mut fresh = with("w2:p4", "s2", Some(&a));
+        fresh["quota"] = Value::Null;
+        producers.push(write(state.path(), "s2", &fresh));
+        producers.push(write(state.path(), "s3", &with("w1:p2", "s3", Some(&b))));
+        // A token that names no account is a session, but not an account.
+        producers.push(write(state.path(), "s4", &with("w1:p3", "s4", None)));
+        // Another route never counts, whatever it carries.
+        let mut other = with("w1:p5", "s5", Some(&a));
+        other["route"]["provider"] = json!("anthropic");
+        producers.push(write(state.path(), "s5", &other));
+        // A route nobody re-checked lately.
+        let mut stale = with("w1:p6", "s6", Some(&a));
+        stale["route"]["observed_at"] = json!(NOW - ROUTE_TTL_SECONDS - 1);
+        producers.push(write(state.path(), "s6", &stale));
+        // A record whose session id is not its file name.
+        let mut renamed = with("w1:p7", "s1", Some(&a));
+        renamed["session_id"] = json!("s1");
+        producers.push(write(state.path(), "s7", &renamed));
+        // A producer that went away.
+        drop(write(state.path(), "s8", &with("w1:p8", "s8", Some(&a))));
+
+        assert_eq!(live_accounts(state.path(), NOW), vec![a.clone(), a, b]);
+        drop(producers);
+        assert!(live_accounts(state.path(), NOW).is_empty());
+    }
+
+    #[test]
+    fn live_accounts_need_a_private_mailbox() {
+        let state = tempfile::tempdir().unwrap();
+        assert!(live_accounts(state.path(), NOW).is_empty());
+        let mut value = record("w1:p1", "s1", 12.0);
+        value["route"]["account"] = json!(chatgpt_account_stamp("acc-1"));
+        let _producer = write(state.path(), "s1", &value);
+        assert_eq!(live_accounts(state.path(), NOW).len(), 1);
+        let directory = state.path().join(MAILBOX_DIR);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(live_accounts(state.path(), NOW).is_empty());
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(directory.join("s1.json"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(live_accounts(state.path(), NOW).is_empty());
     }
 
     #[test]
