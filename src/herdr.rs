@@ -1589,6 +1589,9 @@ pub(crate) fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String
         &format!("quota_acct_{id}_reset"),
         &account.reset,
     );
+    if let Some(badge) = &account.hermes_badge {
+        tokens.insert(format!("quota_acct_{id}_hermes"), badge.clone());
+    }
     if account.gap {
         tokens.insert(format!("quota_acct_{id}_gap"), "\u{2800}".to_string());
     }

@@ -386,6 +386,7 @@ name = "herdr-agent-quota"
 version = "1.6.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "crossterm",
  "directories",

@@ -1374,6 +1374,9 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
             // The blank row keeps tall provider marks from overlapping.
             for slot in 1..=3 {
                 append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
+                if slot == 1 {
+                    append_hermes_badge(&mut row, id);
+                }
                 rows.push(Value::Array(std::mem::take(&mut row)));
             }
             rows.push(Value::Array(styled_row(
@@ -1393,9 +1396,24 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
             Some(false),
             Some(true),
         ));
+        append_hermes_badge(&mut row, id);
         rows.push(Value::Array(row));
     }
     rows
+}
+
+/// The Hermes badge goes last on an account's first footer line, inked like
+/// the footer marks. Only rows that can be proven to share a live Hermes
+/// session's account carry the token (`AccountFamily::HERMES_BADGED`).
+fn append_hermes_badge(row: &mut Array, id: &str) {
+    if AccountFamily::HERMES_BADGED.contains(&id) {
+        row.push(styled_token(
+            &format!("$quota_acct_{id}_hermes"),
+            Some(IDLE_ICON_COLOR),
+            Some(false),
+            Some(false),
+        ));
+    }
 }
 
 fn has_footer_marker(table: &Table) -> bool {
@@ -3514,10 +3532,45 @@ mod field_tests {
             let at = 2 + 4 * index;
             let mut first = vec![format!("$quota_acct_{id}_icon")];
             first.extend(windows(id, 1));
+            // The Hermes badge ends the first line of an account that can carry it.
+            if AccountFamily::HERMES_BADGED.contains(&id) {
+                first.push(format!("$quota_acct_{id}_hermes"));
+            }
             assert_eq!(rows[at], first, "{id}");
             assert_eq!(rows[at + 1], windows(id, 2), "{id}");
             assert_eq!(rows[at + 2], windows(id, 3), "{id}");
             assert_eq!(rows[at + 3], [format!("$quota_acct_{id}_gap")], "{id}");
+        }
+    }
+
+    /// Only the Codex row can carry the Hermes badge, last on its row in
+    /// every format, inked like the footer marks; the Hermes row itself stays
+    /// for a Hermes session whose account no other row shows.
+    #[test]
+    fn only_the_codex_footer_row_carries_the_hermes_badge() {
+        for summary in SummaryFormat::CHOICES.into_iter().filter(|s| s.is_on()) {
+            let (updated, rows) = written_footer(summary);
+            let carriers: Vec<&Vec<String>> = rows
+                .iter()
+                .filter(|row| row.iter().any(|token| token.ends_with("_hermes")))
+                .collect();
+            assert_eq!(carriers.len(), 1, "{summary:?}: {carriers:?}");
+            assert_eq!(
+                carriers[0].last().map(String::as_str),
+                Some("$quota_acct_cx_hermes"),
+                "{summary:?}"
+            );
+            assert!(
+                carriers[0].contains(&"$quota_acct_cx_icon".to_string()),
+                "{summary:?}"
+            );
+            assert!(updated.contains("$quota_acct_hm_icon"), "{summary:?}");
+            let badge = updated
+                .split("{ token = \"$quota_acct_cx_hermes\"")
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("{summary:?}: {updated}"));
+            assert!(badge.contains(IDLE_ICON_COLOR), "{badge}");
         }
     }
 

@@ -14,6 +14,9 @@ exclude = ["docs/screenshots/*", "docs/research/*", ".github/*", ".devin/*"]
 
 [dependencies]
 anyhow = "1.0"
+# Decodes the claims of the Codex login's access token (JWT payload) to name
+# its ChatGPT principal; already in the tree through ureq.
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 directories = "5.0"

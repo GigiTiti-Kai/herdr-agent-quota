@@ -725,6 +725,90 @@ pub fn account_id_from_auth(path: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Who the current Codex login is, as far as a Hermes badge needs to know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginPrincipal {
+    /// The ChatGPT account id the access token's claim names. The Codex
+    /// snapshot is stamped with the same id when it belongs to this login.
+    pub account_id: String,
+    /// [`crate::providers::hermes::chatgpt_principal_stamp`] of that account
+    /// and the token's user (`sub`). Never written anywhere.
+    pub stamp: String,
+}
+
+pub fn current_login_principal() -> Option<LoginPrincipal> {
+    login_principal_from_auth(&auth_path().ok()?)
+}
+
+/// The principal the current Codex login's access token names.
+///
+/// The token is read only to decode its claims (the JWT payload; the
+/// signature is not checked, the claims only name the login) and is dropped
+/// at once. Members of one ChatGPT workspace share `tokens.account_id`, so
+/// the account id alone cannot tell two seats apart; the token's `sub` can.
+/// A token whose account claim disagrees with `tokens.account_id`, or that
+/// names no user, names no principal.
+pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
+    #[derive(Deserialize)]
+    struct AuthTokens {
+        tokens: Option<Tokens>,
+    }
+
+    #[derive(Deserialize)]
+    struct Tokens {
+        #[serde(default)]
+        account_id: Option<String>,
+        #[serde(default, alias = "chatgptAccountId")]
+        chatgpt_account_id: Option<String>,
+        #[serde(default)]
+        access_token: Option<String>,
+    }
+
+    let auth: AuthTokens =
+        serde_json::from_reader(BufReader::new(fs::File::open(path).ok()?)).ok()?;
+    let tokens = auth.tokens?;
+    // The same id `account_id_from_auth` stamps the Codex snapshot with.
+    let account_id = tokens
+        .account_id
+        .or(tokens.chatgpt_account_id)
+        .filter(|value| !value.is_empty())?;
+    let claims = tokens.access_token.as_deref().and_then(jwt_claims)?;
+    let claimed = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)?;
+    let subject = claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|subject| !subject.is_empty())?;
+    (claimed == account_id).then(|| LoginPrincipal {
+        stamp: crate::providers::hermes::chatgpt_principal_stamp(&account_id, subject),
+        account_id,
+    })
+}
+
+/// The claims of a JWT, without checking its signature. `None` for anything
+/// that is not one.
+fn jwt_claims(token: &str) -> Option<Value> {
+    use base64::Engine as _;
+    const MAX_TOKEN_BYTES: usize = 16 * 1024;
+    if token.len() > MAX_TOKEN_BYTES {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let (Some(_header), Some(payload), Some(_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .filter(Value::is_object)
+}
+
 fn account_id_from_rpc(value: &Value) -> Option<String> {
     let result = value.get("result").unwrap_or(value);
     let account = result.get("account").unwrap_or(result);
@@ -851,6 +935,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(account_id_from_auth(&path).as_deref(), Some("acc-1"));
+    }
+
+    fn fake_access_token(claims: &serde_json::Value) -> String {
+        use base64::Engine as _;
+        let encode = |value: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        format!(
+            "{}.{}.fake-signature",
+            encode(&serde_json::json!({"alg": "none"})),
+            encode(claims)
+        )
+    }
+
+    fn write_auth(path: &Path, account_id: &str, access_token: &str) {
+        fs::write(
+            path,
+            serde_json::json!({"auth_mode": "chatgpt", "tokens": {
+                "account_id": account_id, "access_token": access_token,
+                "refresh_token": "fake-refresh"}})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The login's principal is the account id the snapshot is stamped with
+    /// plus the token's user, so two seats of one workspace differ.
+    #[test]
+    fn the_login_principal_is_the_tokens_account_and_user() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let claims = |account: &str, subject: Option<&str>| {
+            let mut claims = serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": account}
+            });
+            if let Some(subject) = subject {
+                claims["sub"] = serde_json::json!(subject);
+            }
+            fake_access_token(&claims)
+        };
+        write_auth(&path, "acc-1", &claims("acc-1", Some("user-1")));
+        let principal = login_principal_from_auth(&path).expect("principal");
+        assert_eq!(principal.account_id, "acc-1");
+        assert_eq!(
+            principal.stamp,
+            crate::providers::hermes::chatgpt_principal_stamp("acc-1", "user-1")
+        );
+        write_auth(&path, "acc-1", &claims("acc-1", Some("user-2")));
+        assert_ne!(
+            login_principal_from_auth(&path).unwrap().stamp,
+            principal.stamp
+        );
+
+        // The token names another account than the login records, or no user.
+        write_auth(&path, "acc-1", &claims("acc-2", Some("user-1")));
+        assert_eq!(login_principal_from_auth(&path), None);
+        write_auth(&path, "acc-1", &claims("acc-1", None));
+        assert_eq!(login_principal_from_auth(&path), None);
+        write_auth(&path, "acc-1", &claims("acc-1", Some("")));
+        assert_eq!(login_principal_from_auth(&path), None);
+        // Not a JWT at all, or not one whose payload is an object.
+        for token in [
+            "secret",
+            "a.b",
+            "a.@@@.c",
+            "a.b.c.d",
+            "x..y",
+            &format!("x.{}.y", {
+                use base64::Engine as _;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("[1]")
+            }),
+            &"x".repeat(17 * 1024),
+        ] {
+            write_auth(&path, "acc-1", token);
+            assert_eq!(
+                login_principal_from_auth(&path),
+                None,
+                "{}",
+                &token[..token.len().min(20)]
+            );
+        }
+        // No login at all.
+        assert_eq!(
+            login_principal_from_auth(&directory.path().join("absent.json")),
+            None
+        );
     }
 
     #[test]
