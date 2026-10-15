@@ -207,7 +207,7 @@ fn refresh_codex(root: &Path) -> BTreeMap<String, String> {
 
 /// A bridge record for `session`, as the Hermes plugin writes it, held by a
 /// live producer for as long as the returned lock is open.
-fn hermes_session(root: &Path, session: &str, account: &str, now: u64) -> fs::File {
+fn hermes_session(root: &Path, session: &str, principal: &str, now: u64) -> fs::File {
     use std::os::unix::fs::OpenOptionsExt;
     let mailbox = root.join("hermes-bridge");
     fs::create_dir_all(&mailbox).unwrap();
@@ -216,7 +216,7 @@ fn hermes_session(root: &Path, session: &str, account: &str, now: u64) -> fs::Fi
     let record = json!({
         "schema": 1, "session_id": session, "pane_id": "w9:p1", "profile": "default", "pid": 1,
         "route": {"epoch": 1, "provider": "openai-codex", "supported": true,
-                  "identity": identity, "account": account, "observed_at": now},
+                  "identity": identity, "principal": principal, "observed_at": now},
         "quota": null,
     });
     let mut options = fs::OpenOptions::new();
@@ -232,9 +232,31 @@ fn hermes_session(root: &Path, session: &str, account: &str, now: u64) -> fs::Fi
     lock
 }
 
+/// A Codex `auth.json` for `account_id` whose made-up access token names
+/// `account_id` and `subject` in its claims.
+fn codex_login(root: &Path, account_id: &str, subject: &str) {
+    use base64::Engine as _;
+    let encode = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+    };
+    let token = format!(
+        "{}.{}.fake-signature",
+        encode(json!({"alg": "none"})),
+        encode(json!({"sub": subject,
+                      "https://api.openai.com/auth": {"chatgpt_account_id": account_id}}))
+    );
+    fs::write(
+        root.join("codex-auth.json"),
+        json!({"auth_mode": "chatgpt",
+               "tokens": {"account_id": account_id, "access_token": token}})
+        .to_string(),
+    )
+    .unwrap();
+}
+
 #[test]
-fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_account() {
-    use herdr_agent_quota::providers::hermes::chatgpt_account_stamp;
+fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() {
+    use herdr_agent_quota::providers::hermes::chatgpt_principal_stamp;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let cache = CacheStore::new(root);
@@ -260,13 +282,8 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_account(
                 .with_account_id(Some("acc-test-1".to_string())),
         )
         .unwrap();
-    // The Codex login the snapshot belongs to; written before the snapshot's
-    // fetch time is irrelevant, the account id is what gates it.
-    fs::write(
-        root.join("codex-auth.json"),
-        r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acc-test-1"}}"#,
-    )
-    .unwrap();
+    // The Codex login the snapshot belongs to.
+    codex_login(root, "acc-test-1", "user-test-1");
     fs::write(root.join("herdr"), FAKE_HERDR).unwrap();
     fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
     let badge = |count: usize| format!("\u{e1aa} {count}");
@@ -282,23 +299,30 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_account(
         "{published:?}"
     );
 
-    // Two live sessions on the Codex account, one on another account.
-    let mine = chatgpt_account_stamp("acc-test-1");
+    // Two live sessions on the Codex login; one on another seat of the same
+    // workspace (same account id, own quota), one on another account.
+    let mine = chatgpt_principal_stamp("acc-test-1", "user-test-1");
     let first = hermes_session(root, "s1", &mine, now);
     let second = hermes_session(root, "s2", &mine, now);
-    let other = hermes_session(root, "s3", &chatgpt_account_stamp("acc-test-2"), now);
+    let teammate = chatgpt_principal_stamp("acc-test-1", "user-test-2");
+    let seat = hermes_session(root, "s3", &teammate, now);
+    let other = hermes_session(
+        root,
+        "s5",
+        &chatgpt_principal_stamp("acc-test-2", "user-test-1"),
+        now,
+    );
     let published = refresh_codex(root);
     assert_eq!(
         published.get("quota_acct_cx_hermes"),
         Some(&badge(2)),
         "{published:?}"
     );
-    // Neither the raw account id nor its stamp ever reaches Herdr.
+    // Neither the raw ids nor the stamp ever reach Herdr.
     let report = fs::read_to_string(root.join("reports/w1")).unwrap();
-    assert!(
-        !report.contains("acc-test-1") && !report.contains(&mine),
-        "{report}"
-    );
+    for secret in ["acc-test-1", "user-test-1", "fake-signature", mine.as_str()] {
+        assert!(!report.contains(secret), "{report}");
+    }
 
     // A session that ends (its producer releases the lock) stops counting.
     drop(second);
@@ -309,13 +333,20 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_account(
     drop(first);
     assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
 
-    // Another Codex login: the snapshot no longer proves anything.
-    let _again = hermes_session(root, "s4", &mine, now);
-    fs::write(
-        root.join("codex-auth.json"),
-        r#"{"auth_mode":"chatgpt","tokens":{"account_id":"acc-test-2"}}"#,
-    )
-    .unwrap();
+    // The Codex CLI logs in as the teammate: the snapshot's account still
+    // matches, but the login is another seat, so the session no longer counts
+    // and the teammate's does.
+    let again = hermes_session(root, "s4", &mine, now);
+    codex_login(root, "acc-test-1", "user-test-2");
+    assert_eq!(
+        refresh_codex(root).get("quota_acct_cx_hermes"),
+        Some(&badge(1))
+    );
+    drop(seat);
     assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
-    drop(other);
+
+    // Another account: the snapshot no longer proves anything.
+    codex_login(root, "acc-test-2", "user-test-1");
+    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
+    drop((again, other));
 }

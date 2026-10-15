@@ -7,9 +7,9 @@ credential a new session would pick" cannot be attributed to a running one. This
 inside the Hermes process, where the live agent is, and asks Hermes's own account-usage fetcher
 about exactly the key that agent holds. The result goes to a per-session mailbox file the quota
 plugin reads. Nothing secret is written: no token, no email, no credential label, no provider
-response, no raw account id. The ChatGPT account the live token names is written only as a
-domain-separated sha256 (`account`), so the quota plugin can tell whether this session bills the
-same account as its Codex row without either side revealing the id.
+response, no raw account or user id. The ChatGPT account and user (`sub`) the live token names
+are written only as one domain-separated sha256 (`principal`), so the quota plugin can tell
+whether this session bills the same seat as its Codex row without either side revealing them.
 
 Scope, on purpose:
 
@@ -77,10 +77,10 @@ MISSING_TICKS_BEFORE_DROP = 30
 MAX_REMEMBERED_ATTEMPTS = 16
 MAX_BRIDGE_CONFIG_BYTES = 4096
 PRUNE_AFTER_SECONDS = 60 * 60.0
-# `account` stamps: sha256(domain || chatgpt_account_id). The quota plugin hashes the account id
-# its Codex snapshot was fetched for with the same domain (`chatgpt_account_stamp` in
-# src/providers/hermes.rs); both sides pin the digest of "acc-1" in a test.
-ACCOUNT_STAMP_DOMAIN = b"herdr-agent-quota/chatgpt-account\0"
+# `principal` stamps: sha256(domain || chatgpt_account_id || 0x00 || sub). The quota plugin hashes
+# the Codex login's account and user the same way (`chatgpt_principal_stamp` in
+# src/providers/hermes.rs); both sides pin the digest of ("acc-1", "user-1") in a test.
+PRINCIPAL_STAMP_DOMAIN = b"herdr-agent-quota/chatgpt-principal\0"
 OPENAI_AUTH_CLAIM = "https://api.openai.com/auth"
 # Far above any access token; a longer value is not decoded at all.
 MAX_TOKEN_CHARS = 16 * 1024
@@ -91,10 +91,10 @@ _MISSING = object()
 
 
 class _Signature(tuple):
-    """What identifies a route for epoch purposes: (provider, supported, identity, account).
+    """What identifies a route for epoch purposes: (provider, supported, identity, principal).
 
-    `account` is derived from the same token as `identity`, so it never changes on its own; it is
-    carried here so that the record written for an epoch always names that epoch's account.
+    `principal` is derived from the same token as `identity`, so it never changes on its own; it
+    is carried here so that the record written for an epoch always names that epoch's principal.
     """
 
     __slots__ = ()
@@ -102,7 +102,7 @@ class _Signature(tuple):
     provider = property(lambda self: self[0])
     supported = property(lambda self: self[1])
     identity = property(lambda self: self[2])
-    account = property(lambda self: self[3])
+    principal = property(lambda self: self[3])
 
 
 _UNKNOWN = _Signature((None, False, None, None))
@@ -137,18 +137,21 @@ def _is_supported_endpoint(base_url):
         return False
 
 
-def chatgpt_account_stamp(account_id):
-    """The comparable form of a ChatGPT account id. The id itself is never written anywhere."""
-    return hashlib.sha256(ACCOUNT_STAMP_DOMAIN + account_id.encode("utf-8")).hexdigest()
+def chatgpt_principal_stamp(account_id, subject):
+    """The comparable form of a ChatGPT principal. Neither id is ever written anywhere."""
+    material = account_id.encode("utf-8") + b"\0" + subject.encode("utf-8")
+    return hashlib.sha256(PRINCIPAL_STAMP_DOMAIN + material).hexdigest()
 
 
-def token_account_stamp(api_key):
-    """The stamp of the ChatGPT account this access token names, or None.
+def token_principal_stamp(api_key):
+    """The stamp of the ChatGPT account and user this access token names, or None.
 
     The account is the token's own `chatgpt_account_id` claim: the value Hermes sends as the
-    `ChatGPT-Account-ID` header of every Codex request made with this token. The signature is not
-    checked; the claim only names an account, and the token is what the backend authenticates.
-    A value that is not such a token names nothing.
+    `ChatGPT-Account-ID` header of every Codex request made with this token. Members of one
+    workspace share it but each has their own quota, so the user (`sub`) is part of the stamp,
+    the same (account, sub) pair Hermes uses to tell two Codex credentials apart. The signature
+    is not checked; the claims only name the principal, and the token is what the backend
+    authenticates. A value that is not such a token names nothing.
     """
     if not isinstance(api_key, str) or len(api_key) > MAX_TOKEN_CHARS:
         return None
@@ -161,11 +164,14 @@ def token_account_stamp(api_key):
     # binascii.Error and JSONDecodeError are ValueErrors; absurd nesting is a RecursionError.
     except (ValueError, UnicodeError, RecursionError):
         return None
-    auth = claims.get(OPENAI_AUTH_CLAIM) if isinstance(claims, dict) else None
-    account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
-    if not isinstance(account, str) or not account:
+    if not isinstance(claims, dict):
         return None
-    return chatgpt_account_stamp(account)
+    auth = claims.get(OPENAI_AUTH_CLAIM)
+    account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
+    subject = claims.get("sub")
+    if not isinstance(account, str) or not account or not isinstance(subject, str) or not subject:
+        return None
+    return chatgpt_principal_stamp(account, subject)
 
 
 def read_route(agent, hmac_key):
@@ -201,8 +207,8 @@ def read_route(agent, hmac_key):
     entry = entry_id if isinstance(entry_id, str) else ""
     material = "\0".join((provider, api_mode, base_url.rstrip("/"), entry, api_key))
     identity = hmac.new(hmac_key, material.encode("utf-8"), hashlib.sha256).hexdigest()
-    account = token_account_stamp(api_key)
-    return _Signature((provider, True, identity, account)), model, (base_url, api_key)
+    principal = token_principal_stamp(api_key)
+    return _Signature((provider, True, identity, principal)), model, (base_url, api_key)
 
 
 def _live_agents():
@@ -568,7 +574,7 @@ class Bridge:
                 "provider": signature.provider,
                 "supported": signature.supported,
                 "identity": signature.identity,
-                "account": signature.account,
+                "principal": signature.principal,
                 "observed_at": int(self._now()),
             },
             "quota": session.quota,

@@ -402,10 +402,10 @@ fn hermes_resolved_is_stale(
 /// What the bridge mailbox says the credential serving this pane's session
 /// has left, or `None` when any link in that proof is missing.
 ///
-/// When the session's live token names the same ChatGPT account the Codex
-/// snapshot was fetched for, the footer row is marked as that account's
-/// (`same_account_as`); the publish pass drops it once the Codex row on the
-/// workspace carries the Hermes badge.
+/// When the session's live token names the same ChatGPT account and user as
+/// the Codex login the Codex snapshot belongs to, the footer row is marked
+/// as that row's (`same_account_as`); the publish pass drops it once the
+/// Codex row on the workspace carries the Hermes badge.
 fn hermes_bridge_tokens(
     cache: &CacheStore,
     pane: &AgentPane,
@@ -421,26 +421,36 @@ fn hermes_bridge_tokens(
         now,
     )?;
     let mut values = tokens_for_provider(Some(&reading.snapshot), now, None, row)?;
-    if values.account.is_some() && reading.account.is_some() {
+    if values.account.is_some() && reading.principal.is_some() {
         let codex = load_usable_snapshot(cache, Provider::Codex).ok().flatten();
-        mark_same_account(&mut values, reading.account.as_deref(), codex.as_ref());
+        let login = codex
+            .as_ref()
+            .and_then(|_| codex::current_login_principal());
+        mark_same_account(
+            &mut values,
+            reading.principal.as_deref(),
+            codex.as_ref(),
+            login.as_ref(),
+        );
     }
     Some(values)
 }
 
-/// Mark a Hermes pane's footer row as the Codex account's when the session's
-/// live token names the account the usable Codex snapshot was fetched for.
+/// Mark a Hermes pane's footer row as the Codex row's when the session's live
+/// token names the same principal as the Codex login the usable Codex
+/// snapshot belongs to.
 fn mark_same_account(
     values: &mut MetadataTokens,
-    session_account: Option<&str>,
+    session_principal: Option<&str>,
     codex: Option<&ProviderSnapshot>,
+    login: Option<&codex::LoginPrincipal>,
 ) {
     let Some(account) = values.account.as_mut() else {
         return;
     };
-    let codex_account = codex.and_then(snapshot_account_stamp);
-    account.same_account_as = session_account
-        .filter(|stamp| codex_account.as_deref() == Some(*stamp))
+    let codex_row = codex.and_then(|codex| codex_row_stamp(codex, login));
+    account.same_account_as = session_principal
+        .filter(|stamp| codex_row.as_deref() == Some(*stamp))
         .map(|_| AccountFamily::for_provider(Provider::Codex).id);
 }
 
@@ -1865,39 +1875,45 @@ fn desired_workspace_summary(
 }
 
 /// How many live Hermes sessions are proven to bill each footer row's
-/// account. A session counts only when the account stamp its own process
-/// published equals the stamp of the account the row's snapshot was fetched
-/// for. Only the Codex row has such an account (`AccountFamily::HERMES_BADGED`);
+/// account. A session counts only when the principal stamp its own process
+/// published equals the stamp of the Codex login the row's snapshot belongs
+/// to. Only the Codex row has such a login (`AccountFamily::HERMES_BADGED`);
 /// nothing is counted while Hermes is not an enabled agent.
 fn hermes_sessions_by_provider(
     cache: &CacheStore,
     snapshots: &[ProviderSnapshot],
     now: u64,
 ) -> Vec<(Provider, usize)> {
-    if !AgentSelection::from_args_or_env(&[]).contains(&Harness::Hermes) {
+    if !AgentSelection::from_args_or_env(&[]).contains(&Harness::Hermes)
+        || !snapshots
+            .iter()
+            .any(|snapshot| snapshot.provider == Provider::Codex)
+    {
         return Vec::new();
     }
-    hermes_sessions_on_rows(snapshots, || {
-        crate::providers::hermes::live_accounts(cache.root(), now)
+    let login = codex::current_login_principal();
+    hermes_sessions_on_rows(snapshots, login.as_ref(), || {
+        crate::providers::hermes::live_principals(cache.root(), now)
     })
 }
 
 /// [`hermes_sessions_by_provider`] once Hermes is known to be enabled. The
-/// mailbox is scanned only when a row has an account to compare with.
+/// mailbox is scanned only when a row has a principal to compare with.
 fn hermes_sessions_on_rows(
     snapshots: &[ProviderSnapshot],
-    live_accounts: impl FnOnce() -> Vec<String>,
+    login: Option<&codex::LoginPrincipal>,
+    live_principals: impl FnOnce() -> Vec<String>,
 ) -> Vec<(Provider, usize)> {
     let Some(codex) = snapshots
         .iter()
         .find(|snapshot| snapshot.provider == Provider::Codex)
-        .and_then(snapshot_account_stamp)
+        .and_then(|snapshot| codex_row_stamp(snapshot, login))
     else {
         return Vec::new();
     };
-    let sessions = live_accounts()
+    let sessions = live_principals()
         .iter()
-        .filter(|account| **account == codex)
+        .filter(|principal| **principal == codex)
         .count();
     if sessions == 0 {
         return Vec::new();
@@ -1905,14 +1921,18 @@ fn hermes_sessions_on_rows(
     vec![(Provider::Codex, sessions)]
 }
 
-/// The comparable stamp of the account a footer row's snapshot was fetched
-/// for. Codex snapshots carry the ChatGPT account id; no other row has an
-/// account a Hermes session could be compared with.
-fn snapshot_account_stamp(snapshot: &ProviderSnapshot) -> Option<String> {
-    (snapshot.provider == Provider::Codex)
-        .then_some(snapshot.account_id.as_deref())
-        .flatten()
-        .map(crate::providers::hermes::chatgpt_account_stamp)
+/// The principal stamp of the Codex row: the current Codex login's, but only
+/// when the Codex snapshot is stamped with that login's account. An
+/// unstamped snapshot, a snapshot of another account, or a login whose token
+/// names no principal proves nothing.
+fn codex_row_stamp(
+    snapshot: &ProviderSnapshot,
+    login: Option<&codex::LoginPrincipal>,
+) -> Option<String> {
+    let login = login?;
+    (snapshot.provider == Provider::Codex
+        && snapshot.account_id.as_deref() == Some(login.account_id.as_str()))
+    .then(|| login.stamp.clone())
 }
 
 /// Rendered by the same path a pane used, account-level windows only. Whole
@@ -2473,36 +2493,58 @@ mod tests {
         codex
     }
 
-    /// Live Hermes sessions count toward a row only by account stamp, and
-    /// only the Codex row has an account to compare. An unstamped Codex
-    /// snapshot proves nothing, and the mailbox is not even scanned for it.
+    fn login(account: &str, subject: &str) -> codex::LoginPrincipal {
+        codex::LoginPrincipal {
+            account_id: account.to_string(),
+            stamp: crate::providers::hermes::chatgpt_principal_stamp(account, subject),
+        }
+    }
+
+    /// Live Hermes sessions count toward a row only by principal stamp, and
+    /// only the Codex row has a login to compare. A snapshot of another
+    /// account than the login's, an unstamped one, or no login proves
+    /// nothing, and the mailbox is not even scanned for them.
     #[test]
-    fn hermes_sessions_count_toward_the_codex_row_only_by_account_stamp() {
-        use crate::providers::hermes::chatgpt_account_stamp;
+    fn hermes_sessions_count_toward_the_codex_row_only_by_principal_stamp() {
+        use crate::providers::hermes::chatgpt_principal_stamp;
         let codex = stamped_codex("acc-1");
-        let mine = chatgpt_account_stamp("acc-1");
-        let other = chatgpt_account_stamp("acc-2");
-        let live = || vec![mine.clone(), other.clone(), mine.clone()];
+        let me = login("acc-1", "user-1");
+        let mine = chatgpt_principal_stamp("acc-1", "user-1");
+        // Another seat of the same workspace, and another account.
+        let teammate = chatgpt_principal_stamp("acc-1", "user-2");
+        let other = chatgpt_principal_stamp("acc-2", "user-1");
+        let live = || vec![mine.clone(), teammate.clone(), other.clone(), mine.clone()];
         assert_eq!(
-            hermes_sessions_on_rows(std::slice::from_ref(&codex), live),
+            hermes_sessions_on_rows(std::slice::from_ref(&codex), Some(&me), live),
             vec![(Provider::Codex, 2)]
         );
         assert!(
-            hermes_sessions_on_rows(std::slice::from_ref(&codex), || vec![other.clone()])
-                .is_empty()
+            hermes_sessions_on_rows(std::slice::from_ref(&codex), Some(&me), || {
+                vec![teammate.clone(), other.clone()]
+            })
+            .is_empty()
         );
-        assert!(hermes_sessions_on_rows(&[codex], Vec::new).is_empty());
+        assert!(
+            hermes_sessions_on_rows(std::slice::from_ref(&codex), Some(&me), Vec::new).is_empty()
+        );
         // The raw id is never what is compared.
         assert!(
-            hermes_sessions_on_rows(&[stamped_codex("acc-1")], || vec!["acc-1".to_string()])
-                .is_empty()
+            hermes_sessions_on_rows(std::slice::from_ref(&codex), Some(&me), || {
+                vec!["acc-1".to_string()]
+            })
+            .is_empty()
         );
         let unstamped = three_window_snapshot(Provider::Codex);
         let claude = three_window_snapshot(Provider::Claude);
-        for rows in [vec![unstamped], vec![claude], Vec::new()] {
-            assert!(
-                hermes_sessions_on_rows(&rows, || panic!("scanned without an account")).is_empty()
-            );
+        let unscanned = || -> Vec<String> { panic!("scanned without a principal") };
+        for (rows, login) in [
+            (vec![unstamped], Some(&me)),
+            (vec![claude], Some(&me)),
+            (Vec::new(), Some(&me)),
+            (vec![stamped_codex("acc-2")], Some(&me)),
+            (vec![codex], None),
+        ] {
+            assert!(hermes_sessions_on_rows(&rows, login, unscanned).is_empty());
         }
     }
 
@@ -2551,33 +2593,37 @@ mod tests {
         MetadataTokens::from_snapshot_for_pane_with_fields(&reading, SUMMARY_NOW, None, row)
     }
 
-    /// A Hermes pane's own row is marked as the Codex account's only when its
-    /// session's stamp equals the stamp of the account the Codex snapshot was
-    /// fetched for.
+    /// A Hermes pane's own row is marked as the Codex row's only when its
+    /// session's stamp equals the Codex login's and that login is the one
+    /// the Codex snapshot was fetched for.
     #[test]
-    fn a_hermes_row_is_the_codex_accounts_only_on_an_equal_stamp() {
-        use crate::providers::hermes::chatgpt_account_stamp;
+    fn a_hermes_row_is_the_codex_rows_only_on_an_equal_principal() {
+        use crate::providers::hermes::chatgpt_principal_stamp;
         let row = summary_row(crate::cli::SummaryFormat::Lines);
         let codex = stamped_codex("acc-1");
-        let marked = |session: Option<&str>, codex: Option<&ProviderSnapshot>| {
+        let me = login("acc-1", "user-1");
+        let marked = |session: Option<&str>,
+                      codex: Option<&ProviderSnapshot>,
+                      login: Option<&codex::LoginPrincipal>| {
             let mut values = hermes_pane_values(row);
-            mark_same_account(&mut values, session, codex);
+            mark_same_account(&mut values, session, codex, login);
             values.account.expect("a footer row").same_account_as
         };
-        let mine = chatgpt_account_stamp("acc-1");
-        let other = chatgpt_account_stamp("acc-2");
-        assert_eq!(marked(Some(&mine), Some(&codex)), Some("cx"));
-        assert_eq!(marked(Some(&other), Some(&codex)), None);
-        assert_eq!(marked(None, Some(&codex)), None);
-        assert_eq!(marked(Some(&mine), None), None);
-        assert_eq!(
-            marked(Some(&mine), Some(&three_window_snapshot(Provider::Codex))),
-            None
-        );
-        assert_eq!(marked(Some("acc-1"), Some(&codex)), None);
+        let mine = chatgpt_principal_stamp("acc-1", "user-1");
+        let teammate = chatgpt_principal_stamp("acc-1", "user-2");
+        assert_eq!(marked(Some(&mine), Some(&codex), Some(&me)), Some("cx"));
+        assert_eq!(marked(Some(&teammate), Some(&codex), Some(&me)), None);
+        assert_eq!(marked(None, Some(&codex), Some(&me)), None);
+        assert_eq!(marked(Some(&mine), None, Some(&me)), None);
+        assert_eq!(marked(Some(&mine), Some(&codex), None), None);
+        let unstamped = three_window_snapshot(Provider::Codex);
+        assert_eq!(marked(Some(&mine), Some(&unstamped), Some(&me)), None);
+        let elsewhere = stamped_codex("acc-2");
+        assert_eq!(marked(Some(&mine), Some(&elsewhere), Some(&me)), None);
+        assert_eq!(marked(Some("acc-1"), Some(&codex), Some(&me)), None);
         // Summary off: there is no footer row to mark.
         let mut off = hermes_pane_values(summary_row(crate::cli::SummaryFormat::Off));
-        mark_same_account(&mut off, Some(&mine), Some(&codex));
+        mark_same_account(&mut off, Some(&mine), Some(&codex), Some(&me));
         assert_eq!(off.account, None);
     }
 

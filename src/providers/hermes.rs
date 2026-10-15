@@ -14,11 +14,12 @@
 //! the session. A reading is used only when every gate below holds; anything
 //! else is no reading at all, never an older or a neighbouring one.
 //!
-//! A supported route may also carry `account`: [`chatgpt_account_stamp`] of
-//! the ChatGPT account the live access token names. It is the only value in
-//! a record that another process can compare, and it is compared with the
-//! same stamp of the account the Codex snapshot was fetched for, never with
-//! a raw id.
+//! A supported route may also carry `principal`: [`chatgpt_principal_stamp`]
+//! of the ChatGPT account and user (`sub`) the live access token names. It is
+//! the only value in a record that another process can compare, and it is
+//! compared with the same stamp of the Codex login the Codex row belongs to,
+//! never with a raw id. Both halves matter: members of one ChatGPT workspace
+//! share the account id but each has their own quota.
 
 use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
 use serde_json::Value;
@@ -39,20 +40,24 @@ const ROUTE_TTL_SECONDS: u64 = 120;
 /// Mailbox entries one scan looks at. Each live session owns two files, and
 /// the producer prunes what dead ones leave behind.
 const MAX_SCANNED_ENTRIES: usize = 512;
-/// Domain of [`chatgpt_account_stamp`]. The bridge plugin hashes the same
-/// bytes; `the_account_stamp_is_pinned` keeps the two from drifting apart.
-const ACCOUNT_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/chatgpt-account\0";
+/// Domain of [`chatgpt_principal_stamp`]. The bridge plugin hashes the same
+/// bytes; `the_principal_stamp_is_pinned` keeps the two from drifting apart.
+const PRINCIPAL_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/chatgpt-principal\0";
 
-/// The comparable form of a ChatGPT account id: lowercase hex of
-/// `sha256("herdr-agent-quota/chatgpt-account\0" || account id)`.
+/// The comparable form of a ChatGPT principal: lowercase hex of
+/// `sha256("herdr-agent-quota/chatgpt-principal\0" || account id || "\0" || sub)`,
+/// both taken from an access token's own claims.
 ///
-/// The raw id never leaves the process that read it. The bridge stamps the
-/// id its live access token names; this plugin stamps the id the Codex
-/// snapshot was fetched for. Equal stamps are the same account.
-pub fn chatgpt_account_stamp(account_id: &str) -> String {
+/// Neither raw value leaves the process that read it. The bridge stamps the
+/// principal its live access token names; this plugin stamps the current
+/// Codex login's. Equal stamps are the same seat of the same account, the
+/// identity Hermes itself uses to tell two Codex credentials apart.
+pub fn chatgpt_principal_stamp(account_id: &str, subject: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(ACCOUNT_STAMP_DOMAIN);
+    hasher.update(PRINCIPAL_STAMP_DOMAIN);
     hasher.update(account_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(subject.as_bytes());
     hasher
         .finalize()
         .iter()
@@ -64,16 +69,16 @@ pub fn chatgpt_account_stamp(account_id: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
     pub snapshot: ProviderSnapshot,
-    /// [`chatgpt_account_stamp`] of the account the session's live token
-    /// names, when it names one.
-    pub account: Option<String>,
+    /// [`chatgpt_principal_stamp`] of the account and user the session's live
+    /// token names, when it names both.
+    pub principal: Option<String>,
 }
 
 /// The current route of a record, once its route-level gates hold.
 struct Route {
     epoch: u64,
     identity: String,
-    account: Option<String>,
+    principal: Option<String>,
 }
 
 /// The quota of the credential serving `session_id` in `pane_id` right now.
@@ -99,15 +104,15 @@ pub fn load(
     parse_record(&record, pane_id, session_id, provider_id, now_unix)
 }
 
-/// The account stamp of every Hermes session a live producer is watching on
-/// the bridged route right now, one entry per session.
+/// The principal stamp of every Hermes session a live producer is watching
+/// on the bridged route right now, one entry per session.
 ///
 /// This is what the footer's Hermes badge counts. It reads only this
 /// plugin's own mailbox, never a pane: a session counts while its producer
 /// holds the lock and re-checked its route within [`ROUTE_TTL_SECONDS`],
-/// whichever pane it reports from. A session whose token names no account,
-/// or that is on any other route, is not counted.
-pub fn live_accounts(state: &Path, now_unix: u64) -> Vec<String> {
+/// whichever pane it reports from. A session whose token names no
+/// principal, or that is on any other route, is not counted.
+pub fn live_principals(state: &Path, now_unix: u64) -> Vec<String> {
     let directory = state.join(MAILBOX_DIR);
     if !files::is_private_directory(&directory) {
         return Vec::new();
@@ -132,7 +137,7 @@ pub fn live_accounts(state: &Path, now_unix: u64) -> Vec<String> {
                 .get("pane_id")
                 .and_then(Value::as_str)
                 .filter(|pane| is_pane_id(pane))?;
-            parse_route(&record, pane_id, session_id, BRIDGED_PROVIDER, now_unix)?.account
+            parse_route(&record, pane_id, session_id, BRIDGED_PROVIDER, now_unix)?.principal
         })
         .collect()
 }
@@ -157,7 +162,7 @@ pub fn parse_record(
     let Route {
         epoch,
         identity,
-        account,
+        principal,
     } = parse_route(record, pane_id, session_id, provider_id, now_unix)?;
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     let not_future = |value: &Value, key: &str| {
@@ -198,7 +203,7 @@ pub fn parse_record(
     }
     Some(Reading {
         snapshot: ProviderSnapshot::new(Provider::Hermes, windows, fetched_at),
-        account,
+        principal,
     })
 }
 
@@ -238,8 +243,8 @@ fn parse_route(
         return None;
     }
     // Absent from records written before the stamp existed, and null when the
-    // token names no account. Anything else that is not a stamp is malformed.
-    let account = match route.get("account") {
+    // token names no principal. Anything else that is not a stamp is malformed.
+    let principal = match route.get("principal") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
             value
@@ -251,7 +256,7 @@ fn parse_route(
     Some(Route {
         epoch,
         identity,
-        account,
+        principal,
     })
 }
 
@@ -416,44 +421,50 @@ mod tests {
         load(state, "w1:p1", "s1", BRIDGED_PROVIDER, NOW).map(|reading| reading.snapshot)
     }
 
-    /// The bridge plugin hashes the same bytes (`test_the_account_stamp_is_pinned`
-    /// in `tests/hermes_plugin/test_bridge.py` asserts this exact digest). If
-    /// either side changes, every badge silently stops matching.
-    #[test]
-    fn the_account_stamp_is_pinned() {
-        assert_eq!(
-            chatgpt_account_stamp("acc-1"),
-            "b8696038180fa40aecce9f9182a0b8428b6e4d50866868696c6f8368ff59831c"
-        );
-        assert_ne!(
-            chatgpt_account_stamp("acc-1"),
-            chatgpt_account_stamp("acc-2")
-        );
-        assert!(!chatgpt_account_stamp("acc-1").contains("acc-1"));
+    fn stamp(account: &str, subject: &str) -> String {
+        chatgpt_principal_stamp(account, subject)
     }
 
-    /// A route names its account only as a stamp. A record written before the
-    /// stamp existed, or for a token that names no account, still reads; a
-    /// value that is not a stamp is a malformed record.
+    /// The bridge plugin hashes the same bytes
+    /// (`test_the_principal_stamp_is_pinned` in
+    /// `tests/hermes_plugin/test_bridge.py` asserts this exact digest). If
+    /// either side changes, every badge silently stops matching.
     #[test]
-    fn a_route_names_its_account_only_as_a_stamp() {
-        let read = |account: Option<Value>| {
+    fn the_principal_stamp_is_pinned() {
+        assert_eq!(
+            stamp("acc-1", "user-1"),
+            "fbb8c62b1dfc955d0617ae4d6780b6b62fb040c7b8a3ec08c0f06d7f9f6c84e4"
+        );
+        // Another seat of the same workspace is another principal.
+        assert_ne!(stamp("acc-1", "user-1"), stamp("acc-1", "user-2"));
+        assert_ne!(stamp("acc-1", "user-1"), stamp("acc-2", "user-1"));
+        // The separator keeps the two halves from sliding into each other.
+        assert_ne!(stamp("acc-1", "user-1"), stamp("acc-1u", "ser-1"));
+        assert!(!stamp("acc-1", "user-1").contains("acc-1"));
+    }
+
+    /// A route names its principal only as a stamp. A record written before
+    /// the stamp existed, or for a token that names no principal, still
+    /// reads; a value that is not a stamp is a malformed record.
+    #[test]
+    fn a_route_names_its_principal_only_as_a_stamp() {
+        let read = |principal: Option<Value>| {
             let mut value = record("w1:p1", "s1", 12.0);
-            match account {
-                Some(account) => value["route"]["account"] = account,
+            match principal {
+                Some(principal) => value["route"]["principal"] = principal,
                 None => {
-                    value["route"].as_object_mut().unwrap().remove("account");
+                    value["route"].as_object_mut().unwrap().remove("principal");
                 }
             }
             parse_record(&value, "w1:p1", "s1", BRIDGED_PROVIDER, NOW)
         };
-        let stamp = chatgpt_account_stamp("acc-1");
+        let mine = stamp("acc-1", "user-1");
         assert_eq!(
-            read(Some(json!(stamp))).expect("reading").account,
-            Some(stamp)
+            read(Some(json!(mine))).expect("reading").principal,
+            Some(mine)
         );
-        assert_eq!(read(Some(Value::Null)).expect("reading").account, None);
-        assert_eq!(read(None).expect("reading").account, None);
+        assert_eq!(read(Some(Value::Null)).expect("reading").principal, None);
+        assert_eq!(read(None).expect("reading").principal, None);
         for malformed in [
             json!("acc-1"),
             json!("short"),
@@ -466,25 +477,26 @@ mod tests {
     }
 
     /// The badge counts sessions, not panes: every live producer on the
-    /// bridged route whose token names an account, whatever its quota.
+    /// bridged route whose token names a principal, whatever its quota.
     #[test]
-    fn live_accounts_are_the_stamps_of_live_bridged_sessions() {
+    fn live_principals_are_the_stamps_of_live_bridged_sessions() {
         let state = tempfile::tempdir().unwrap();
-        let a = chatgpt_account_stamp("acc-1");
-        let b = chatgpt_account_stamp("acc-2");
-        let with = |pane: &str, session: &str, account: Option<&str>| {
+        let a = stamp("acc-1", "user-1");
+        let b = stamp("acc-1", "user-2");
+        let with = |pane: &str, session: &str, principal: Option<&str>| {
             let mut value = record(pane, session, 12.0);
-            value["route"]["account"] = account.map_or(Value::Null, |stamp| json!(stamp));
+            value["route"]["principal"] = principal.map_or(Value::Null, |stamp| json!(stamp));
             value
         };
         let mut producers = Vec::new();
         producers.push(write(state.path(), "s1", &with("w1:p1", "s1", Some(&a))));
-        // Another pane on the same account, with no quota fetched yet.
+        // Another pane on the same principal, with no quota fetched yet.
         let mut fresh = with("w2:p4", "s2", Some(&a));
         fresh["quota"] = Value::Null;
         producers.push(write(state.path(), "s2", &fresh));
+        // Another seat of the same workspace.
         producers.push(write(state.path(), "s3", &with("w1:p2", "s3", Some(&b))));
-        // A token that names no account is a session, but not an account.
+        // A token that names no principal is a session, but not a principal.
         producers.push(write(state.path(), "s4", &with("w1:p3", "s4", None)));
         // Another route never counts, whatever it carries.
         let mut other = with("w1:p5", "s5", Some(&a));
@@ -501,25 +513,25 @@ mod tests {
         // A producer that went away.
         drop(write(state.path(), "s8", &with("w1:p8", "s8", Some(&a))));
 
-        assert_eq!(live_accounts(state.path(), NOW), vec![a.clone(), a, b]);
+        assert_eq!(live_principals(state.path(), NOW), vec![a.clone(), a, b]);
         drop(producers);
-        assert!(live_accounts(state.path(), NOW).is_empty());
+        assert!(live_principals(state.path(), NOW).is_empty());
     }
 
     #[test]
-    fn live_accounts_need_a_private_mailbox() {
+    fn live_principals_need_a_private_mailbox() {
         let state = tempfile::tempdir().unwrap();
-        assert!(live_accounts(state.path(), NOW).is_empty());
+        assert!(live_principals(state.path(), NOW).is_empty());
         let mut value = record("w1:p1", "s1", 12.0);
-        value["route"]["account"] = json!(chatgpt_account_stamp("acc-1"));
+        value["route"]["principal"] = json!(stamp("acc-1", "user-1"));
         let _producer = write(state.path(), "s1", &value);
-        assert_eq!(live_accounts(state.path(), NOW).len(), 1);
+        assert_eq!(live_principals(state.path(), NOW).len(), 1);
         let directory = state.path().join(MAILBOX_DIR);
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(live_accounts(state.path(), NOW).is_empty());
+        assert!(live_principals(state.path(), NOW).is_empty());
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(directory.join("s1.json"), fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(live_accounts(state.path(), NOW).is_empty());
+        assert!(live_principals(state.path(), NOW).is_empty());
     }
 
     #[test]

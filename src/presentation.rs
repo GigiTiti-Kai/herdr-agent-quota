@@ -106,11 +106,12 @@ impl AccountFamily {
     ];
 
     /// Footer rows that can carry the Hermes badge
-    /// (`quota_acct_<id>_hermes`): rows whose snapshot is stamped with an
-    /// account a live Hermes session can be proven to share. Only the Codex
-    /// row is: its snapshot carries the ChatGPT account id, and the bridge
-    /// stamps the account its live token names. Claude's row has no account
-    /// a Hermes credential could be compared with.
+    /// (`quota_acct_<id>_hermes`): rows whose login a live Hermes session
+    /// can be proven to share. Only the Codex row is: its snapshot carries
+    /// the ChatGPT account id, the Codex login's token names that account and
+    /// its user, and the bridge stamps the same pair for the token Hermes
+    /// holds. Claude's row has no account a Hermes credential could be
+    /// compared with.
     pub const HERMES_BADGED: [&'static str; 1] = ["cx"];
 
     /// A family is keyed by the collector, so a Pi pane that resolved to
@@ -150,8 +151,8 @@ pub struct AccountSummary {
     /// Lines mode: a blank line closes the provider block.
     pub gap: bool,
     /// The Hermes badge (`quota_acct_<id>_hermes`): live Hermes sessions are
-    /// proven to bill this row's account. Only a workspace row carries it,
-    /// and only when it fits the row.
+    /// proven to bill this row's account as the same user. Only a workspace
+    /// row carries it, and only when it fits the row.
     pub hermes_badge: Option<String>,
     /// For a Hermes pane's own row: the family whose row shows this same
     /// billing account. When that row carries the Hermes badge on the
