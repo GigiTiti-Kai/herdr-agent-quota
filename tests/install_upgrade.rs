@@ -56,6 +56,12 @@ esac
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
+        // Never touch the real plugin dirs: install.sh moves alias dirs under
+        // $HOME / $XDG_*, and a test run from a Herdr pane inherits the live ones.
+        .env("HOME", dir.path())
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+        .env_remove("HERDR_BIN_PATH")
         .env("TEST_CONFIG", &config)
         .env("TEST_PLUGIN", dir.path().join("plugin"))
         .env("TEST_ACTION", configure)
@@ -138,6 +144,12 @@ esac
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
+        // Never touch the real plugin dirs: install.sh moves alias dirs under
+        // $HOME / $XDG_*, and a test run from a Herdr pane inherits the live ones.
+        .env("HOME", dir.path())
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+        .env_remove("HERDR_BIN_PATH")
         .env("TEST_CONFIG", &config)
         .env("TEST_PLUGIN", dir.path().join("plugin"))
         .env("TEST_ACTION", configure)
