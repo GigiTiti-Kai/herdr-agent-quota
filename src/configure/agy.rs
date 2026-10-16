@@ -14,10 +14,13 @@ const CONFIG: Adapter = Adapter {
 };
 
 pub fn check() -> Result<()> {
-    CONFIG.check(&settings_path(
-        "AGY_SETTINGS_FILE",
-        ".gemini/antigravity-cli/settings.json",
-    )?)
+    let cache = CacheStore::from_env()?;
+    let executable = std::env::current_exe().context("resolve plugin executable")?;
+    CONFIG.check(
+        &settings_path("AGY_SETTINGS_FILE", ".gemini/antigravity-cli/settings.json")?,
+        cache.root(),
+        &executable,
+    )
 }
 
 pub fn apply() -> Result<()> {

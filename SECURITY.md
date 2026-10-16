@@ -3,7 +3,7 @@
 ## Reporting
 
 Report vulnerabilities privately through
-[GitHub Security Advisories](https://github.com/levi-qiao/herdr-agent-quota/security/advisories/new).
+[GitHub Security Advisories](https://github.com/levi-qiao/herdr-agent-usage/security/advisories/new).
 Do not include credentials in public issues. The expected initial response time
 is seven days. Security fixes target the latest release.
 
@@ -15,7 +15,8 @@ context-window fields only). Codex quota is obtained through its app-server;
 OMP quota through its usage CLI. OMP's credential database is never opened.
 Local SQLite reads are read-only and limited to session/model data, plus Cursor
 IDE's `state.vscdb` key `cursorAuth/accessToken` when the CLI has no login of
-its own. On macOS, Cursor Agent CLI and Muse Code both keep OAuth tokens in
+its own and `$CURSOR_STATE_DB` is set (macOS never opens the default
+Cursor.app Application Support path). On macOS, Cursor Agent CLI and Muse Code both keep OAuth tokens in
 Keychain (`cursor-access-token` / `cursor-user`, and Muse
 `ai.meta.dev.credentials` / `meta`); the collector reads only those CLI items
 through `security find-generic-password`. Background processes never prompt:

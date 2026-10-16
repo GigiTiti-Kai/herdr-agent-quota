@@ -3,6 +3,7 @@ use clap::Parser;
 use herdr_agent_quota::cli::{Cli, Command};
 
 fn main() -> Result<()> {
+    herdr_agent_quota::identity::adopt_alias_plugin_dirs();
     let cli = Cli::parse();
     match cli.command {
         Command::Refresh {

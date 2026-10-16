@@ -1,3 +1,5 @@
+use crate::cache::CacheStore;
+use crate::identity::{self, PLUGIN_ID};
 use crate::model::{ContextUsage, Harness, Provider};
 use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
 use anyhow::{Context, Result};
@@ -383,9 +385,6 @@ pub fn notify(title: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-/// Source that owns this plugin's Herdr Agent view. Herdr requires the
-/// `plugin:<id>` form and rejects a set whose plugin is missing or disabled.
-const AGENT_VIEW_SOURCE: &str = "plugin:herdr-agent-quota";
 /// A socket request must not outlive the event hook that sent it. Herdr
 /// answers these in microseconds; anything near this is a hung server, and a
 /// sidebar sort is never worth blocking a turn for.
@@ -407,7 +406,7 @@ pub fn set_quota_agent_view() -> Result<()> {
         "id": "agent-quota:view-set",
         "method": "agent.view.set",
         "params": {
-            "source": AGENT_VIEW_SOURCE,
+            "source": identity::agent_view_source(),
             "label": crate::cli::AgentOrder::LABEL,
             "sort": [
                 {"field": "workspace_order", "order": "asc"},
@@ -426,7 +425,7 @@ pub fn clear_quota_agent_view() -> Result<()> {
     socket_request(&serde_json::json!({
         "id": "agent-quota:view-clear",
         "method": "agent.view.clear",
-        "params": {"source": AGENT_VIEW_SOURCE},
+        "params": {"source": identity::agent_view_source()},
     }))
     .map(|_| ())
 }
@@ -477,24 +476,33 @@ pub fn list_agent_panes() -> Result<Vec<AgentPane>> {
 /// combined view so one poll does not fan out into one `agent list` call per
 /// provider.
 pub fn list_agent_state() -> Result<AgentState> {
-    let value = list_agent_value()?;
+    Ok(agent_state_from(
+        &list_agent_value()?,
+        attach_missing_sessions,
+    ))
+}
+
+/// Every inventory consumer (watch, focus, sibling publish) sees the same
+/// recovered sessions. A pane left without one renders the account-level
+/// model, which belongs to whichever rollout Codex wrote last.
+fn agent_state_from(value: &Value, attach: impl FnOnce(&mut [AgentPane])) -> AgentState {
     let mut panes = Vec::new();
-    collect_agent_panes(&value, &mut panes);
-    // Keep Herdr's order: it is the Agent panel's draw order, and group head
-    // election depends on it. A `pane_id` sort would put `w1:p10` before
-    // `w1:p7`.
+    collect_agent_panes(value, &mut panes);
+    // Preserve Herdr's inventory order: under the default grouped view this is
+    // the Agent panel's draw order. Lexical pane ids are not layout order
+    // (for example, p10 sorts before p7).
     let mut seen = BTreeSet::new();
     panes.retain(|pane| seen.insert(pane.pane_id.clone()));
-    attach_muse_sessions(&mut panes);
+    attach(&mut panes);
     let mut working_pane_ids = Vec::new();
-    collect_working_providers(&value, &mut Vec::new(), &mut working_pane_ids);
+    collect_working_providers(value, &mut Vec::new(), &mut working_pane_ids);
     working_pane_ids.sort();
     working_pane_ids.dedup();
-    Ok(AgentState {
+    AgentState {
         panes,
-        working_providers: working_providers_from(&value),
+        working_providers: working_providers_from(value),
         working_pane_ids,
-    })
+    }
 }
 
 /// One pane from a single inventory read, for the event and focus paths.
@@ -508,7 +516,7 @@ pub fn find_agent_pane(pane_id: &str) -> Result<Option<AgentPane>> {
         return Ok(None);
     };
     let mut panes = [pane];
-    attach_muse_sessions(&mut panes);
+    attach_missing_sessions(&mut panes);
     let [pane] = panes;
     Ok(Some(pane))
 }
@@ -525,11 +533,111 @@ pub fn find_agent_icon_panes(pane_ids: &[&str]) -> Result<Vec<AgentPane>> {
     Ok(panes)
 }
 
+fn attach_missing_sessions(panes: &mut [AgentPane]) {
+    attach_muse_sessions(panes);
+    attach_codex_sessions(panes);
+}
+
 /// Herdr has no Muse session integration, so a Muse pane arrives without a
 /// session. Resolve it from Muse's own session lock; a session Herdr does
 /// report is always kept as-is.
 fn attach_muse_sessions(panes: &mut [AgentPane]) {
     attach_muse_sessions_with(panes, crate::providers::muse::session_ids_for_panes);
+}
+
+/// Codex hooks normally report a session id. A wrapper can disable those
+/// hooks while leaving Herdr's foreground cwd intact, so use the rollout's
+/// exact session_meta cwd only when one missing pane and one rollout agree.
+fn attach_codex_sessions(panes: &mut [AgentPane]) {
+    attach_codex_sessions_with(
+        panes,
+        codex_process_started_at,
+        crate::providers::codex::session_ids_for_panes,
+    );
+}
+
+fn attach_codex_sessions_with(
+    panes: &mut [AgentPane],
+    started_at: impl Fn(&str) -> Option<u64>,
+    resolve: impl FnOnce(&[(String, String, u64)]) -> BTreeMap<String, String>,
+) {
+    let missing = panes
+        .iter()
+        .filter(|pane| pane.harness == Harness::Codex && pane.session.is_none())
+        .collect::<Vec<_>>();
+    // Callers drop unselected harnesses after the inventory read; a partial
+    // install must not inspect the processes of an agent it does not track.
+    if missing.is_empty()
+        || !crate::cli::AgentSelection::from_args_or_env(&[]).contains(&Harness::Codex)
+    {
+        return;
+    }
+    let candidates = missing
+        .into_iter()
+        .filter_map(|pane| {
+            started_at(&pane.pane_id)
+                .map(|started_at| (pane.pane_id.clone(), pane.cwd.clone(), started_at))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    let resolved = resolve(&candidates);
+    for pane in panes {
+        if pane.harness != Harness::Codex || pane.session.is_some() {
+            continue;
+        }
+        if let Some(session_id) = resolved.get(&pane.pane_id) {
+            pane.session = Some(AgentSession {
+                kind: Some("id".to_string()),
+                value: session_id.clone(),
+            });
+        }
+    }
+}
+
+fn codex_process_started_at(pane_id: &str) -> Option<u64> {
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let output = Command::new(executable)
+        .args(["pane", "process-info", "--pane", pane_id])
+        .output()
+        .ok()?;
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let process = value
+        .pointer("/result/process_info/foreground_processes")?
+        .as_array()?
+        .iter()
+        .find(|process| {
+            process
+                .get("argv")
+                .and_then(Value::as_array)
+                .and_then(|argv| argv.first())
+                .and_then(Value::as_str)
+                .is_some_and(|argv0| argv0 == "codex" || argv0.ends_with("/codex"))
+        })?;
+    let pid = process.get("pid")?.as_u64()?.to_string();
+    let elapsed = Command::new("ps")
+        .args(["-p", &pid, "-o", "etime="])
+        .output()
+        .ok()?;
+    let seconds = parse_ps_elapsed(&String::from_utf8_lossy(&elapsed.stdout))?;
+    Some(CacheStore::now_unix().saturating_sub(seconds))
+}
+
+fn parse_ps_elapsed(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (days, clock) = if let Some((days, clock)) = value.split_once('-') {
+        (days.parse::<u64>().ok()?, clock)
+    } else {
+        (0, value)
+    };
+    let mut seconds = 0_u64;
+    for part in clock.split(':') {
+        seconds = seconds
+            .checked_mul(60)?
+            .checked_add(part.parse::<u64>().ok()?)?;
+    }
+    (clock.split(':').count() >= 2).then_some(days * 86_400 + seconds)
 }
 
 fn attach_muse_sessions_with(
@@ -726,8 +834,13 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         .map(AgentStatus::parse)
                         .unwrap_or_default();
                     let focused = map.get("focused").and_then(Value::as_bool).unwrap_or(false);
-                    let cwd = map
-                        .get("cwd")
+                    // Codex rollouts record the native foreground process's
+                    // cwd. Other collectors keep the pane cwd contract they
+                    // already use.
+                    let cwd = (harness == Harness::Codex)
+                        .then(|| map.get("foreground_cwd"))
+                        .flatten()
+                        .or_else(|| map.get("cwd"))
                         .or_else(|| map.get("foreground_cwd"))
                         .and_then(Value::as_str)
                         .unwrap_or_default()
@@ -1044,7 +1157,7 @@ fn publish_pane_tokens_inner(
                 &executable,
                 "pane",
                 &pane.pane_id,
-                "herdr-agent-quota",
+                PLUGIN_ID,
                 names,
                 &desired,
                 sequence,
@@ -1119,7 +1232,7 @@ fn report_icon_metadata(
             "report-metadata",
             &pane.pane_id,
             "--source",
-            "herdr-agent-quota",
+            PLUGIN_ID,
         ])
         .args(["--seq", &sequence.to_string(), "--ttl-ms", METADATA_TTL_MS]);
     for name in ICON_TOKEN_NAMES {
@@ -1194,7 +1307,7 @@ fn sync_sibling_group_headers(
                 "report-metadata",
                 &sibling.pane_id,
                 "--source",
-                "herdr-agent-quota",
+                PLUGIN_ID,
             ])
             .args(["--seq", &sequence.to_string()])
             .args(["--ttl-ms", METADATA_TTL_MS]);
@@ -1643,12 +1756,19 @@ fn vendor_nesting(
     }
 }
 
+/// Fork: off (`fork/README.md`, Upstream policy). Upstream folds a second
+/// same-vendor pane in a Space into a nested child that loses cache, TTL and
+/// its own 5h/7d/30d rows. `false` empties `vendor_nesting`, so every pane is
+/// `VendorRow::Flat` and `mark_one_quota_row_per_vendor` returns early.
 pub(crate) fn shares_login_quota(harness: Harness) -> bool {
-    matches!(
-        harness,
-        Harness::Grok | Harness::Codex | Harness::Devin | Harness::OpenCode | Harness::Cursor
-    )
+    FORK_VENDOR_NESTING
+        && matches!(
+            harness,
+            Harness::Grok | Harness::Codex | Harness::Devin | Harness::OpenCode | Harness::Cursor
+        )
 }
+
+const FORK_VENDOR_NESTING: bool = false;
 
 /// Same-Space same-vendor group. Grok is one login-scoped vendor: the
 /// collector reads one `auth.json`, so two Grok tabs in a Space share 5h/7d.
@@ -2544,6 +2664,15 @@ mod tests {
     };
     use serde_json::json;
 
+    /// Fork: two same-vendor panes in one Space stay two flat panes, each
+    /// with its own cache, TTL and 5h/7d/30d (`fork/README.md`).
+    #[test]
+    fn fork_never_nests_a_vendor() {
+        for harness in crate::cli::AgentSelection::SUPPORTED {
+            assert!(!shares_login_quota(harness), "{harness:?}");
+        }
+    }
+
     fn lines_claude() -> MetadataTokens {
         let snapshot = ProviderSnapshot::new(
             Provider::Claude,
@@ -3131,6 +3260,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn same_space_vendor_children_stack_after_the_head() {
         let focused = AgentPane {
             pane_id: "w5:pA".to_string(),
@@ -3231,6 +3361,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn a_shared_vendor_header_stays_idle_when_a_session_completes() {
         let head = AgentPane {
             pane_id: "w5:pA".to_string(),
@@ -4082,6 +4213,96 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The watcher republishes working panes from `list_agent_state`. Two
+    /// Firstmate Codex workers (hooks disabled, so Herdr reports no session)
+    /// kept the account-level model — the rollout Codex wrote last — because
+    /// only the refresh pass recovered their sessions. The inventory itself
+    /// must carry the recovered session so every publisher agrees.
+    #[test]
+    fn the_watch_inventory_renders_each_wrapped_codex_pane_with_its_own_model() {
+        let value = json!({"result": {"agents": [
+            {"pane_id": "w28:p2", "agent": "codex", "agent_status": "working",
+             "cwd": "/firstmate/projects/ralph-hermes",
+             "foreground_cwd": "/treehouse/ralph-hermes-86f4b1/1/ralph-hermes"},
+            {"pane_id": "w29:p2", "agent": "codex", "agent_status": "working",
+             "cwd": "/firstmate/projects/eaves-and-ember",
+             "foreground_cwd": "/treehouse/eaves-and-ember-717502/1/eaves-and-ember"},
+            {"pane_id": "w1:p1", "agent": "codex", "agent_status": "idle",
+             "cwd": "/project", "agent_session": {"kind": "id", "value": "hooked"}}
+        ]}});
+        let mut asked = Vec::new();
+        let state = agent_state_from(&value, |panes| {
+            attach_codex_sessions_with(
+                panes,
+                |pane_id| match pane_id {
+                    "w28:p2" => Some(1_790_098_615),
+                    "w29:p2" => Some(1_790_098_627),
+                    _ => panic!("a pane Herdr already identified is never inspected"),
+                },
+                |candidates| {
+                    asked = candidates.to_vec();
+                    BTreeMap::from([
+                        ("w28:p2".to_string(), "hermes-live".to_string()),
+                        ("w29:p2".to_string(), "ember-live".to_string()),
+                    ])
+                },
+            )
+        });
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    "w28:p2".to_string(),
+                    "/treehouse/ralph-hermes-86f4b1/1/ralph-hermes".to_string(),
+                    1_790_098_615
+                ),
+                (
+                    "w29:p2".to_string(),
+                    "/treehouse/eaves-and-ember-717502/1/eaves-and-ember".to_string(),
+                    1_790_098_627
+                ),
+            ]
+        );
+        assert_eq!(state.working_pane_ids, vec!["w28:p2", "w29:p2"]);
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Codex, Vec::new(), 0);
+        // The newest rollout on the account belongs to another session.
+        snapshot.model = Some("gpt-5.6-terra".to_string());
+        for id in ["hermes-live", "ember-live", "hooked"] {
+            snapshot
+                .session_models
+                .insert(id.to_string(), "gpt-6-astra".to_string());
+        }
+        for pane in &state.panes {
+            let session = pane.session.as_ref().and_then(AgentSession::id);
+            let values = MetadataTokens::from_snapshot_for_pane(
+                &snapshot,
+                0,
+                session,
+                PercentStyle::default(),
+                SidebarShape::default(),
+            );
+            assert_eq!(
+                values.quota_provider_model, "Codex/gpt-6-astra",
+                "{}",
+                pane.pane_id
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_cwd_is_preferred_for_a_wrapped_agent_process() {
+        let value = json!({"result": {"agents": [{
+            "pane_id": "w1:p1",
+            "agent": "codex",
+            "cwd": "/project",
+            "foreground_cwd": "/treehouse/project"
+        }]}});
+        let mut panes = Vec::new();
+        collect_agent_panes(&value, &mut panes);
+        assert_eq!(panes[0].cwd, "/treehouse/project");
     }
 
     /// Herdr reports at most 16 metadata tokens per pane. A snapshot that

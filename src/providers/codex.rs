@@ -7,7 +7,7 @@ use crate::providers::ProviderError;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const FIVE_HOUR_WINDOW_MINUTES: u64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 const ROLLOUT_TAIL_BYTES: u64 = 256 * 1024;
+/// Session identity is the first JSONL record. Bound a malformed first line.
+const ROLLOUT_META_LINE_BYTES: u64 = 64 * 1024;
+/// Zstd is not seekable here. Decode forward within this budget while keeping
+/// only the recent records; beyond it, omit diagnostics rather than show an
+/// old model or context as current.
+const ROLLOUT_COMPRESSED_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+const ROLLOUT_COMPRESSED_TAIL_BYTES: usize = 8 * 1024 * 1024;
 /// How far back from EOF to look for the latest `turn_context` when the tail
 /// has none. Codex writes that event at turn start, then tool calls and
 /// `token_count` lines; a long turn can push the model several megabytes
@@ -153,8 +160,7 @@ fn parse_reset(value: &Value) -> Option<ResetAt> {
 /// the refresh path supplies pane session ids so an older pane is not lost
 /// behind the bounded `thread/list` page.
 pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
-    let executable = std::env::var_os("CODEX_BIN_PATH").unwrap_or_else(|| "codex".into());
-    let mut command = Command::new(executable);
+    let mut command = codex_command();
     command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
@@ -192,6 +198,212 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
     result
 }
 
+/// Herdr runs hooks, actions, and the watcher with its server's PATH, which
+/// on macOS can be launchd's `/usr/bin:/bin:/usr/sbin:/sbin`. A bare `codex`
+/// then never starts, every fetch keeps the cached snapshot, and pane models
+/// stop following new sessions. Fall back to the usual install directories,
+/// and put the chosen one on the child's PATH so an npm `env node` shim finds
+/// the `node` installed beside it.
+fn codex_command() -> Command {
+    let path = std::env::var_os("PATH");
+    let fallbacks = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".local/bin"))
+        .into_iter()
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+        .collect::<Vec<_>>();
+    let (executable, directory) = resolve_codex_executable(
+        std::env::var_os("CODEX_BIN_PATH"),
+        path.as_deref(),
+        &fallbacks,
+    );
+    let mut command = Command::new(executable);
+    if let Some(directory) = directory {
+        let paths = std::iter::once(directory)
+            .chain(path.iter().flat_map(std::env::split_paths))
+            .collect::<Vec<_>>();
+        if let Ok(joined) = std::env::join_paths(paths) {
+            command.env("PATH", joined);
+        }
+    }
+    command
+}
+
+fn resolve_codex_executable(
+    configured: Option<std::ffi::OsString>,
+    path: Option<&std::ffi::OsStr>,
+    fallbacks: &[PathBuf],
+) -> (std::ffi::OsString, Option<PathBuf>) {
+    if let Some(configured) = configured {
+        // An npm-style shim starts with `#!/usr/bin/env node`, so the script
+        // resolves `node` through its own PATH. Herdr's server PATH omits
+        // Homebrew, and `codex_command` already prepends the install directory
+        // in the auto-discovery case. Mirror that here when the override names
+        // a file with a parent directory. A bare name like `codex` is resolved
+        // against the existing PATH, so there is no directory to prepend.
+        let directory = PathBuf::from(&configured)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(PathBuf::from);
+        return (configured, directory);
+    }
+    let on_path = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .any(|directory| directory.join("codex").is_file());
+    if !on_path {
+        if let Some(directory) = fallbacks
+            .iter()
+            .find(|directory| directory.join("codex").is_file())
+        {
+            return (
+                directory.join("codex").into_os_string(),
+                Some(directory.clone()),
+            );
+        }
+    }
+    ("codex".into(), None)
+}
+
+const PROCESS_SESSION_START_TOLERANCE_SECONDS: u64 = 90;
+
+/// Bind missing Herdr sessions by a Codex process start time as well as the
+/// rollout's exact cwd. Treehouse worktrees can be reused, so cwd alone is
+/// deliberately insufficient once more than one rollout names it.
+pub fn session_ids_for_panes(panes: &[(String, String, u64)]) -> BTreeMap<String, String> {
+    let Some(home) = codex_home().ok() else {
+        return BTreeMap::new();
+    };
+    session_ids_for_panes_at(&home, panes)
+}
+
+fn session_ids_for_panes_at(
+    home: &Path,
+    panes: &[(String, String, u64)],
+) -> BTreeMap<String, String> {
+    let wanted = panes
+        .iter()
+        .filter(|(_, cwd, _)| !cwd.is_empty())
+        .map(|(_, cwd, _)| cwd.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut by_cwd = BTreeMap::<String, Vec<(String, u64)>>::new();
+    for path in rollouts_started_near(home, panes.iter().map(|(_, _, started)| *started)) {
+        let Some((session_id, cwd, started_at)) = rollout_session_meta_with_started_at(&path)
+        else {
+            continue;
+        };
+        if wanted.contains(cwd.as_str())
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(session_id.as_str()))
+        {
+            by_cwd
+                .entry(cwd)
+                .or_default()
+                .push((session_id, started_at));
+        }
+    }
+    panes
+        .iter()
+        .filter_map(|(pane_id, cwd, process_started_at)| {
+            let candidates = by_cwd.get(cwd)?;
+            let mut matches = candidates.iter().filter(|(_, rollout_started_at)| {
+                rollout_started_at.abs_diff(*process_started_at)
+                    <= PROCESS_SESSION_START_TOLERANCE_SECONDS
+            });
+            let (session_id, _) = matches.next()?;
+            matches
+                .next()
+                .is_none()
+                .then(|| (pane_id.clone(), session_id.clone()))
+        })
+        .collect()
+}
+
+/// Rollouts whose file date is within a day of a process start. Codex names
+/// both the `sessions/YYYY/MM/DD` directory and the file by the local start
+/// date, so the UTC day either side covers every offset. Every Herdr
+/// inventory read resolves session-less panes, so this must not walk the
+/// whole rollout history.
+fn rollouts_started_near(home: &Path, starts: impl Iterator<Item = u64>) -> Vec<PathBuf> {
+    let days = starts
+        .filter_map(|started| i64::try_from(started).ok())
+        .filter_map(|started| time::OffsetDateTime::from_unix_timestamp(started).ok())
+        .flat_map(|started| {
+            [
+                started.date().previous_day(),
+                Some(started.date()),
+                started.date().next_day(),
+            ]
+        })
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut directories = days
+        .iter()
+        .map(|day| {
+            home.join("sessions")
+                .join(format!("{:04}", day.year()))
+                .join(format!("{:02}", u8::from(day.month())))
+                .join(format!("{:02}", day.day()))
+        })
+        .collect::<Vec<_>>();
+    directories.push(home.join("archived_sessions"));
+    let prefixes = days
+        .iter()
+        .map(|day| {
+            format!(
+                "rollout-{:04}-{:02}-{:02}T",
+                day.year(),
+                u8::from(day.month()),
+                day.day()
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for directory in directories {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if is_rollout_file(&name)
+                && prefixes.iter().any(|prefix| name.starts_with(prefix))
+                && entry.file_type().is_ok_and(|file_type| file_type.is_file())
+                && !has_plain_sibling(&entry.path())
+            {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths
+}
+
+fn rollout_session_meta_with_started_at(path: &Path) -> Option<(String, String, u64)> {
+    let line = if is_compressed_rollout(path) {
+        let file = fs::File::open(path).ok()?;
+        let decoder = zstd::stream::read::Decoder::new(file).ok()?;
+        first_rollout_line(decoder)?
+    } else {
+        let file = fs::File::open(path).ok()?;
+        first_rollout_line(file)?
+    };
+    let entry = serde_json::from_str::<Value>(&line).ok()?;
+    (entry.get("type").and_then(Value::as_str) == Some("session_meta")).then_some(())?;
+    let payload = entry.get("payload")?;
+    let session_id = payload.get("id")?.as_str()?.trim();
+    let cwd = payload.get("cwd")?.as_str()?.trim();
+    let started_at = parse_rollout_timestamp(&entry)?;
+    (!session_id.is_empty() && !cwd.is_empty())
+        .then(|| (session_id.to_string(), cwd.to_string(), started_at))
+}
+
+fn first_rollout_line(reader: impl Read) -> Option<String> {
+    let mut reader = BufReader::new(reader).take(ROLLOUT_META_LINE_BYTES + 1);
+    let mut bytes = Vec::new();
+    reader.read_until(b'\n', &mut bytes).ok()?;
+    (bytes.len() <= ROLLOUT_META_LINE_BYTES as usize).then(|| String::from_utf8(bytes).ok())?
+}
+
 /// Kill the app-server's process group and reap it, at most once.
 ///
 /// Whichever of the request thread and the watchdog gets here first takes the
@@ -223,7 +435,7 @@ fn fetch_from_process(
         1,
         "initialize",
         serde_json::json!({
-            "clientInfo": {"name": "herdr-agent-quota", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {"name": crate::identity::PLUGIN_ID, "version": env!("CARGO_PKG_VERSION")},
             "capabilities": {}
         }),
     )?;
@@ -358,9 +570,10 @@ fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMap<String, P
                 directories.push(path);
                 continue;
             }
-            if !file_type.is_file()
-                || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-            {
+            if !file_type.is_file() || !is_rollout_file(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            if has_plain_sibling(&path) {
                 continue;
             }
             let name = entry.file_name();
@@ -395,7 +608,52 @@ struct RolloutObservation {
     context: Option<ContextUsage>,
 }
 
+fn is_rollout_file(name: &str) -> bool {
+    name.ends_with(".jsonl") || name.ends_with(".jsonl.zst")
+}
+
+fn is_compressed_rollout(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with(".jsonl.zst"))
+}
+
+fn has_plain_sibling(path: &Path) -> bool {
+    is_compressed_rollout(path) && path.with_extension("").is_file()
+}
+
+fn read_compressed_tail(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut decoder = zstd::stream::read::Decoder::new(file).ok()?;
+    let mut tail = VecDeque::new();
+    let mut decoded = 0_u64;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = decoder.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        decoded += read as u64;
+        if decoded > ROLLOUT_COMPRESSED_DECODE_BYTES {
+            return None;
+        }
+        tail.extend(&chunk[..read]);
+        if tail.len() > ROLLOUT_COMPRESSED_TAIL_BYTES {
+            tail.drain(..tail.len() - ROLLOUT_COMPRESSED_TAIL_BYTES);
+        }
+    }
+    let bytes = tail.into_iter().collect::<Vec<_>>();
+    let text = String::from_utf8_lossy(&bytes);
+    if decoded > bytes.len() as u64 {
+        Some(text.split_once('\n')?.1.to_string())
+    } else {
+        Some(text.into_owned())
+    }
+}
+
 fn read_rollout_observation(path: &Path, session_id: &str) -> Option<RolloutObservation> {
+    if is_compressed_rollout(path) {
+        return parse_rollout_observation(&read_compressed_tail(path)?, session_id);
+    }
     let mut file = fs::File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     let start = length.saturating_sub(ROLLOUT_TAIL_BYTES);
@@ -1149,6 +1407,202 @@ mod tests {
         assert!(!snapshot.session_contexts.contains_key("other-session"));
     }
 
+    fn write_session_meta(home: &Path, day: &str, stamp: &str, id: &str, cwd: &str, at: &str) {
+        let rollouts = home.join("sessions").join(day);
+        fs::create_dir_all(&rollouts).unwrap();
+        fs::write(
+            rollouts.join(format!("rollout-{stamp}-{id}.jsonl")),
+            serde_json::json!({"type":"session_meta", "timestamp": at,
+                "payload":{"id":id,"cwd":cwd,"timestamp":at,"originator":"codex-tui"}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolves_a_reused_cwd_only_when_the_process_start_matches_one_rollout() {
+        let directory = tempfile::tempdir().unwrap();
+        for (id, stamp, at) in [
+            ("old", "2026-09-22T07-01-40", "2026-09-22T13:01:40Z"),
+            ("live", "2026-09-22T07-16-40", "2026-09-22T13:16:40Z"),
+        ] {
+            write_session_meta(
+                directory.path(),
+                "2026/09/22",
+                stamp,
+                id,
+                "/treehouse/reused",
+                at,
+            );
+        }
+        let resolved = session_ids_for_panes_at(
+            directory.path(),
+            // 2026-09-22T13:16:42Z
+            &[(
+                "w1:p1".to_string(),
+                "/treehouse/reused".to_string(),
+                1_790_083_002,
+            )],
+        );
+        assert_eq!(resolved.get("w1:p1").map(String::as_str), Some("live"));
+    }
+
+    /// Sanitized from two Firstmate workers relaunched into reused treehouse
+    /// worktrees (Herdr panes with hooks disabled, so no agent_session). Each
+    /// cwd has an older rollout from the previous worker; only the process
+    /// start picks the live one. The third pane starts after UTC midnight
+    /// while Codex filed it under the previous local day.
+    #[test]
+    fn relaunched_workers_in_reused_worktrees_bind_their_own_rollouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let hermes = "/treehouse/ralph-hermes-86f4b1/1/ralph-hermes";
+        let ember = "/treehouse/eaves-and-ember-717502/1/eaves-and-ember";
+        for (stamp, id, cwd, at) in [
+            (
+                "2026-09-22T10-13-09",
+                "01a0c9e4-7d2e-7420-a351-4edbc4bbda48",
+                hermes,
+                "2026-09-22T16:13:10.017Z",
+            ),
+            (
+                "2026-09-22T11-36-55",
+                "01a0ca31-2d7b-7863-8d3c-58bf5cf4c566",
+                hermes,
+                "2026-09-22T17:36:55.920Z",
+            ),
+            (
+                "2026-09-22T11-10-32",
+                "01a0ca19-06ee-7910-bcc4-cde13c5a5312",
+                ember,
+                "2026-09-22T17:10:33.180Z",
+            ),
+            (
+                "2026-09-22T11-37-08",
+                "01a0ca31-5e0a-7040-bdc6-28bfc15690e1",
+                ember,
+                "2026-09-22T17:37:08.339Z",
+            ),
+            (
+                "2026-09-22T21-30-00",
+                "late-local-evening",
+                "/treehouse/late",
+                "2026-09-23T03:30:00.500Z",
+            ),
+        ] {
+            write_session_meta(home, "2026/09/22", stamp, id, cwd, at);
+        }
+        let resolved = session_ids_for_panes_at(
+            home,
+            &[
+                // ps start 2026-09-22T17:36:55Z
+                ("w28:p2".to_string(), hermes.to_string(), 1_790_098_615),
+                // ps start 2026-09-22T17:37:07Z
+                ("w29:p2".to_string(), ember.to_string(), 1_790_098_627),
+                // ps start 2026-09-23T03:30:00Z
+                (
+                    "w30:p1".to_string(),
+                    "/treehouse/late".to_string(),
+                    1_790_134_200,
+                ),
+            ],
+        );
+        assert_eq!(
+            resolved.get("w28:p2").map(String::as_str),
+            Some("01a0ca31-2d7b-7863-8d3c-58bf5cf4c566")
+        );
+        assert_eq!(
+            resolved.get("w29:p2").map(String::as_str),
+            Some("01a0ca31-5e0a-7040-bdc6-28bfc15690e1")
+        );
+        assert_eq!(
+            resolved.get("w30:p1").map(String::as_str),
+            Some("late-local-evening")
+        );
+    }
+
+    #[test]
+    fn a_herdr_server_path_without_codex_falls_back_to_an_install_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("usr-bin");
+        let homebrew = directory.path().join("homebrew-bin");
+        fs::create_dir_all(&system).unwrap();
+        fs::create_dir_all(&homebrew).unwrap();
+        fs::write(homebrew.join("codex"), "").unwrap();
+        let fallbacks = [directory.path().join("absent"), homebrew.clone()];
+
+        let (executable, prepended) =
+            resolve_codex_executable(None, Some(system.as_os_str()), &fallbacks);
+        assert_eq!(executable, homebrew.join("codex").into_os_string());
+        assert_eq!(prepended, Some(homebrew.clone()));
+
+        // Codex already on PATH, or an explicit override, is used as given.
+        let (executable, prepended) =
+            resolve_codex_executable(None, Some(homebrew.as_os_str()), &fallbacks);
+        assert_eq!(executable, std::ffi::OsString::from("codex"));
+        assert_eq!(prepended, None);
+        let (executable, prepended) = resolve_codex_executable(
+            Some("/custom/codex".into()),
+            Some(system.as_os_str()),
+            &fallbacks,
+        );
+        assert_eq!(executable, std::ffi::OsString::from("/custom/codex"));
+        assert_eq!(prepended, Some(PathBuf::from("/custom")));
+    }
+
+    #[test]
+    fn an_explicit_codex_bin_path_prepends_its_directory_to_the_child_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let shim_dir = directory.path().join("shims");
+        fs::create_dir_all(&shim_dir).unwrap();
+        fs::write(shim_dir.join("codex"), "").unwrap();
+        let configured = shim_dir.join("codex").into_os_string();
+
+        // $CODEX_BIN_PATH pointing at a shim: use the override as-is and
+        // prepend its directory so an `env node` shim resolves node under
+        // Herdr's minimal server PATH.
+        let (executable, prepended) = resolve_codex_executable(
+            Some(configured.clone()),
+            Some(directory.path().join("absent").as_os_str()),
+            &[],
+        );
+        assert_eq!(executable, configured);
+        assert_eq!(prepended, Some(shim_dir.clone()));
+
+        // A bare name without a directory component is resolved against the
+        // inherited PATH; there is no directory to prepend.
+        let (executable, prepended) = resolve_codex_executable(
+            Some(std::ffi::OsString::from("codex")),
+            Some(directory.path().join("absent").as_os_str()),
+            &[],
+        );
+        assert_eq!(executable, std::ffi::OsString::from("codex"));
+        assert_eq!(prepended, None);
+
+        // Unset: unchanged - no directory is prepended.
+        let (executable, prepended) =
+            resolve_codex_executable(None, Some(shim_dir.as_os_str()), &[]);
+        assert_eq!(executable, std::ffi::OsString::from("codex"));
+        assert_eq!(prepended, None);
+    }
+
+    #[test]
+    fn two_rollouts_near_one_process_start_stay_unresolved() {
+        let directory = tempfile::tempdir().unwrap();
+        for (id, stamp, at) in [
+            ("first", "2026-09-22T11-36-55", "2026-09-22T17:36:55Z"),
+            ("second", "2026-09-22T11-37-20", "2026-09-22T17:37:20Z"),
+        ] {
+            write_session_meta(directory.path(), "2026/09/22", stamp, id, "/shared", at);
+        }
+        let resolved = session_ids_for_panes_at(
+            directory.path(),
+            &[("w1:p1".to_string(), "/shared".to_string(), 1_790_098_615)],
+        );
+        assert!(resolved.is_empty());
+    }
+
     #[test]
     fn unattributed_rollout_cannot_add_a_window_to_the_current_accounts_quota() {
         let directory = tempfile::tempdir().unwrap();
@@ -1363,5 +1817,140 @@ mod tests {
             snapshot.session_models.get("session-1").map(String::as_str),
             Some("gpt-6-astra")
         );
+    }
+
+    fn compressed_rollout(path: &Path) -> Vec<u8> {
+        let bytes = zstd::stream::encode_all(
+            include_bytes!("../../tests/fixtures/codex/rollout-prefix.jsonl").as_slice(),
+            0,
+        )
+        .unwrap();
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    fn set_modified(path: &Path, seconds: u64) {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    #[test]
+    fn compressed_rollout_is_discovered_and_binds_its_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("sessions/2026/09/22");
+        fs::create_dir_all(&day).unwrap();
+        let compressed = day.join("rollout-2026-09-22T07-01-40-session-compressed.jsonl.zst");
+        compressed_rollout(&compressed);
+        fs::write(day.join("rollout-other.jsonl"), b"\n").unwrap();
+
+        assert_eq!(
+            session_ids_for_panes_at(
+                directory.path(),
+                &[("pane-1".into(), "/workspace".into(), 1_790_082_100)],
+            )
+            .get("pane-1")
+            .map(String::as_str),
+            Some("session-compressed")
+        );
+        assert_eq!(
+            find_rollout_paths(directory.path(), &["session-compressed".into()])
+                .get("session-compressed"),
+            Some(&compressed)
+        );
+    }
+
+    #[test]
+    fn plain_sibling_wins_even_when_compressed_is_newer() {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("sessions/2026/09/22");
+        fs::create_dir_all(&day).unwrap();
+        let plain = day.join("rollout-2026-09-22T07-01-40-session-compressed.jsonl");
+        fs::write(
+            &plain,
+            b"{\"timestamp\":\"2026-09-22T13:01:40Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session-compressed\",\"cwd\":\"/workspace\"}}\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-terra\"}}\n",
+        )
+        .unwrap();
+        let compressed = day.join("rollout-2026-09-22T07-01-40-session-compressed.jsonl.zst");
+        compressed_rollout(&compressed);
+
+        set_modified(&plain, 100);
+        set_modified(&compressed, 200);
+        let mut snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 1);
+        enrich_local_sessions_at(
+            &mut snapshot,
+            directory.path(),
+            &["session-compressed".into()],
+        );
+        assert_eq!(
+            snapshot
+                .session_models
+                .get("session-compressed")
+                .map(String::as_str),
+            Some("gpt-5.6-terra")
+        );
+        assert!(snapshot.context.is_none());
+        assert_eq!(
+            find_rollout_paths(directory.path(), &["session-compressed".into()])
+                .get("session-compressed"),
+            Some(&plain)
+        );
+        assert_eq!(
+            rollouts_started_near(directory.path(), std::iter::once(1_790_082_100)),
+            vec![plain.clone()]
+        );
+
+        set_modified(&plain, 300);
+        assert_eq!(
+            find_rollout_paths(directory.path(), &["session-compressed".into()])
+                .get("session-compressed"),
+            Some(&plain)
+        );
+    }
+
+    #[test]
+    fn damaged_compressed_rollout_falls_back_like_unreadable_plain_rollout() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("rollout-session-compressed.jsonl.zst");
+        let bytes = compressed_rollout(&path);
+        fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(read_rollout_observation(&path, "session-compressed").is_none());
+        fs::write(&path, b"not a zstd frame").unwrap();
+        assert!(read_rollout_observation(&path, "session-compressed").is_none());
+        assert!(read_rollout_observation(
+            &directory.path().join("unreadable.jsonl"),
+            "session-compressed"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compressed_reader_uses_latest_model_and_context_beyond_prefix_and_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("rollout-session-compressed.jsonl.zst");
+        let mut source =
+            include_str!("../../tests/fixtures/codex/rollout-prefix.jsonl").to_string();
+        let filler = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"ignored\"}}\n";
+        while source.len() < 256 * 1024 {
+            source.push_str(filler);
+        }
+        source.push_str("{\"type\":\"turn_context\",\"payload\":{\"model\":\"later-model\"}}\n");
+        source.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":60000},\"model_context_window\":100000}}}\n");
+        let tail_floor = source.len() + ROLLOUT_TAIL_BYTES as usize + filler.len();
+        pad_jsonl(&mut source, tail_floor, filler);
+        fs::write(
+            &path,
+            zstd::stream::encode_all(source.as_bytes(), 0).unwrap(),
+        )
+        .unwrap();
+
+        let observation = read_rollout_observation(&path, "session-compressed").unwrap();
+        assert_eq!(observation.model.as_deref(), Some("later-model"));
+        assert!((observation.context.unwrap().used_percent - 54.5454).abs() < 0.001);
     }
 }

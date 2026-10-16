@@ -69,6 +69,106 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agent, and one blank row ends each Space before the next name. `configure`
   appends a `$quota_group_tail` row last in every managed layout and moves
   an older layout's rows into place.
+- The GitHub repository and Herdr plugin id are now
+  [`levi-qiao/herdr-agent-usage`](https://github.com/levi-qiao/herdr-agent-usage)
+  / `herdr-agent-usage`. `./install.sh` adopts config and state from
+  `herdr-agent-quota` even when Herdr has already switched the linked id, then
+  unlinks the old id if it is still listed. The first launch of the new binary
+  does the same for the state and config directories Herdr injects. Files the
+  new directory already has are kept. The previous Cursor hook script stays at
+  its old path until `./install.sh` rewrites `hooks.json`. `./uninstall.sh`
+  restores either id.
+
+### Fixed
+
+- Claude session-local quota no longer presents an idle pane's old percentage as
+  current. The statusLine cache tracks per-window freshness from documented
+  API-derived fields, timer-only redraws keep the original observation age,
+  and stale values render explicitly as `stale` without current headroom.
+  A temporary payload with no `rate_limits` may keep the same session's last
+  still-current window, but it keeps the old observation age rather than
+  making that percentage fresh again.
+- Claude configuration now honors `CLAUDE_CONFIG_DIR/settings.json` when
+  `CLAUDE_SETTINGS_FILE` is not set, matching Claude Code's documented
+  relocated config directory instead of silently falling back to
+  `~/.claude/settings.json`.
+- A Claude or Agy statusLine payload that reports only a model id, such as a
+  model released after this build, now shows that id instead of a blank
+  model. The display name is still preferred when the payload has one.
+- `configure --check` reports a Claude or Agy statusLine hook that still
+  feeds another install (for example the pre-rename `herdr-agent-quota`
+  binary and state directory) as stale instead of installed. Such a hook
+  never reaches this plugin, so new sessions show no model or quota until
+  `configure --apply` rewrites it.
+- Codex quota and per-session models refresh again when Herdr runs the
+  plugin. Herdr's server PATH can omit Homebrew, so every hook, action, and
+  watcher fetch failed to start `codex app-server` and kept a stale snapshot
+  whose model belonged to whatever session a terminal refresh last saw. With
+  no `$CODEX_BIN_PATH` and no `codex` on PATH, the collector now tries
+  `~/.local/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`.
+- `$CODEX_BIN_PATH` set to an npm-style codex shim now starts under Herdr's
+  server PATH too. The collector prepends the override's parent directory
+  to the child PATH the same way the automatic fallback does, so a shim
+  beginning with `#!/usr/bin/env node` resolves `node` next to itself
+  instead of failing with `env: node: No such file or directory`.
+- Codex panes launched through wrappers that suppress Codex hooks now recover
+  their session from Herdr's foreground cwd plus the native Codex process
+  start time, matched to exactly one rollout's `session_meta`. The recovery
+  runs on every agent inventory read, so the active-turn watcher, focus, and
+  sibling publishes keep that session's model and context instead of
+  borrowing the newest provider-wide rollout between manual refreshes. Only
+  rollouts dated within a day of the process start are opened. Ambiguous
+  matches remain unresolved.
+- OpenCode 2 sessions resolve again. OpenCode 2 keeps new sessions in
+  `session_v2`/`session_message` and carries the role in the `type` column,
+  neither of which the collector read: every session created after the upgrade
+  looked absent, so its pane lost the model, context, and OpenCode Go quota
+  rows. Both store layouts are read now, and a migrated session keeps the
+  evidence it already had.
+- Cursor quota follows a `cursor-agent login` account switch while a watch
+  process is already running. The previous token stays valid, and the
+  one-time Keychain approval marker does not move, so caching that secret
+  against the marker kept fetching the old account's Dashboard usage.
+
+## [1.6.2] - 2026-09-20
+
+### Fixed
+
+- Running the integration suite from a Herdr pane no longer disrupts the
+  current Agent view or temporarily puts a Space header between its own agents.
+- Forced quota refresh restores the Agent view. Herdr drops a plugin-owned
+  view on disable, and enable does not run startup, so Space grouping fell
+  back to native `grouped` until the next server restart. Event/focus/watch
+  still do not touch the view.
+- The Cursor hook wrapper lives in plugin state instead of `~/.cursor`.
+  `afterAgentResponse` and `stop` each spawned `bash` against a
+  Cursor-provenance path, so Ghostty prompted `SystemPolicyAppData` twice
+  per turn. Restart an already-running Cursor pane after configure so it
+  reloads `hooks.json`.
+
+- macOS no longer opens Cursor.app's `~/Library/Application Support/Cursor/…/state.vscdb`
+  unless `$CURSOR_STATE_DB` is set, and Herdr-spawned processes no longer read
+  `~/.cursor` (chats `store.db`, `cli-config.json`, `auth.json`) unless
+  `$CURSOR_HOME` / `$CURSOR_AUTH_FILE` / `$CURSOR_STATE_DB` is set. Those trees
+  carry Cursor `com.apple.provenance`; this plugin is ad-hoc signed, so each
+  event/watch/hook process was prompting Ghostty `SystemPolicyAppData`
+  ("would like to access data from other apps"). Credentials stay on Keychain;
+  model/cache/context stay on the hook mailbox. The cache identity mtime is
+  the plugin-state Keychain marker, not a `stat` of `~/.cursor/auth.json` —
+  that leftover watch-tick was enough to keep the dialog after file reads
+  were already gated. The Keychain approval marker moves to plugin state
+  (`cursor-keychain-approved`); configure copies a legacy
+  `~/.cursor/.herdr-keychain-approved` once. A CLI login never falls through
+  to the IDE token, including `AGENT_CLI_CREDENTIAL_STORE=file`.
+
+### Added
+
+- Agent setup playbook (`docs/agent-setup.md`, `docs/agent-setup.zh-CN.md`)
+  and a copy-paste prompt in both READMEs, so a coding agent on the machine
+  that runs Herdr can detect local CLIs, install matching collectors, and
+  finish font maps, Herdr integrations, and macOS Keychain approval instead
+  of stopping at `./install.sh`.
+
 ## [1.6.1] - 2026-09-18
 
 ### Fixed
@@ -901,19 +1001,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A popup dashboard pane, event-driven refresh, and a local snapshot cache that
   survives provider failures.
 
-[Unreleased]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.6.1...HEAD
-[1.6.1]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.6.0...v1.6.1
-[1.6.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.5...v1.6.0
-[1.5.5]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.4...v1.5.5
-[1.5.4]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.3...v1.5.4
-[1.5.3]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.2...v1.5.3
-[1.5.2]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.1...v1.5.2
-[1.5.1]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.5.0...v1.5.1
-[1.5.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.4.0...v1.5.0
-[1.4.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.3.0...v1.4.0
-[1.3.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.2.0...v1.3.0
-[1.2.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/levi-qiao/herdr-agent-quota/compare/v0.2.0...v1.0.0
-[0.2.0]: https://github.com/levi-qiao/herdr-agent-quota/releases/tag/v0.2.0
-[0.1.0]: https://github.com/levi-qiao/herdr-agent-quota/releases/tag/v0.1.0
+[Unreleased]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.2...HEAD
+[1.6.2]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.1...v1.6.2
+[1.6.1]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.0...v1.6.1
+[1.6.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.5...v1.6.0
+[1.5.5]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.4...v1.5.5
+[1.5.4]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.3...v1.5.4
+[1.5.3]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.2...v1.5.3
+[1.5.2]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.0...v1.5.1
+[1.5.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v0.2.0...v1.0.0
+[0.2.0]: https://github.com/levi-qiao/herdr-agent-usage/releases/tag/v0.2.0
+[0.1.0]: https://github.com/levi-qiao/herdr-agent-usage/releases/tag/v0.1.0

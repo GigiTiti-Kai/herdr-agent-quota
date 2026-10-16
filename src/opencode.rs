@@ -10,7 +10,48 @@ const SESSION_BY_ID: &str = "SELECT id FROM session WHERE id = ?1 LIMIT 1";
 /// Bounded same-session providerID lookup. Not a spend scan.
 const MESSAGE_DATA_FOR_SESSION: &str =
     "SELECT data FROM message WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 8";
+/// OpenCode 2 keeps new sessions here instead of `session`.
+const SESSION_BY_ID_V2: &str = "SELECT id FROM session_v2 WHERE id = ?1 LIMIT 1";
+/// The same bounded lookup against the v2 message table, which orders by the
+/// session-unique `seq` and carries the role in `type` instead of the payload.
+const MESSAGE_DATA_FOR_SESSION_V2: &str =
+    "SELECT type, data FROM session_message WHERE session_id = ?1 ORDER BY seq DESC LIMIT 8";
+/// A table this layout needs. Absent means the layout is not in use, not that
+/// the store is unreadable.
+const TABLE_BY_NAME: &str =
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1";
 const MAX_MODELS_BYTES: u64 = 8 * 1024 * 1024;
+
+/// One on-disk layout of OpenCode's session store.
+///
+/// OpenCode 1.x wrote `session`/`message`. OpenCode 2 writes new sessions to
+/// `session_v2`/`session_message` and keeps the v1 tables as the migration
+/// source for sessions that predate the upgrade, so one store can hold both and
+/// a session id lives in exactly one of them. The role moved out of the JSON
+/// payload into `type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionSchema {
+    sessions_table: &'static str,
+    by_id: &'static str,
+    messages: &'static str,
+    role_in_column: bool,
+}
+
+/// Probed in order: a migrated session keeps the evidence it already had.
+const SESSION_SCHEMAS: [SessionSchema; 2] = [
+    SessionSchema {
+        sessions_table: "session",
+        by_id: SESSION_BY_ID,
+        messages: MESSAGE_DATA_FOR_SESSION,
+        role_in_column: false,
+    },
+    SessionSchema {
+        sessions_table: "session_v2",
+        by_id: SESSION_BY_ID_V2,
+        messages: MESSAGE_DATA_FOR_SESSION_V2,
+        role_in_column: true,
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
@@ -188,27 +229,55 @@ fn lookup_session_db(path: &Path, session_id: &str) -> SessionLookup {
     let Ok(connection) = open_readonly(path) else {
         return SessionLookup::Unreadable;
     };
-    match session_exists(&connection, session_id) {
-        Ok(false) => SessionLookup::Missing,
+    match read_session_evidence(&connection, session_id) {
+        Ok(Some(evidence)) => SessionLookup::Found(evidence),
+        Ok(None) => SessionLookup::Missing,
         Err(_) => SessionLookup::Unreadable,
-        Ok(true) => match session_evidence(&connection, session_id) {
-            Ok((provider_id, model_id, context_tokens)) => SessionLookup::Found(SessionEvidence {
-                session_id: session_id.to_string(),
-                provider_id,
-                model_id,
-                context_tokens,
-            }),
-            Err(_) => SessionLookup::Unreadable,
-        },
     }
+}
+
+/// Reads the session from whichever store layout holds it. A layout whose
+/// tables are absent is skipped: an OpenCode 1 store has no v2 tables, and a
+/// freshly upgraded one has no v2 rows for its older sessions.
+fn read_session_evidence(
+    connection: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<SessionEvidence>> {
+    for schema in SESSION_SCHEMAS {
+        if !table_exists(connection, schema.sessions_table)? {
+            continue;
+        }
+        if !session_exists(connection, session_id, &schema)? {
+            continue;
+        }
+        let (provider_id, model_id, context_tokens) =
+            session_evidence(connection, session_id, &schema)?;
+        return Ok(Some(SessionEvidence {
+            session_id: session_id.to_string(),
+            provider_id,
+            model_id,
+            context_tokens,
+        }));
+    }
+    Ok(None)
+}
+
+fn table_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(TABLE_BY_NAME)?;
+    let mut rows = statement.query([name])?;
+    Ok(rows.next()?.is_some())
 }
 
 fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
 
-fn session_exists(connection: &Connection, session_id: &str) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare(SESSION_BY_ID)?;
+fn session_exists(
+    connection: &Connection,
+    session_id: &str,
+    schema: &SessionSchema,
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(schema.by_id)?;
     let mut rows = statement.query([session_id])?;
     Ok(rows.next()?.is_some())
 }
@@ -216,12 +285,17 @@ fn session_exists(connection: &Connection, session_id: &str) -> rusqlite::Result
 fn session_evidence(
     connection: &Connection,
     session_id: &str,
+    schema: &SessionSchema,
 ) -> rusqlite::Result<(Option<String>, Option<String>, Option<u64>)> {
-    let mut statement = connection.prepare(MESSAGE_DATA_FOR_SESSION)?;
+    let mut statement = connection.prepare(schema.messages)?;
     let mut rows = statement.query([session_id])?;
     let mut identity = None;
     while let Some(row) = rows.next()? {
-        let data: String = row.get(0)?;
+        let role = schema
+            .role_in_column
+            .then(|| row.get::<_, String>(0))
+            .transpose()?;
+        let data: String = row.get(usize::from(schema.role_in_column))?;
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
@@ -229,9 +303,10 @@ fn session_evidence(
         if identity.is_none() {
             identity.clone_from(&message_identity);
         }
-        if let (Some((provider_id, model_id)), Some(context_tokens)) =
-            (message_identity, context_tokens_from_message(&value))
-        {
+        if let (Some((provider_id, model_id)), Some(context_tokens)) = (
+            message_identity,
+            context_tokens_from_message(&value, role.as_deref()),
+        ) {
             if identity.as_ref() == Some(&(provider_id, model_id)) {
                 let (provider_id, model_id) = identity.unwrap();
                 return Ok((Some(provider_id), model_id, Some(context_tokens)));
@@ -254,16 +329,18 @@ fn provider_from_message(value: &Value) -> Option<(String, Option<String>)> {
     if provider_id.is_empty() {
         return None;
     }
+    // `modelID` is the v1 spelling; v2 nests the model under `model.id`.
     let model_id = string_field(value, "modelID").or_else(|| {
         value
             .get("model")
-            .and_then(|model| string_field(model, "modelID"))
+            .and_then(|model| string_field(model, "modelID").or_else(|| string_field(model, "id")))
     });
     Some((provider_id, model_id))
 }
 
-fn context_tokens_from_message(value: &Value) -> Option<u64> {
-    if value.get("role").and_then(Value::as_str) != Some("assistant") {
+fn context_tokens_from_message(value: &Value, column_role: Option<&str>) -> Option<u64> {
+    let role = value.get("role").and_then(Value::as_str).or(column_role);
+    if role != Some("assistant") {
         return None;
     }
     let tokens = value.get("tokens")?;
@@ -407,6 +484,56 @@ pub(crate) fn write_fixture_db(path: &Path, rows: &[(&str, &str)]) -> rusqlite::
             "INSERT INTO message (id, session_id, time_created, time_updated, data)
              VALUES (?1, ?2, ?3, ?3, ?4)",
             rusqlite::params![format!("msg_{index}"), *session_id, index as i64 + 1, *data],
+        )?;
+    }
+    Ok(())
+}
+
+/// OpenCode 2's store layout. The role is a column there, so each row is
+/// `(session id, type, data)`.
+#[cfg(test)]
+pub(crate) fn write_v2_fixture_db(
+    path: &Path,
+    rows: &[(&str, &str, &str)],
+) -> rusqlite::Result<()> {
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        "CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL DEFAULT 'proj',
+            slug TEXT NOT NULL DEFAULT 's',
+            directory TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT 't',
+            version TEXT NOT NULL DEFAULT '2',
+            time_created INTEGER NOT NULL DEFAULT 1,
+            time_updated INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );",
+    )?;
+    for (index, (session_id, kind, data)) in rows.iter().enumerate() {
+        connection.execute(
+            "INSERT INTO session_v2 (id) VALUES (?1)
+             ON CONFLICT(id) DO NOTHING",
+            [*session_id],
+        )?;
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+            rusqlite::params![
+                format!("msg_{index}"),
+                *session_id,
+                *kind,
+                index as i64 + 1,
+                *data
+            ],
         )?;
     }
     Ok(())
@@ -567,6 +694,104 @@ mod tests {
     }
 
     #[test]
+    fn v2_session_reads_the_role_column_and_the_model_object() {
+        let directory = tempdir().unwrap();
+        let paths = OpenCodePaths::from_dir(directory.path());
+        write_v2_fixture_db(
+            &paths.db,
+            &[
+                (
+                    "ses_v2",
+                    "user",
+                    r#"{"model":{"id":"kimi-k2.5","providerID":"opencode-go"}}"#,
+                ),
+                (
+                    "ses_v2",
+                    "assistant",
+                    r#"{"model":{"id":"kimi-k2.5","providerID":"opencode-go"},"tokens":{"input":100,"output":10,"reasoning":5,"cache":{"read":20,"write":30}}}"#,
+                ),
+            ],
+        )
+        .unwrap();
+        match lookup_session(&paths, "ses_v2") {
+            SessionLookup::Found(session) => {
+                assert_eq!(session.provider_id.as_deref(), Some("opencode-go"));
+                assert_eq!(session.model_id.as_deref(), Some("kimi-k2.5"));
+                assert_eq!(session.context_tokens, Some(165));
+            }
+            other => panic!("expected found session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_v2_row_whose_type_is_not_assistant_yields_no_context() {
+        let directory = tempdir().unwrap();
+        let paths = OpenCodePaths::from_dir(directory.path());
+        write_v2_fixture_db(
+            &paths.db,
+            &[(
+                "ses_v2",
+                "user",
+                r#"{"model":{"id":"kimi-k2.5","providerID":"opencode-go"},"tokens":{"input":100,"output":10,"reasoning":5,"cache":{"read":20,"write":30}}}"#,
+            )],
+        )
+        .unwrap();
+        match lookup_session(&paths, "ses_v2") {
+            SessionLookup::Found(session) => {
+                assert_eq!(session.context_tokens, None);
+            }
+            other => panic!("expected found session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_v2_only_store_reports_absent_sessions_as_missing() {
+        let directory = tempdir().unwrap();
+        let paths = OpenCodePaths::from_dir(directory.path());
+        write_v2_fixture_db(
+            &paths.db,
+            &[(
+                "ses_v2",
+                "assistant",
+                r#"{"model":{"id":"kimi-k2.5","providerID":"opencode-go"}}"#,
+            )],
+        )
+        .unwrap();
+        assert_eq!(lookup_session(&paths, "ses_absent"), SessionLookup::Missing);
+        assert_eq!(lookup_session_db(&paths.db, ""), SessionLookup::Missing);
+    }
+
+    #[test]
+    fn a_migrated_session_keeps_the_evidence_it_already_had() {
+        let directory = tempdir().unwrap();
+        let paths = OpenCodePaths::from_dir(directory.path());
+        write_fixture_db(
+            &paths.db,
+            &[(
+                "ses_both",
+                r#"{"role":"assistant","providerID":"anthropic","modelID":"sonnet"}"#,
+            )],
+        )
+        .unwrap();
+        write_v2_fixture_db(
+            &paths.db,
+            &[(
+                "ses_both",
+                "assistant",
+                r#"{"model":{"id":"kimi-k2.5","providerID":"opencode-go"}}"#,
+            )],
+        )
+        .unwrap();
+        match lookup_session(&paths, "ses_both") {
+            SessionLookup::Found(session) => {
+                assert_eq!(session.provider_id.as_deref(), Some("anthropic"));
+                assert_eq!(session.model_id.as_deref(), Some("sonnet"));
+            }
+            other => panic!("expected found session, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn model_context_lookup_is_exact_and_bounded() {
         let directory = tempdir().unwrap();
         let paths = OpenCodePaths::from_dir(directory.path());
@@ -613,5 +838,11 @@ mod tests {
         assert!(MESSAGE_DATA_FOR_SESSION.contains("LIMIT 8"));
         assert!(!MESSAGE_DATA_FOR_SESSION.contains("SUM("));
         assert!(!MESSAGE_DATA_FOR_SESSION.contains("cost"));
+
+        assert!(SESSION_BY_ID_V2.contains("WHERE id = ?1"));
+        assert!(MESSAGE_DATA_FOR_SESSION_V2.contains("WHERE session_id = ?1"));
+        assert!(MESSAGE_DATA_FOR_SESSION_V2.contains("LIMIT 8"));
+        assert!(!MESSAGE_DATA_FOR_SESSION_V2.contains("SUM("));
+        assert!(!MESSAGE_DATA_FOR_SESSION_V2.contains("cost"));
     }
 }

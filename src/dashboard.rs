@@ -67,7 +67,7 @@ fn print_snapshot(cache: &CacheStore) -> Result<()> {
 }
 
 fn render_snapshot(cache: &CacheStore) -> Result<String> {
-    let mut output = String::from("Herdr Agent Quota\r\n=================\r\n");
+    let mut output = String::from("Herdr Agent Usage\r\n=================\r\n");
     let now = CacheStore::now_unix();
     let style = cache.percent_style().unwrap_or_default();
     for provider in Provider::ALL {
@@ -202,7 +202,7 @@ mod tests {
     fn snapshot_lines_return_to_column_zero_in_herdr_pty() {
         let directory = tempdir().unwrap();
         let rendered = render_snapshot(&CacheStore::new(directory.path())).unwrap();
-        assert!(rendered.contains("Quota\r\n=================\r\nCodex"));
-        assert!(!rendered.contains("Quota\n================="));
+        assert!(rendered.contains("Herdr Agent Usage\r\n=================\r\nCodex"));
+        assert!(!rendered.contains("Herdr Agent Usage\n================="));
     }
 }

@@ -40,7 +40,7 @@ pub fn run(
 ) -> Result<()> {
     if apply || uninstall {
         std::env::var_os("HERDR_PLUGIN_STATE_DIR").context(
-            "configuration writes must run through Herdr so every collector uses the same cache; invoke herdr-agent-quota.configure or herdr-agent-quota.uninstall",
+            "configuration writes must run through Herdr so every collector uses the same cache; invoke herdr-agent-usage.configure or herdr-agent-usage.uninstall",
         )?;
     }
     if agents.is_empty() {

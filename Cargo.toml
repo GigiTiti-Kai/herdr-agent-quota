@@ -1,12 +1,12 @@
 [package]
 name = "herdr-agent-quota"
-version = "1.6.1"
+version = "1.6.2"
 edition = "2021"
 rust-version = "1.95"
 description = "Credential-scoped AI quota and context in Herdr for Claude, Codex, Grok, Agy, OpenCode, Pi, omp, Devin, Muse, and Cursor"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/levi-qiao/herdr-agent-quota"
+repository = "https://github.com/levi-qiao/herdr-agent-usage"
 homepage = "https://herdr.dev/plugins/"
 keywords = ["herdr", "claude-code", "codex", "quota", "usage"]
 categories = ["command-line-utilities", "development-tools"]
@@ -39,6 +39,9 @@ ureq = { version = "2.12", features = ["json"] }
 # models.db, Devin CLI's sessions.db, and Cursor IDE's state.vscdb
 # (`cursorAuth/accessToken` only).
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+# Codex can archive rollouts as .jsonl.zst. Read the first record for identity
+# and stream a bounded recent window for model/context observations.
+zstd = { version = "0.13", default-features = false }
 
 # Only used to put the Codex app-server in its own process group.
 [target.'cfg(unix)'.dependencies]
@@ -48,5 +51,5 @@ libc = "0.2"
 tempfile = "3.14"
 
 [[bin]]
-name = "herdr-agent-quota"
+name = "herdr-agent-usage"
 path = "src/main.rs"

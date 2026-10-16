@@ -34,7 +34,7 @@ regressions with a short call burst while a person watches the pane.
 
 Bisect in this order, with one observed reproduction per step:
 
-1. `herdr plugin disable herdr-agent-quota` **and** remove the `statusLine`
+1. `herdr plugin disable herdr-agent-usage` **and** remove the `statusLine`
    entry from `~/.claude/settings.json`, then **restart the agent pane**.
    `herdr plugin disable` alone is not enough — Claude Code runs the statusLine
    command itself, independent of Herdr, and reads the setting at startup.

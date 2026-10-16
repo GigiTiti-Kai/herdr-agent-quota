@@ -1,6 +1,6 @@
-id = "herdr-agent-quota"
-name = "Herdr Agent Quota"
-version = "1.6.1"
+id = "herdr-agent-usage"
+name = "Herdr Agent Usage"
+version = "1.6.2"
 min_herdr_version = "0.9.0"
 description = "Credential-scoped AI quota and context for Claude, Codex, Grok, Agy, OpenCode, Pi, omp, Devin, Muse, Cursor, and Hermes."
 platforms = ["macos", "linux"]
@@ -9,63 +9,63 @@ platforms = ["macos", "linux"]
 command = ["cargo", "build", "--release"]
 
 [[startup]]
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" startup --provider all"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" startup --provider all"]
 
 [[actions]]
 id = "refresh"
 title = "Refresh agent quota"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" refresh --provider all --force"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" refresh --provider all --force"]
 
 [[actions]]
 id = "configure"
 title = "Install / repair agent quota"
-command = ["sh", "-c", "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" configure --apply && herdr server reload-config && exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" startup --provider all"]
+command = ["sh", "-c", "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" configure --apply && herdr server reload-config && exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" startup --provider all"]
 
 [[actions]]
 id = "open-settings"
 title = "Open agent quota settings"
-command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus"]
 
 [[actions]]
 id = "uninstall"
 title = "Uninstall agent quota configuration"
-command = ["sh", "-c", "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" configure --uninstall && herdr server reload-config"]
+command = ["sh", "-c", "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" configure --uninstall && herdr server reload-config"]
 
 [[events]]
 id = "agent-quota-refresh"
 on = "pane.agent_detected"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" event"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" event"]
 
 [[events]]
 id = "agent-quota-status-refresh"
 on = "pane.agent_status_changed"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" event"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" event"]
 
 [[events]]
 id = "focused-agent-quota-refresh"
 on = "pane.focused"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" focus"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" focus"]
 
 [[events]]
 id = "focused-workspace-agent-quota-refresh"
 on = "workspace.focused"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" focus"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" focus"]
 
 [[events]]
 id = "focused-tab-agent-quota-refresh"
 on = "tab.focused"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" focus"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" focus"]
 
 [[panes]]
 id = "dashboard"
 title = "Agent quota"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" dashboard"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" dashboard"]
 placement = "popup"
 
 [[panes]]
 id = "settings"
 title = "Agent quota settings"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" settings"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-usage\" settings"]
 placement = "popup"
 # Every option on screen at once. The default half-size popup is 24 rows and
 # the list plus controls needs 36 interior rows, so without this the agents

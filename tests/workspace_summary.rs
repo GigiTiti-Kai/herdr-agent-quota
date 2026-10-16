@@ -44,7 +44,7 @@ fn refresh(root: &Path, workspaces: serde_json::Value) -> Vec<String> {
     fs::write(root.join("calls"), "").unwrap();
     let _ = fs::remove_dir_all(root.join("reports"));
     fs::create_dir(root.join("reports")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
         .args(["refresh", "--provider", "claude"])
         .env("HERDR_PLUGIN_STATE_DIR", root)
         .env("HERDR_PLUGIN_CONFIG_DIR", root)
@@ -177,7 +177,7 @@ fn refresh_codex(root: &Path) -> BTreeMap<String, String> {
     fs::write(root.join("calls"), "").unwrap();
     let _ = fs::remove_dir_all(root.join("reports"));
     fs::create_dir(root.join("reports")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
         .args(["refresh", "--provider", "codex"])
         .env("HERDR_PLUGIN_STATE_DIR", root)
         .env("HERDR_PLUGIN_CONFIG_DIR", root)
@@ -387,7 +387,7 @@ fn refresh_claude(root: &Path, credentials: &Path) -> BTreeMap<String, String> {
     fs::write(root.join("calls"), "").unwrap();
     let _ = fs::remove_dir_all(root.join("reports"));
     fs::create_dir(root.join("reports")).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
         .args(["refresh", "--provider", "claude"])
         .env("HERDR_PLUGIN_STATE_DIR", root)
         .env("HERDR_PLUGIN_CONFIG_DIR", root)

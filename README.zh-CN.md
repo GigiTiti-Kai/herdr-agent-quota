@@ -1,9 +1,9 @@
-# herdr-agent-quota
+# herdr-agent-usage
 
 在 Herdr Agent 侧栏显示模型、上下文和订阅额度——按 Space 分组，并用品牌图标承载
 agent 状态。
 
-[![CI](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml/badge.svg)](https://github.com/levi-qiao/herdr-agent-quota/actions/workflows/ci.yml)
+[![CI](https://github.com/levi-qiao/herdr-agent-usage/actions/workflows/ci.yml/badge.svg)](https://github.com/levi-qiao/herdr-agent-usage/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [English](README.md)
@@ -33,13 +33,23 @@ order 默认按 Space 分组，组内剩余额度最少的优先。
 以及受支持的 agent CLI。
 
 ```sh
-git clone https://github.com/levi-qiao/herdr-agent-quota.git
-cd herdr-agent-quota
+git clone https://github.com/levi-qiao/herdr-agent-usage.git
+cd herdr-agent-usage
 ./install.sh
 ```
 
+GitHub 仓库名和 Herdr 插件 id 都是 `herdr-agent-usage`。`./install.sh` 会接管已有的
+`herdr-agent-quota` 配置和状态，即使 Herdr 已经把链接换成新 id 也会从磁盘上的旧目录
+搬过去，然后再 unlink 仍在列表里的旧 id。新二进制第一次启动时也会搬 Herdr 注入的那两个
+目录。拉取之后请再跑一次 `./install.sh`，Cursor 的 hook 命令才会改写；在那之前旧脚本
+继续生效。
+
 只启用部分 agent：`./install.sh --agent claude,codex,omp`。
 仅在需要加载新安装的 hook 或 Herdr integration 时，才需重启已经运行的 agent 会话。
+
+脚本会编译、链接并跑 `configure`。它不会在每一种终端里把图标映射好，也不会
+做完 Herdr integration 和 macOS 钥匙串授权。要让这台电脑上的编程助手收尾，
+把 [让 Agent 装完整](#让-agent-装完整) 里的提示词贴给它。
 
 在仓库目录升级：
 
@@ -51,12 +61,90 @@ git pull --ff-only
 升级保留已有偏好，修复插件管理的配置，重新读取额度并自动恢复后台更新。
 不需要删除缓存或管理 watcher 进程；Herdr 服务端连接变化后，watcher 会自动接管。
 
+## 让 Agent 装完整
+
+`./install.sh` 不是全部工作：品牌图标要在**当前**终端里映射字体，多数 agent
+还要 Herdr integration，macOS 上的 Cursor/Muse 需要一次性钥匙串 **Always
+Allow**。把下面这段贴给**跑 Herdr 的这台电脑**上的 Claude、Cursor、Grok、
+Codex 或其他编程助手。完整步骤和命令见
+[docs/agent-setup.zh-CN.md](docs/agent-setup.zh-CN.md)
+（[English](docs/agent-setup.md)）。
+
+```
+把 herdr-agent-usage 在这台电脑上配置到真正能用：Herdr 的 Agent 侧栏要显示
+品牌图标，以及我实际安装了的那些 agent CLI 的额度。不要在 ./install.sh
+结束后停手。图标变成方框或问号都算没装完。
+
+仓库：https://github.com/levi-qiao/herdr-agent-usage
+若当前工作区已经是该仓库就直接用；否则 clone 后进入目录，严格按照
+docs/agent-setup.zh-CN.md（中文）或 docs/agent-setup.md（英文）执行。
+读不到这两个文件时，仍须做完下面全部步骤。
+
+规则：
+- 不要 herdr pane read（尤其 --source recent）。那会重绘正在跑的 agent TUI。
+- 不要调用名为 agent 的裸命令（和 Grok 并存时那是 Grok 的）。Cursor CLI 是
+  cursor 或 cursor-agent。
+- 不要给 Cursor 装 statusLine，那会换掉官方底栏。
+- 插件 action 看不到你 export 的环境变量。选择项用 ./install.sh 的 flag 传。
+- 用 rustup 装 rust-toolchain.toml 里的工具链，不要 brew install rust。
+
+1. PATH 先加上 ~/.local/bin、~/.cargo/bin、/opt/homebrew/bin、/usr/local/bin。
+   需要 herdr 0.9.0+ 和 rustup/cargo。没有 herdr 就停下来告诉我。没有 cargo
+   就装 rustup（https://rustup.rs），不要用发行版/Homebrew 的 rust 包。
+
+2. 探测 agent：PATH 上的二进制、常见配置目录、以及 herdr agent list 的并集。
+   --agent 名字：claude（claude，~/.claude）、codex（codex，~/.codex）、
+   grok（grok，~/.grok）、agy（agy，~/.gemini/antigravity-cli）、
+   opencode（opencode，~/.config/opencode）、pi（pi，~/.pi/agent）、
+   omp（omp，~/.omp）、devin（devin，~/.local/share/devin）、
+   muse（muse 或 muse-code，~/.config/muse）、
+   cursor（cursor 或 cursor-agent，~/.cursor）。
+   先打印探测结果。一个都没有就装 all，并说明。
+
+3. 在仓库里：若是干净的 main 先 git pull --ff-only，然后
+   ./install.sh --agent <探测到的,逗号分隔>
+   读完输出。font: 和缺失 integration 都是还没做完的工作。
+
+4. 脚本之后：
+   - herdr plugin list 必须能看到已启用的 herdr-agent-usage。
+   - 等到 configure/refresh 日志 succeeded（invoke 会在 running 时就返回）。
+   - herdr integration status；已探测到且为 not installed 的，执行
+     herdr integration install <id>（claude、codex、grok、opencode、pi、omp、
+     devin、cursor；agy 和 muse 不需要）。用户没有的 CLI 不要装。
+   - 字体：configure 会把 Herdr Agent Icons Max 拷到 ~/Library/Fonts（macOS）
+     或 ~/.local/share/fonts（Linux），且仅当 Ghostty/kitty 配置已存在时写入
+     映射。Linux 对该字体目录跑 fc-cache。判断当前终端（TERM_PROGRAM /
+     KITTY_WINDOW_ID / WEZTERM_EXECUTABLE）。PUA U+E1A0–U+E1B6 必须显式映射，
+     否则格子是方框或「?」。Ghostty：
+     font-codepoint-map = U+E1A0-U+E1B6="Herdr Agent Icons Max"
+     （以及 U+E1C0–U+E1C5），包在 # BEGIN/END herdr-agent-usage font 里。
+     kitty：symbol_map 同样范围到 Herdr Agent Icons Max。WezTerm：把该 family
+     加进 font_with_fallback。VS Code/Cursor：追加到
+     terminal.integrated.fontFamily。然后重载终端（Ghostty cmd+shift+,，
+     kitty ctrl+shift+f5）。Muse 故意用文本标记 ◈。宽栏里同一厂商的嵌套子行
+     本来就没有图标。1.6.1 之后仍是黄色「?」多半是终端没映射；更旧版本工作态
+     用了 ZWNJ，需要升级。
+   - macOS 上的 Cursor：若 ~/.cursor/cli-config.json 有 authInfo，且没有
+     ~/.cursor/.herdr-keychain-approved，先告诉我，再运行
+     ./target/release/herdr-agent-usage refresh --provider cursor --keychain-approve --force
+     并让我点 Always Allow（不要点 Allow）。
+   - macOS 上 Muse 的 keychain 登录：同样用 --provider muse。
+   - herdr plugin action invoke refresh --plugin herdr-agent-usage 并等待结束。
+   - 告诉我哪些已经在跑的窗格要重启（新 hook / integration）。Claude/Agy 要
+     再发一轮 StatusLine 才会有额度。Cursor 的 cache 要在 hooks.json 重载后
+     再发一轮。
+
+5. 汇报：探测到 vs 实际启用的 agent、integration、字体路径和映射了哪个终端、
+   钥匙串、还要重启什么、还有什么是坏的。没有人看过图标或未经字体映射验证时，
+   不要声称图标已经正确。
+```
+
 ## 设置
 
 按 `prefix+shift+q` 打开；若该快捷键已有其他用途，可运行：
 
 ```sh
-herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
+herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 ```
 
 <img src="docs/screenshots/settings.png" alt="Agent quota 设置" width="760">
@@ -84,7 +172,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Grok | CLI billing 接口；7d 或 30d | 当前 CLI 凭据 |
 | Devin | CLI usage 接口；1d 和 7d | 当前 CLI 凭据 |
 | Muse Code | CLI 订阅接口；5h 和 7d | 当前 CLI 账号登录；会话通过 Muse 的 session lock 识别（Linux） |
-| Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则 macOS Keychain 里 `cursor-agent login` 的登录，否则桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；`cx` 来自 `store.db` `token_details`（CLI 底栏百分比）；cache 来自 CLI hook |
+| Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则 macOS Keychain 里 `cursor-agent login` 的登录，否则在 CLI 没有自己的登录且设置了 `$CURSOR_STATE_DB` 时用桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；`cx` 来自 `store.db` `token_details`（CLI 底栏百分比）；cache 来自 CLI hook |
 | Claude Code | StatusLine；5h 和 7d | 精确会话的观测 |
 | Agy / Antigravity | StatusLine；5h、7d，以及 Gemini 会话上的 api（第三方池） | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
@@ -142,13 +230,15 @@ Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
 
 | 现象 | 检查 |
 | --- | --- |
+| 品牌图标是方框或 `?` | 字体没装上，或当前终端没有 U+E1A0–U+E1B6 映射——见 [让 Agent 装完整](#让-agent-装完整)。`configure` 之后要重载终端。1.6.1 之前工作态的黄色 `?` 是 ZWNJ 的 bug，先升级。Muse 故意用文本标记 `◈`。宽栏里同一厂商的嵌套子行本来就没有图标。 |
 | 缺少会话数据 | 运行 `herdr integration status`，安装缺失项后重启对应 agent |
 | Claude/Agy 缺少额度 | 发送一轮消息，让该会话的 StatusLine 产生观测 |
 | OMP 缺少额度 | 检查 `omp usage --json --redact --provider <id>` |
 | Hermes 缺少额度 | 除非会话在 Herdr 窗格内以默认 profile 运行 ChatGPT/Codex，否则属于预期。用 `hermes plugins list` 确认 `herdr-agent-quota` 已启用，然后发送一轮消息。不会借用其他 CLI 的额度 |
 | Devin 缺少额度 | 检查 CLI 登录；使用自定义路径时检查 `DEVIN_CREDENTIALS_FILE` |
-| Muse 缺少额度 | 运行 `muse login`（API key 登录没有订阅额度）；使用自定义路径时检查 `MUSE_AUTH_PATH`。macOS 上 `storage: "keychain"` 登录还需一次性 Keychain 授权：运行 `herdr-agent-quota refresh --provider muse --keychain-approve`，并点击 **Always Allow** |
-| Cursor 缺少额度或仍显示上一账号 | 运行 `cursor login`。macOS 上 `cursor-agent login` 把 token 存在 Keychain：运行 `herdr-agent-quota refresh --provider cursor --keychain-approve` 并点击 **Always Allow**。仅当 CLI 本身没有登录时才使用桌面端 token |
+| Muse 缺少额度 | 运行 `muse login`（API key 登录没有订阅额度）；使用自定义路径时检查 `MUSE_AUTH_PATH`。macOS 上 `storage: "keychain"` 登录还需一次性 Keychain 授权：运行 `herdr-agent-usage refresh --provider muse --keychain-approve`，并点击 **Always Allow** |
+| Cursor 缺少额度或仍显示上一账号 | 运行 `cursor login`。macOS 上 `cursor-agent login` 把 token 存在 Keychain：运行 `herdr-agent-usage refresh --provider cursor --keychain-approve` 并点击 **Always Allow**。仅当 CLI 本身没有登录且设置了 `$CURSOR_STATE_DB` 时才使用桌面端 token |
+| 用 Cursor 时 Ghostty 反复弹出 “would like to access data from other apps” | 这是 macOS 的 `SystemPolicyAppData`：Ghostty 的子进程碰到了 Cursor 名下的文件（`~/.cursor` 或 Application Support）。本插件在 macOS 上默认不再打开这些目录，除非设置了 `$CURSOR_HOME` / `$CURSOR_AUTH_FILE` / `$CURSOR_STATE_DB`。Cursor CLI 自己仍可能弹（它会写 `~/Library/Caches`）。点 **Allow**，或给 Ghostty 开 Files & Folders / Full Disk Access。点 **Don't Allow** 之后读会失败关闭。升级后请重载插件，让 watcher 用上新二进制。 |
 | Cursor 缺少 cache/cx | `cx` 来自该会话的 `store.db`；cache 仍需重启 pane 以加载 `hooks.json` 后再发一轮（headless `--print` 不会触发这些 hook） |
 | 缺少侧栏行 | 运行下面的 configure action 修复插件配置 |
 | 侧栏太窄，`gauges` 不显示进度条 | 约 24 列以下是预期行为；调宽后刷新即可 |
@@ -156,8 +246,8 @@ Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。
 | `gauges` 下 cache 信息仍分两行 | 调宽侧栏，直到合并后的整行放得下 |
 
 ```sh
-herdr plugin action invoke refresh --plugin herdr-agent-quota
-herdr plugin action invoke configure --plugin herdr-agent-quota
+herdr plugin action invoke refresh --plugin herdr-agent-usage
+herdr plugin action invoke configure --plugin herdr-agent-usage
 ```
 
 完整卸载使用 `./uninstall.sh`，只移除部分 agent 使用 `./uninstall.sh --agent grok`。

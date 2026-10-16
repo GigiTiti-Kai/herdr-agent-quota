@@ -87,7 +87,7 @@ esac
         .unwrap();
         fs::write(root.join("calls"), "").unwrap();
         fs::write(root.join("report"), "").unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
             .args(["refresh", "--provider", "claude"])
             .env("HERDR_PLUGIN_STATE_DIR", root)
             .env("HERDR_PLUGIN_CONFIG_DIR", root)

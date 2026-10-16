@@ -85,16 +85,11 @@ pub fn run(providers: &[Provider], force: bool, json: bool) -> Result<()> {
 
 /// Restore the Herdr state this plugin owns, then refresh once.
 ///
-/// Only the agent order is restored, and only when it is this plugin's to
-/// restore: a `default` order owns no Herdr view, so startup has nothing to
-/// put back and must not spend a socket call saying so.
+/// Forced refresh restores the Agent view: Herdr drops a plugin-owned view
+/// on disable, and enable does not run startup. Event/focus/watch must not
+/// spend a socket call on every turn. A `default` order owns no view, so
+/// nothing is put back.
 pub fn startup(providers: &[Provider]) -> Result<()> {
-    if let Ok(cache) = CacheStore::from_env() {
-        let order = crate::configure::resolved_agent_order(None, Some(&cache));
-        if order.is_quota() {
-            crate::configure::apply_agent_order(order);
-        }
-    }
     // Handoff need not emit another idle -> working event. An existing
     // watcher adopts the saved environment; otherwise this starts one.
     run(providers, true, false)?;
@@ -547,6 +542,9 @@ fn run_internal(
 ) -> Result<()> {
     let cache = CacheStore::from_env()?;
     WatchHerdrEnvironment::current().save(&cache)?;
+    if force {
+        restore_quota_agent_view(&cache);
+    }
     // Agent inventory is metadata-only. Reusing it for both the fetch and the
     // publish pass lets local Codex/Grok diagnostics target the exact pane
     // sessions without adding another Herdr call or reading any pane output.
@@ -576,6 +574,16 @@ fn run_internal(
         println!("{}", serde_json::to_string_pretty(&outcomes)?);
     }
     Ok(())
+}
+
+/// Herdr drops this plugin's Agent view (`plugin:<id>`) on disable. Enable
+/// does not run startup, so a forced refresh is the repair that also
+/// respawns the watcher. Event/focus/watch ticks stay off this path.
+fn restore_quota_agent_view(cache: &CacheStore) {
+    let order = crate::configure::resolved_agent_order(None, Some(cache));
+    if order.is_quota() {
+        crate::configure::apply_agent_order(order);
+    }
 }
 
 pub fn event() -> Result<()> {
@@ -2458,7 +2466,9 @@ fn tokens_for_loaded_snapshot(
 mod tests {
     use super::*;
     use crate::cli::{PercentStyle, SidebarLayout};
-    use crate::model::{ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
+    use crate::model::{
+        ProviderSnapshot, ResetAt, SessionQuotaObservation, UsageWindow, WindowKind,
+    };
     use tempfile::tempdir;
 
     fn test_pane(id: &str, harness: Harness) -> AgentPane {
@@ -3394,6 +3404,21 @@ mod tests {
                 window(WindowKind::Weekly, 20.0, 90_000),
             ],
         );
+        snapshot.session_quota_observations.insert(
+            "s1".to_string(),
+            vec![
+                SessionQuotaObservation {
+                    kind: WindowKind::FiveHour,
+                    observed_at_unix: Some(1_000),
+                    api_generation: Some("generation-a".to_string()),
+                },
+                SessionQuotaObservation {
+                    kind: WindowKind::Weekly,
+                    observed_at_unix: Some(1_000),
+                    api_generation: Some("generation-a".to_string()),
+                },
+            ],
+        );
         cache.save(&snapshot).unwrap();
 
         let row = publish_row(&cache);
@@ -3695,6 +3720,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn one_vendor_quota_row_stays_on_the_stable_pane() {
         let mut tokens = vec![
             quota_tokens("w1:p1", "Grok", Some(87)),
@@ -3714,6 +3740,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn focusing_another_tab_does_not_move_the_vendor_quota_row() {
         let mut tokens = vec![
             quota_tokens("w1:p1", "Grok", Some(87)),
@@ -3754,6 +3781,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn opencode_go_and_opencode_share_one_vendor_row() {
         let mut go = quota_tokens("w1:p1", "OpenCode Go", Some(40));
         go.identity = Some(crate::herdr::PaneIdentity {
@@ -3787,6 +3815,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn a_stale_same_space_sibling_is_queued_to_drop_windows() {
         let mut focused = test_pane("w5:pA", Harness::Grok);
         focused.focused = true;
@@ -3804,6 +3833,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn a_flat_representative_is_queued_when_a_sibling_joins() {
         let mut head = test_pane("w9:p1", Harness::Cursor);
         head.workspace_id = "w9".to_string();
@@ -3844,6 +3874,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
     fn vendor_sync_does_not_queue_a_different_vendor() {
         let mut grok = test_pane("w5:pA", Harness::Grok);
         grok.workspace_id = "w5".to_string();

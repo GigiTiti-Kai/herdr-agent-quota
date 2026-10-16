@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "herdr-agent-quota",
+    name = "herdr-agent-usage",
     version,
     about = "Show AI agent subscription quota in Herdr"
 )]

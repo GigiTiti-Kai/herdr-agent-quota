@@ -2,6 +2,7 @@ use crate::cli::{
     AgentSelection, BrandColors, FieldSet, SidebarField, SidebarLayout, SidebarRowGap,
     SummaryFormat,
 };
+use crate::identity::{self, PLUGIN_ID};
 use crate::model::Harness;
 use crate::presentation::AccountFamily;
 use anyhow::{Context, Result};
@@ -85,16 +86,13 @@ const QUOTA_ROW_MARKERS: [&str; 74] = [
     "$quota_share_month_danger",
     "$quota_share_month_unknown",
 ];
-const ROW_GAP_MARKER: &str = "herdr-agent-quota";
-const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
-/// Marks `ui.agent_panel_sort` when this plugin wrote Space grouping.
-const AGENT_PANEL_SORT_MARKER: &str = "herdr-agent-quota";
-const PROVIDER_STYLE_MARKER: &str = "herdr-agent-quota-provider";
-const FOOTER_MARKER: &str = "herdr-agent-quota-footer";
+const ROW_GAP_MARKER: &str = PLUGIN_ID;
+/// Fork-only: marks the account-summary `footer` this plugin wrote.
+fn footer_marker() -> String {
+    format!("{PLUGIN_ID}-footer")
+}
 const REFRESH_KEY: &str = "prefix+shift+r";
-const REFRESH_ACTION: &str = "herdr-agent-quota.refresh";
 const SETTINGS_KEY: &str = "prefix+shift+q";
-const SETTINGS_ACTION: &str = "herdr-agent-quota.open-settings";
 const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
 // Brand answers "who"; status answers "how much is left". All other text
 // inherits Herdr's active theme. Selected state may change background only —
@@ -528,13 +526,13 @@ fn rewrite_quota_sidebar(
     add_plugin_keybinding(
         &mut document,
         REFRESH_KEY,
-        REFRESH_ACTION,
+        &identity::refresh_action(),
         "refresh all agent quotas",
     )?;
     add_plugin_keybinding(
         &mut document,
         SETTINGS_KEY,
-        SETTINGS_ACTION,
+        &identity::settings_action(),
         "open agent quota settings",
     )?;
     ensure_spaces_panel_sort(&mut document)?;
@@ -544,7 +542,7 @@ fn rewrite_quota_sidebar(
         .and_then(Item::as_value)
         .and_then(|value| value.decor().suffix())
         .and_then(|suffix| suffix.as_str())
-        .is_some_and(|suffix| suffix.contains(ROW_GAP_MARKER));
+        .is_some_and(identity::comment_owns);
     if !table.contains_key("row_gap") || managed_row_gap {
         // Herdr's row_gap also splits nested vendor children. Keep panes
         // packed and paint the user's 1-line gap with `$quota_nest_gap`.
@@ -585,14 +583,16 @@ fn rewrite_quota_sidebar(
         let mut rows_value = Value::Array(managed_rows);
         rows_value
             .decor_mut()
-            .set_suffix(format!(" # {MANAGED_ROW_MARKER}"));
+            .set_suffix(format!(" # {}", identity::row_marker()));
         table.insert("rows", Item::Value(rows_value));
     }
     // Shared like `row_gap`: written when absent or ours, removed only when ours.
     let managed_footer = has_footer_marker(table);
     if summary.is_on() && (managed_footer || !table.contains_key("footer")) {
         let mut footer = Value::Array(footer_rows(layout, summary));
-        footer.decor_mut().set_suffix(format!(" # {FOOTER_MARKER}"));
+        footer
+            .decor_mut()
+            .set_suffix(format!(" # {}", footer_marker()));
         table.insert("footer", Item::Value(footer));
     } else if !summary.is_on() && managed_footer {
         table.remove("footer");
@@ -693,7 +693,7 @@ fn has_rows_marker(value: &Value) -> bool {
         .decor()
         .suffix()
         .and_then(|suffix| suffix.as_str())
-        .is_some_and(|suffix| suffix.contains(MANAGED_ROW_MARKER))
+        .is_some_and(identity::owns_row_comment)
 }
 
 fn is_safe_to_take_over(rows: &Array) -> bool {
@@ -839,7 +839,7 @@ pub fn remove_quota_row_for(input: &str, agents: &[Harness], full: bool) -> Resu
         .and_then(Item::as_value)
         .and_then(|value| value.decor().suffix())
         .and_then(|suffix| suffix.as_str())
-        .is_some_and(|suffix| suffix.contains(ROW_GAP_MARKER));
+        .is_some_and(identity::comment_owns);
     if managed_row_gap {
         table.remove("row_gap");
     }
@@ -863,6 +863,26 @@ fn add_plugin_keybinding(
         .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .context("Herdr keys.command must be an array of tables")?;
+    let wanted_kind = action.rsplit('.').next().unwrap_or(action);
+    let mut rewritten = false;
+    for command in commands.iter_mut() {
+        let Some(existing) = command.get("command").and_then(Item::as_str) else {
+            continue;
+        };
+        if !identity::is_managed_keybinding(existing) {
+            continue;
+        }
+        if !existing.ends_with(&format!(".{wanted_kind}")) {
+            continue;
+        }
+        if existing != action {
+            command.insert("command", Item::Value(Value::from(action)));
+        }
+        rewritten = true;
+    }
+    if rewritten {
+        return Ok(());
+    }
     if commands
         .iter()
         .any(|command| command.get("command").and_then(Item::as_str) == Some(action))
@@ -894,12 +914,14 @@ fn remove_plugin_keybindings(document: &mut DocumentMut) {
     };
     let mut retained = ArrayOfTables::new();
     for command in commands.iter() {
-        if !matches!(
-            command.get("command").and_then(Item::as_str),
-            Some(REFRESH_ACTION | SETTINGS_ACTION)
-        ) {
-            retained.push(command.clone());
+        if command
+            .get("command")
+            .and_then(Item::as_str)
+            .is_some_and(identity::is_managed_keybinding)
+        {
+            continue;
         }
+        retained.push(command.clone());
     }
     if retained.is_empty() {
         keys.remove("command");
@@ -971,7 +993,7 @@ fn add_provider_rows(
         let mut value = Value::Array(rows.clone());
         value
             .decor_mut()
-            .set_suffix(format!(" # {PROVIDER_STYLE_MARKER}"));
+            .set_suffix(format!(" # {}", identity::provider_marker()));
         rows_by_agent.insert(provider, Item::Value(value));
     }
     Ok(skipped)
@@ -1000,7 +1022,7 @@ fn has_provider_style_marker(value: &Value) -> bool {
         .decor()
         .suffix()
         .and_then(|suffix| suffix.as_str())
-        .is_some_and(|suffix| suffix.contains(PROVIDER_STYLE_MARKER))
+        .is_some_and(identity::owns_provider_comment)
 }
 
 /// Herdr 0.9's native navigation row. Plugin fields are appended below it so
@@ -1520,7 +1542,9 @@ fn has_footer_marker(table: &Table) -> bool {
         .and_then(Item::as_value)
         .and_then(|value| value.decor().suffix())
         .and_then(|suffix| suffix.as_str())
-        .is_some_and(|suffix| suffix.contains(FOOTER_MARKER))
+        .is_some_and(|suffix| {
+            identity::all_plugin_ids().any(|id| suffix.contains(&format!("{id}-footer")))
+        })
 }
 
 fn append_window_row(rows: &mut Array, palette: [&'static str; 3]) {
@@ -1544,7 +1568,7 @@ fn remove_managed_selection_theme(document: &mut DocumentMut) {
             .and_then(Item::as_value)
             .and_then(|value| value.decor().suffix())
             .and_then(|suffix| suffix.as_str())
-            .is_some_and(|suffix| suffix.contains(ROW_GAP_MARKER));
+            .is_some_and(identity::comment_owns);
         if managed {
             custom.remove(key);
         }
@@ -1568,11 +1592,10 @@ fn ensure_spaces_panel_sort(document: &mut DocumentMut) -> Result<()> {
         .and_then(Item::as_value)
         .and_then(|value| value.decor().suffix())
         .and_then(|suffix| suffix.as_str())
-        .is_some_and(|suffix| suffix.contains(AGENT_PANEL_SORT_MARKER));
+        .is_some_and(identity::comment_owns);
     if !ui.contains_key("agent_panel_sort") || managed {
         let mut sort = Value::from("spaces");
-        sort.decor_mut()
-            .set_suffix(format!(" # {AGENT_PANEL_SORT_MARKER}"));
+        sort.decor_mut().set_suffix(format!(" # {PLUGIN_ID}"));
         ui.insert("agent_panel_sort", Item::Value(sort));
     }
     Ok(())
@@ -1587,7 +1610,7 @@ fn remove_managed_panel_sort(document: &mut DocumentMut) {
         .and_then(Item::as_value)
         .and_then(|value| value.decor().suffix())
         .and_then(|suffix| suffix.as_str())
-        .is_some_and(|suffix| suffix.contains(AGENT_PANEL_SORT_MARKER));
+        .is_some_and(identity::comment_owns);
     if managed {
         ui.remove("agent_panel_sort");
     }
@@ -1717,6 +1740,39 @@ mod tests {
             .map(|(harness, _)| *harness)
             .collect();
         assert_eq!(styles.as_slice(), AgentSelection::SUPPORTED.as_slice());
+    }
+
+    #[test]
+    fn rewrites_alias_owned_markers_and_keybindings_to_the_current_id() {
+        let original = concat!(
+            "[[keys.command]]\n",
+            "key = \"prefix+shift+r\"\n",
+            "type = \"plugin_action\"\n",
+            "command = \"herdr-agent-quota.refresh\"\n",
+            "description = \"refresh all agent quotas\"\n\n",
+            "[[keys.command]]\n",
+            "key = \"prefix+shift+q\"\n",
+            "type = \"plugin_action\"\n",
+            "command = \"herdr-agent-quota.open-settings\"\n",
+            "description = \"open agent quota settings\"\n\n",
+            "[ui]\n",
+            "agent_panel_sort = \"spaces\" # herdr-agent-quota\n\n",
+            "[ui.sidebar.agents]\n",
+            "row_gap = 0 # herdr-agent-quota\n",
+            "rows = [[\"state_icon\", \"agent\"]] # herdr-agent-quota-row\n",
+        );
+        let updated = add_quota_row(original).unwrap();
+        assert!(updated.contains(identity::refresh_action().as_str()));
+        assert!(updated.contains(identity::settings_action().as_str()));
+        assert!(updated.contains(&format!("agent_panel_sort = \"spaces\" # {PLUGIN_ID}")));
+        assert!(updated.contains(&format!("row_gap = 0 # {PLUGIN_ID}")));
+        assert!(updated.contains(identity::row_marker().as_str()));
+        assert!(!updated.contains("herdr-agent-quota.refresh"));
+        assert!(!updated.contains("herdr-agent-quota-row"));
+        assert_eq!(add_quota_row(&updated).unwrap(), updated);
+        let removed = remove_quota_row(&updated).unwrap();
+        assert!(!removed.contains(identity::refresh_action().as_str()));
+        assert!(!removed.contains("row_gap"));
     }
 
     #[test]
@@ -2435,22 +2491,22 @@ rows = [["state_icon", "agent"]]
             (
                 "",
                 [
-                    "16c3318208a6eb34e3a72bf6789528fb9a884d01e01daba3cc0d0d00d95a8d0f",
-                    "dd2765e50ce77732b79ce86e7cd43d7fdb9c78294c0081e65973dac7b7525c49",
+                    "c770121f69b0337732a3f1e7e34df77e2da283e608c5f944a1da4b5779688280",
+                    "353ffecaf26a2a69bb70f9be2a4bff2f4db033a385f69d4c227cf95f16c7065e",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
                 [
-                    "971909fad008f16ec823f004fd1a6a4ea3373dcc4e0949a62d3b7a542d16c2b8",
-                    "d8262e7f04aa176531428c380dc310b0c01aa9b14dbe8ac816f154725868b4d9",
+                    "19fc54746ec4fba97761574825c4dfad7301c47478c39e7c9f3bbfbf22e4249a",
+                    "7eecfee223e84e11ddae04febbdeb8f31f5e953396cfa6eff50bc9c241e59f2d",
                 ],
             ),
             (
                 "[ui.sidebar.agents]\nrows = [[\"state_icon\", { token = \"tab\", bold = true }, \"$quota_provider_model\"], [\"$quota_topic\"]] # herdr-agent-quota-row\n",
                 [
-                    "971909fad008f16ec823f004fd1a6a4ea3373dcc4e0949a62d3b7a542d16c2b8",
-                    "d8262e7f04aa176531428c380dc310b0c01aa9b14dbe8ac816f154725868b4d9",
+                    "19fc54746ec4fba97761574825c4dfad7301c47478c39e7c9f3bbfbf22e4249a",
+                    "7eecfee223e84e11ddae04febbdeb8f31f5e953396cfa6eff50bc9c241e59f2d",
                 ],
             ),
         ] {
@@ -2812,7 +2868,7 @@ claude = [["state_icon", "agent"]]
         assert!(updated.contains("claude = [[\"state_icon\", \"agent\"]]"));
         assert!(updated.contains("codex ="));
         assert!(updated.contains("opencode ="));
-        assert!(updated.contains("herdr-agent-quota-provider"));
+        assert!(updated.contains(identity::provider_marker().as_str()));
         let skipped = rewrite_quota_sidebar(
             original,
             &AgentSelection::SUPPORTED,
@@ -2841,7 +2897,7 @@ claude = [["state_icon", "agent"]]
         .unwrap();
         assert!(updated.contains("$quota_group"));
         assert!(updated.contains("$quota_icon"));
-        assert!(updated.contains("herdr-agent-quota-row"));
+        assert!(updated.contains(identity::row_marker().as_str()));
         assert!(!updated.contains("rows_by_agent"), "{updated}");
         for agent_key in ["grok =", "claude =", "codex =", "agy =", "opencode ="] {
             assert!(
@@ -2862,7 +2918,7 @@ claude = [["state_icon", "agent"]]
         assert!(removed.contains("rows = "));
         assert!(removed.contains("$quota_icon"));
         assert!(removed.contains("row_gap"));
-        assert!(removed.contains(REFRESH_ACTION));
+        assert!(removed.contains(identity::refresh_action().as_str()));
         assert!(!removed.contains("rows_by_agent"), "{removed}");
     }
 
@@ -2879,7 +2935,7 @@ claude = [["state_icon", "agent"]]
         // is what the full uninstall is for.
         let complete = remove_quota_row(&full).unwrap();
         assert!(!complete.contains("rows_by_agent"));
-        assert!(!complete.contains(REFRESH_ACTION));
+        assert!(!complete.contains(identity::refresh_action().as_str()));
     }
 
     #[test]
@@ -2905,8 +2961,10 @@ opencode = [["state_icon", "agent"]]
 "#;
         let updated = add_quota_row(original).unwrap();
         assert!(updated.contains("opencode = [[\"state_icon\", \"agent\"]]"));
-        assert!(!updated
-            .contains("opencode = [[\"state_icon\", \"agent\"]] # herdr-agent-quota-provider"));
+        assert!(!updated.contains(&format!(
+            "opencode = [[\"state_icon\", \"agent\"]] # {}",
+            identity::provider_marker()
+        )));
         let removed = remove_quota_row(&updated).unwrap();
         assert!(removed.contains("opencode = [[\"state_icon\", \"agent\"]]"));
     }
@@ -2916,10 +2974,13 @@ opencode = [["state_icon", "agent"]]
         let updated =
             add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
         assert!(updated.contains("$quota_group"));
-        assert!(updated.contains("herdr-agent-quota-row"));
+        assert!(updated.contains(identity::row_marker().as_str()));
         assert!(!updated.contains("rows_by_agent"), "{updated}");
         assert!(!updated.contains("opencode ="), "{updated}");
-        assert!(!updated.contains("herdr-agent-quota-provider"), "{updated}");
+        assert!(
+            !updated.contains(identity::provider_marker().as_str()),
+            "{updated}"
+        );
         let removed = remove_quota_row(&updated).unwrap();
         assert!(!removed.contains("opencode ="));
         assert!(!removed.contains("$quota_"));
@@ -2928,7 +2989,7 @@ opencode = [["state_icon", "agent"]]
     #[test]
     fn empty_sidebar_configuration_round_trips_to_empty() {
         let updated = add_quota_row("").unwrap();
-        assert!(updated.contains("agent_panel_sort = \"spaces\" # herdr-agent-quota"));
+        assert!(updated.contains(&format!("agent_panel_sort = \"spaces\" # {PLUGIN_ID}")));
         assert_eq!(remove_quota_row(&updated).unwrap(), "");
         let stacked =
             add_quota_row_for("", &AgentSelection::SUPPORTED, SidebarLayout::Stacked).unwrap();
@@ -2942,14 +3003,14 @@ opencode = [["state_icon", "agent"]]
             BrandColors::On,
         )
         .unwrap();
-        assert!(flushed.contains("row_gap = 0 # herdr-agent-quota"));
+        assert!(flushed.contains(&format!("row_gap = 0 # {PLUGIN_ID}")));
         assert_eq!(remove_quota_row(&flushed).unwrap(), "");
     }
 
     #[test]
     fn install_writes_spaces_panel_sort_unless_the_user_already_chose() {
         let fresh = add_quota_row("").unwrap();
-        assert!(fresh.contains("agent_panel_sort = \"spaces\" # herdr-agent-quota"));
+        assert!(fresh.contains(&format!("agent_panel_sort = \"spaces\" # {PLUGIN_ID}")));
         assert_eq!(add_quota_row(&fresh).unwrap(), fresh);
 
         let user_priority = "[ui]\nagent_panel_sort = \"priority\"\n";
@@ -2973,7 +3034,7 @@ opencode = [["state_icon", "agent"]]
             BrandColors::On,
         )
         .unwrap();
-        assert!(flushed.contains("row_gap = 0 # herdr-agent-quota"));
+        assert!(flushed.contains(&format!("row_gap = 0 # {PLUGIN_ID}")));
         assert!(!flushed.contains("row_gap = 1"));
         let separated = add_quota_row_with(
             &flushed,
@@ -2984,7 +3045,7 @@ opencode = [["state_icon", "agent"]]
             BrandColors::On,
         )
         .unwrap();
-        assert!(separated.contains("row_gap = 0 # herdr-agent-quota"));
+        assert!(separated.contains(&format!("row_gap = 0 # {PLUGIN_ID}")));
         assert!(!separated.contains("row_gap = 1"));
     }
 
@@ -3064,7 +3125,7 @@ rows = [["state_icon", "pane", "terminal_title_stripped"]]
             .iter()
             .any(|item| item.as_str() == Some("terminal_title_stripped")));
         assert!(updated.contains("claude =") || updated.contains("codex ="));
-        assert!(updated.contains(REFRESH_ACTION));
+        assert!(updated.contains(identity::refresh_action().as_str()));
         assert!(updated.contains("row_gap"));
     }
 
@@ -3082,7 +3143,7 @@ rows = [["lantern_status"], ["state_icon", "my_plugin_token"]]
         assert!(updated.contains("lantern_status"));
         assert!(updated.contains("my_plugin_token"));
         assert!(updated.contains("claude =") || updated.contains("grok ="));
-        assert!(updated.contains(REFRESH_ACTION));
+        assert!(updated.contains(identity::refresh_action().as_str()));
     }
 
     fn custom_shared_rows() -> &'static str {
@@ -3746,7 +3807,7 @@ mod field_tests {
                 updated.contains("footer = [[\"$mine\"]]"),
                 "{summary:?}:\n{updated}"
             );
-            assert!(!updated.contains(FOOTER_MARKER), "{summary:?}:\n{updated}");
+            assert!(!updated.contains("-footer"), "{summary:?}:\n{updated}");
         }
     }
 
