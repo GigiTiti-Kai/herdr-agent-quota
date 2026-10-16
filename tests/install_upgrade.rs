@@ -233,6 +233,8 @@ esac
         )
         .env("HOME", dir.path())
         .env("XDG_STATE_HOME", &xdg_state)
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+        .env_remove("HERDR_BIN_PATH")
         .env("TEST_CONFIG", &new_config)
         .env("TEST_OLD_CONFIG", &old_config)
         .env("TEST_PLUGIN", dir.path().join("plugin"))
