@@ -107,12 +107,13 @@ impl AccountFamily {
 
     /// Footer rows that can carry the Hermes badge
     /// (`quota_acct_<id>_hermes`): rows whose login a live Hermes session
-    /// can be proven to share. Only the Codex row is: its snapshot carries
-    /// the ChatGPT account id, the Codex login's token names that account and
-    /// its user, and the bridge stamps the same pair for the token Hermes
-    /// holds. Claude's row has no account a Hermes credential could be
-    /// compared with.
-    pub const HERMES_BADGED: [&'static str; 1] = ["cx"];
+    /// can be proven to share. Claude: the row's windows come from the token
+    /// in Claude Code's credentials file, and the bridge stamps that file's
+    /// path once it saw the Hermes session's key equal that token. Codex: its
+    /// snapshot carries the ChatGPT account id, the Codex login's token names
+    /// that account and its user, and the bridge stamps the same pair for
+    /// the token Hermes holds.
+    pub const HERMES_BADGED: [&'static str; 2] = ["cl", "cx"];
 
     /// A family is keyed by the collector, so a Pi pane that resolved to
     /// canonical Codex shares the Codex row and nothing is borrowed.

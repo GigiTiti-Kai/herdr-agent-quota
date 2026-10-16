@@ -39,7 +39,7 @@ fn output(program: &str, args: &[&str]) -> String {
 #[test]
 fn the_bridge_plugin_unit_tests_pass() {
     let ran = run("python3", &["tests/hermes_plugin/test_bridge.py"]);
-    assert!(ran >= 36, "only {ran} plugin tests ran");
+    assert!(ran >= 61, "only {ran} plugin tests ran");
 }
 
 /// An earlier version of this file would run a Hermes interpreter straight on
@@ -90,5 +90,5 @@ fn the_bridge_plugin_works_inside_real_hermes_in_a_sandbox() {
         "/tests/test_real_hermes.py",
     ];
     let ran = run("bash", &real);
-    assert!(ran >= 9, "only {ran} real-Hermes tests ran");
+    assert!(ran >= 12, "only {ran} real-Hermes tests ran");
 }

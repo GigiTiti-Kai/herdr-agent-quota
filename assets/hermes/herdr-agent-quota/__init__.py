@@ -11,6 +11,12 @@ response, no raw account or user id. The ChatGPT account and user (`sub`) the li
 are written only as one domain-separated sha256 (`principal`), so the quota plugin can tell
 whether this session bills the same seat as its Codex row without either side revealing them.
 
+A native Anthropic session that runs on the token Claude Code keeps in its credentials file is
+marked the same way (`claude_credentials`): a domain-separated sha256 of that file's resolved
+path, written only once the live key was seen to be the file's token. The quota plugin reads the
+same file for its Claude row, so equal stamps mean both follow one login. No quota is fetched for
+that route and nothing is sent anywhere to decide it.
+
 Scope, on purpose:
 
 * default profile only, interactive CLI/TUI sessions only, inside a Herdr pane only;
@@ -24,7 +30,7 @@ attributes. They are confined to that one function; when they are missing the pl
 nothing and writes no quota.
 """
 
-# HERDR_AGENT_QUOTA_BRIDGE_VERSION=2
+# HERDR_AGENT_QUOTA_BRIDGE_VERSION=3
 
 from __future__ import annotations
 
@@ -84,6 +90,18 @@ PRINCIPAL_STAMP_DOMAIN = b"herdr-agent-quota/chatgpt-principal\0"
 OPENAI_AUTH_CLAIM = "https://api.openai.com/auth"
 # Far above any access token; a longer value is not decoded at all.
 MAX_TOKEN_CHARS = 16 * 1024
+# `claude_credentials` stamps: sha256(domain || resolved path of Claude Code's credentials file).
+# The quota plugin hashes the file its Claude row reads the same way (`claude_credentials_stamp`
+# in src/providers/hermes.rs); both sides pin one digest in a test.
+CLAUDE_CREDENTIALS_STAMP_DOMAIN = b"herdr-agent-quota/claude-credentials-file\0"
+CLAUDE_PROVIDER = "anthropic"
+CLAUDE_API_MODE = "anthropic_messages"
+CLAUDE_HOST = "api.anthropic.com"
+# How often a native Anthropic key that is not yet known to be the file's token is compared with
+# the file again. A key that was seen to be the file's token is never compared again.
+CLAUDE_RECHECK_SECONDS = HEARTBEAT_SECONDS
+# Far above a real credentials file; a larger one is not read.
+MAX_CLAUDE_CREDENTIALS_BYTES = 256 * 1024
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _PANE_ID_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,64}$")
@@ -91,10 +109,12 @@ _MISSING = object()
 
 
 class _Signature(tuple):
-    """What identifies a route for epoch purposes: (provider, supported, identity, principal).
+    """What identifies a route for epoch purposes:
+    (provider, supported, identity, principal, claude_credentials).
 
     `principal` is derived from the same token as `identity`, so it never changes on its own; it
     is carried here so that the record written for an epoch always names that epoch's principal.
+    `claude_credentials` is set only on a native Anthropic route (`Bridge._claude_stamp`).
     """
 
     __slots__ = ()
@@ -103,9 +123,10 @@ class _Signature(tuple):
     supported = property(lambda self: self[1])
     identity = property(lambda self: self[2])
     principal = property(lambda self: self[3])
+    claude_credentials = property(lambda self: self[4])
 
 
-_UNKNOWN = _Signature((None, False, None, None))
+_UNKNOWN = _Signature((None, False, None, None, None))
 
 
 def _read_once(agent):
@@ -190,7 +211,7 @@ def read_route(agent, hmac_key):
     if not isinstance(provider, str) or not provider.strip():
         return _UNKNOWN, model, None
     provider = provider.strip().lower()
-    unsupported = _Signature((provider, False, None, None))
+    unsupported = _Signature((provider, False, None, None, None))
     # A rotating key source is installed as a callable; there is no single key to speak for.
     if not isinstance(api_key, str) or not api_key.strip() or not isinstance(base_url, str):
         return unsupported, model, None
@@ -208,7 +229,117 @@ def read_route(agent, hmac_key):
     material = "\0".join((provider, api_mode, base_url.rstrip("/"), entry, api_key))
     identity = hmac.new(hmac_key, material.encode("utf-8"), hashlib.sha256).hexdigest()
     principal = token_principal_stamp(api_key)
-    return _Signature((provider, True, identity, principal)), model, (base_url, api_key)
+    return _Signature((provider, True, identity, principal, None)), model, (base_url, api_key)
+
+
+def claude_credentials_stamp(path):
+    """The comparable form of a Claude credentials file: its resolved path, hashed."""
+    return hashlib.sha256(CLAUDE_CREDENTIALS_STAMP_DOMAIN + os.fsencode(path)).hexdigest()
+
+
+def _is_native_anthropic_endpoint(base_url):
+    try:
+        parts = urlsplit(base_url)
+        return (
+            parts.scheme == "https"
+            and parts.hostname == CLAUDE_HOST
+            and parts.port in (None, 443)
+            and not parts.username
+            and not parts.password
+        )
+    except ValueError:
+        return False
+
+
+def _read_claude_once(agent):
+    return (
+        getattr(agent, "provider", None),
+        getattr(agent, "api_mode", None),
+        getattr(agent, "base_url", None),
+        getattr(agent, "api_key", None),
+        getattr(agent, "_anthropic_api_key", _MISSING),
+        getattr(agent, "_anthropic_base_url", _MISSING),
+    )
+
+
+def read_claude_route(agent, hmac_key):
+    """`(identity, api_key)` of a native Anthropic route that runs on one plain key, else None.
+
+    Read twice, like `read_route`: the agent's key and the key its Anthropic client was built with
+    must agree. `identity` is this process's HMAC of the key; it never leaves the process.
+    """
+    first = _read_claude_once(agent)
+    if first != _read_claude_once(agent):
+        return None
+    provider, api_mode, base_url, api_key, client_key, client_base = first
+    if not isinstance(provider, str) or provider.strip().lower() != CLAUDE_PROVIDER:
+        return None
+    # A callable token provider has no single key to speak for.
+    if api_mode != CLAUDE_API_MODE or not isinstance(api_key, str) or not api_key.strip():
+        return None
+    if client_key is _MISSING or client_key != api_key:
+        return None
+    if not isinstance(base_url, str) or not isinstance(client_base, str):
+        return None
+    if client_base.rstrip("/") != base_url.rstrip("/") or not _is_native_anthropic_endpoint(base_url):
+        return None
+    material = "\0".join((CLAUDE_PROVIDER, api_mode, base_url.rstrip("/"), api_key))
+    return hmac.new(hmac_key, material.encode("utf-8"), hashlib.sha256).hexdigest(), api_key
+
+
+def _hermes_claude_credentials_path():
+    from agent.anthropic_credentials import claude_code_credentials_path
+
+    return claude_code_credentials_path()
+
+
+def _hermes_adopts_external_logins():
+    from agent.credential_sources import adopt_external_logins_enabled
+
+    return adopt_external_logins_enabled()
+
+
+def claude_credentials_file_stamp(api_key, *, credentials_path=_hermes_claude_credentials_path,
+                                  adopts=_hermes_adopts_external_logins):
+    """The stamp of Claude Code's credentials file when `api_key` is the token in it now, else None.
+
+    The file is the one Hermes itself borrows a Claude login from (`claude_code_credentials_path`:
+    `$CLAUDE_CONFIG_DIR` or `~/.claude`, `.credentials.json`). It is only read: no refresh, no
+    request. A user who turned borrowing off (`auth.adopt_external_logins: false`) has it left
+    alone. The token is compared in memory and dropped; only the resolved path is hashed.
+    """
+    try:
+        if not adopts():
+            return None
+        resolved = os.path.realpath(credentials_path(), strict=True)
+        # Non-blocking, so a FIFO planted there cannot hang the hook that asked.
+        fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, "rb") as handle:
+                fd = None
+                data = handle.read(MAX_CLAUDE_CREDENTIALS_BYTES + 1)
+        finally:
+            if fd is not None:
+                os.close(fd)
+    except Exception:  # Hermes moved its helpers, no file, unreadable: nothing is proven
+        return None
+    if len(data) > MAX_CLAUDE_CREDENTIALS_BYTES:
+        return None
+    try:
+        payload = json.loads(data)
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
+    token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    if not isinstance(token, str) or not token:
+        return None
+    try:
+        same = hmac.compare_digest(token.encode("utf-8"), api_key.encode("utf-8"))
+    except UnicodeError:
+        return None
+    return claude_credentials_stamp(resolved) if same else None
 
 
 def _live_agents():
@@ -291,7 +422,7 @@ class _Session:
     __slots__ = (
         "session_id", "lock_fd", "epoch", "signature", "model", "quota", "wants_fetch",
         "next_fetch_at", "failures", "fetch_token", "fetch_started", "missing_ticks", "written_at",
-        "attempts",
+        "attempts", "claude_key", "claude_stamp", "claude_checked_at",
     )
 
     def __init__(self, session_id, lock_fd):
@@ -309,6 +440,11 @@ class _Session:
         self.missing_ticks = 0
         self.written_at = 0.0
         self.attempts = {}  # identity -> (next_fetch_at, failures) of credentials not in use
+        # The last native Anthropic key seen (its HMAC), the file stamp proven for it, and when
+        # it was last compared with the file (None: not yet).
+        self.claude_key = None
+        self.claude_stamp = None
+        self.claude_checked_at = None
 
 
 class Bridge:
@@ -320,11 +456,13 @@ class Bridge:
 
     def __init__(self, mailbox_dir, pane_id, *, find_agent=find_live_agent,
                  fetch_windows=fetch_codex_windows, notify=None, now=time.time,
-                 spawn_thread=None, poll_seconds=POLL_SECONDS):
+                 spawn_thread=None, poll_seconds=POLL_SECONDS,
+                 claude_file_stamp=claude_credentials_file_stamp):
         self._dir = Path(mailbox_dir)
         self._pane_id = pane_id
         self._find_agent = find_agent
         self._fetch_windows = fetch_windows
+        self._claude_file_stamp = claude_file_stamp
         self._notify = notify
         self._now = now
         self._spawn_thread = spawn_thread or _plain_thread
@@ -398,6 +536,8 @@ class Bridge:
         else:
             signature, model, _secret = read_route(agent, self._hmac_key)
             session.missing_ticks = 0
+            if signature.provider == CLAUDE_PROVIDER:
+                signature = _Signature(signature[:4] + (self._claude_stamp(session, agent),))
         if signature != session.signature:
             # Debounce and backoff belong to the credential that was asked, not the session:
             # a pool that moves on to a fresh entry is asked about it at once, and coming back
@@ -434,6 +574,36 @@ class Bridge:
             # record that cannot be written is retried here, silently.
             if self._write(session) and quiet_for > ROUTE_TTL_SECONDS:
                 self._notify_pending = True
+
+    def _claude_stamp(self, session, agent):
+        """The Claude credentials file stamp for the key this native Anthropic agent holds.
+
+        A key counts as the file's once it was seen equal to the token in the file: the token
+        Hermes borrows from Claude Code (pool entry or fallback) is exactly that string. The
+        proof belongs to the key, so it stands while the key stays, even after Claude Code
+        refreshes the file on its own; a new key is compared at once. A key not seen in the file
+        is compared again at most every CLAUDE_RECHECK_SECONDS.
+        """
+        route = read_claude_route(agent, self._hmac_key)
+        if route is None:
+            return None
+        identity, api_key = route
+        if identity != session.claude_key:
+            session.claude_key, session.claude_stamp, session.claude_checked_at = identity, None, None
+        if session.claude_stamp is not None:
+            return session.claude_stamp
+        now = self._now()
+        if session.claude_checked_at is not None and now - session.claude_checked_at < CLAUDE_RECHECK_SECONDS:
+            return None
+        session.claude_checked_at = now
+        try:
+            stamp = self._claude_file_stamp(api_key)
+        except Exception:
+            stamp = None
+        finally:
+            del api_key
+        session.claude_stamp = stamp if isinstance(stamp, str) else None
+        return session.claude_stamp
 
     def tick(self):
         """One poller pass: follow idle `/model` switches, start due fetches, send nudges."""
@@ -575,6 +745,7 @@ class Bridge:
                 "supported": signature.supported,
                 "identity": signature.identity,
                 "principal": signature.principal,
+                "claude_credentials": signature.claude_credentials,
                 "observed_at": int(self._now()),
             },
             "quota": session.quota,

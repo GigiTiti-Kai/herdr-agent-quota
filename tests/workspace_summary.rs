@@ -208,15 +208,34 @@ fn refresh_codex(root: &Path) -> BTreeMap<String, String> {
 /// A bridge record for `session`, as the Hermes plugin writes it, held by a
 /// live producer for as long as the returned lock is open.
 fn hermes_session(root: &Path, session: &str, principal: &str, now: u64) -> fs::File {
+    let identity = "0123456789abcdef".repeat(4);
+    bridge_session(
+        root,
+        session,
+        json!({"epoch": 1, "provider": "openai-codex", "supported": true,
+               "identity": identity, "principal": principal, "observed_at": now}),
+    )
+}
+
+/// A native Anthropic session's bridge record: never supported, no quota,
+/// naming a Claude credentials file stamp (or none).
+fn claude_session(root: &Path, session: &str, stamp: Option<&str>, now: u64) -> fs::File {
+    bridge_session(
+        root,
+        session,
+        json!({"epoch": 1, "provider": "anthropic", "supported": false, "identity": null,
+               "principal": null, "claude_credentials": stamp, "observed_at": now}),
+    )
+}
+
+fn bridge_session(root: &Path, session: &str, route: serde_json::Value) -> fs::File {
     use std::os::unix::fs::OpenOptionsExt;
     let mailbox = root.join("hermes-bridge");
     fs::create_dir_all(&mailbox).unwrap();
     fs::set_permissions(&mailbox, fs::Permissions::from_mode(0o700)).unwrap();
-    let identity = "0123456789abcdef".repeat(4);
     let record = json!({
         "schema": 1, "session_id": session, "pane_id": "w9:p1", "profile": "default", "pid": 1,
-        "route": {"epoch": 1, "provider": "openai-codex", "supported": true,
-                  "identity": identity, "principal": principal, "observed_at": now},
+        "route": route,
         "quota": null,
     });
     let mut options = fs::OpenOptions::new();
@@ -349,4 +368,148 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() 
     codex_login(root, "acc-test-2", "user-test-1");
     assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
     drop((again, other));
+}
+
+/// A refresh of the Claude row with Hermes enabled: the real binary, a fake
+/// Herdr, and a Claude credentials file whose token has lapsed, so the usage
+/// endpoint is never asked and the cached account windows stand.
+fn refresh_claude(root: &Path, credentials: &Path) -> BTreeMap<String, String> {
+    fs::write(
+        root.join("workspaces.json"),
+        json!({"result":{"workspaces":[{"workspace_id":"w1","label":"api"}]}}).to_string(),
+    )
+    .unwrap();
+    fs::write(root.join("calls"), "").unwrap();
+    let _ = fs::remove_dir_all(root.join("reports"));
+    fs::create_dir(root.join("reports")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        .args(["refresh", "--provider", "claude"])
+        .env("HERDR_PLUGIN_STATE_DIR", root)
+        .env("HERDR_PLUGIN_CONFIG_DIR", root)
+        .env("HERDR_BIN_PATH", root.join("herdr"))
+        .env("HERDR_CONFIG_FILE", root.join("config.toml"))
+        .env("HERDR_SOCKET_PATH", root.join("herdr.sock"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("CLAUDE_CONFIG_DIR", root.join("claude-config"))
+        .env("CLAUDE_CREDENTIALS_FILE", credentials)
+        .env("HERMES_HOME", root.join("hermes-home"))
+        .env("HERDR_AGENT_QUOTA_AGENTS", "claude,hermes")
+        .env("TEST_WORKSPACES", root.join("workspaces.json"))
+        .env("TEST_CALLS", root.join("calls"))
+        .env("TEST_REPORTS", root.join("reports"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = fs::read_to_string(root.join("reports/w1")).unwrap_or_default();
+    apply_report(&BTreeMap::new(), &report)
+}
+
+#[test]
+fn the_claude_row_carries_the_hermes_badge_only_for_live_sessions_on_its_credentials_file() {
+    use herdr_agent_quota::providers::hermes::{chatgpt_principal_stamp, claude_credentials_stamp};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let cache = CacheStore::new(root);
+    cache.set_account_summary(SummaryFormat::Lines).unwrap();
+    let now = CacheStore::now_unix();
+    let windows = vec![
+        UsageWindow::new(
+            WindowKind::FiveHour,
+            20.0,
+            Some(ResetAt::from_unix_seconds(now + 3_600)),
+        )
+        .unwrap(),
+        UsageWindow::new(
+            WindowKind::Weekly,
+            35.0,
+            Some(ResetAt::from_unix_seconds(now + 6 * 86_400)),
+        )
+        .unwrap(),
+    ];
+    // The Claude row as the usage endpoint left it.
+    cache
+        .save(
+            &ProviderSnapshot::new(Provider::Claude, windows.clone(), now)
+                .session_local()
+                .with_account_windows(windows),
+        )
+        .unwrap();
+    // Claude Code's credentials file, reached through a symlinked directory.
+    // Its token lapsed in 1970, so nothing is sent anywhere.
+    let home = root.join("claude-home");
+    fs::create_dir(&home).unwrap();
+    fs::write(
+        home.join(".credentials.json"),
+        json!({"claudeAiOauth": {"accessToken": "fake-claude-token", "expiresAt": 1_000}})
+            .to_string(),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&home, root.join("claude-link")).unwrap();
+    let credentials = root.join("claude-link/.credentials.json");
+    let file = claude_credentials_stamp(&fs::canonicalize(&credentials).unwrap()).unwrap();
+    let elsewhere = claude_credentials_stamp(Path::new("/srv/other/.credentials.json")).unwrap();
+    fs::write(root.join("herdr"), FAKE_HERDR).unwrap();
+    fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
+    let badge = |count: usize| format!("\u{e1aa} {count}");
+
+    // No Hermes session: the Claude row, no badge.
+    let published = refresh_claude(root, &credentials);
+    assert!(
+        published.contains_key("quota_acct_cl_icon"),
+        "{published:?}"
+    );
+    assert!(
+        !published.contains_key("quota_acct_cl_hermes"),
+        "{published:?}"
+    );
+
+    // Two sessions on the file's token; one on another file; one whose key
+    // was not seen in the file; one Codex session.
+    let first = claude_session(root, "s1", Some(&file), now);
+    let second = claude_session(root, "s2", Some(&file), now);
+    let other = claude_session(root, "s3", Some(&elsewhere), now);
+    let unproven = claude_session(root, "s4", None, now);
+    let codex = hermes_session(root, "s5", &chatgpt_principal_stamp("a", "u"), now);
+    let published = refresh_claude(root, &credentials);
+    assert_eq!(
+        published.get("quota_acct_cl_hermes"),
+        Some(&badge(2)),
+        "{published:?}"
+    );
+    assert!(
+        !published.contains_key("quota_acct_cx_hermes"),
+        "{published:?}"
+    );
+    // Neither the stamp, the path nor the token ever reaches Herdr.
+    let report = fs::read_to_string(root.join("reports/w1")).unwrap();
+    for secret in [
+        file.as_str(),
+        "fake-claude-token",
+        "claude-home",
+        "credentials",
+    ] {
+        assert!(!report.contains(secret), "{report}");
+    }
+
+    // A session that ends stops counting.
+    drop(second);
+    assert_eq!(
+        refresh_claude(root, &credentials).get("quota_acct_cl_hermes"),
+        Some(&badge(1))
+    );
+
+    // The Claude row reads another file now: nothing proves the sessions.
+    let moved = root.join("moved.json");
+    fs::copy(home.join(".credentials.json"), &moved).unwrap();
+    assert!(!refresh_claude(root, &moved).contains_key("quota_acct_cl_hermes"));
+    // ... and no file at all proves nothing either.
+    assert!(!refresh_claude(root, &root.join("absent.json")).contains_key("quota_acct_cl_hermes"));
+
+    drop(first);
+    assert!(!refresh_claude(root, &credentials).contains_key("quota_acct_cl_hermes"));
+    drop((other, unproven, codex));
 }
