@@ -46,11 +46,25 @@ JWT_X = fake_jwt(ACCOUNT_X)
 JWT_X2 = fake_jwt(ACCOUNT_X, signature="fake-signature-refreshed")
 JWT_X_SEAT2 = fake_jwt(ACCOUNT_X, subject=SUBJECT_2)
 JWT_Y = fake_jwt(ACCOUNT_Y)
+# Made-up Claude OAuth tokens: C is in the Claude Code credentials file, C2 is what it holds after
+# Claude Code refreshed it, D comes from anywhere else (an API key, Hermes's own login).
+KEY_C = "sk-ant-oat01-fake-CCCCCCCCCCCCCCCCCCCCCCCC"
+KEY_C2 = "sk-ant-oat01-fake-cccccccccccccccccccccccc"
+KEY_D = "sk-ant-api03-fake-DDDDDDDDDDDDDDDDDDDDDDDD"
 SECRETS = (KEY_A, KEY_B, ACCOUNT_X, ACCOUNT_Y, SUBJECT_1, SUBJECT_2, JWT_X, JWT_X2, JWT_X_SEAT2,
-           JWT_Y)
+           JWT_Y, KEY_C, KEY_C2, KEY_D)
 CODEX_BASE = "https://chatgpt.com/backend-api/codex"
+ANTHROPIC_BASE = "https://api.anthropic.com"
 HMAC_KEY = b"k" * 32
 WEEK = [{"kind": "7d", "used_percent": 12.0, "resets_at": 4_000_000_000}]
+
+
+def write_claude_credentials(path, token, **extra):
+    """A Claude Code credentials file holding `token`, shaped like the real one."""
+    oauth = {"accessToken": token, "refreshToken": "fake-refresh", "expiresAt": 4_102_444_800_000}
+    oauth.update(extra)
+    Path(path).write_text(json.dumps({"claudeAiOauth": oauth}))
+    os.chmod(path, 0o600)
 
 
 class FakeAgent:
@@ -69,6 +83,27 @@ class FakeAgent:
         self.api_key = key
         self._client_kwargs["api_key"] = key
         self._credential_pool_entry_id = entry_id
+
+
+class FakeClaudeAgent:
+    """A native Anthropic agent as Hermes builds it: the key sits on the agent and on its Anthropic
+    client (`_anthropic_api_key`), and the OpenAI-style client kwargs are empty."""
+
+    def __init__(self, session_id="s1", key=KEY_C, provider="anthropic",
+                 api_mode="anthropic_messages", base_url=ANTHROPIC_BASE, model="claude-a"):
+        self.session_id = session_id
+        self.provider = provider
+        self.api_mode = api_mode
+        self.base_url = base_url
+        self._anthropic_base_url = base_url
+        self.api_key = key
+        self._anthropic_api_key = key
+        self.model = model
+        self._credential_pool_entry_id = None
+        self._client_kwargs = {}
+
+    def set_key(self, key):
+        self.api_key = self._anthropic_api_key = key
 
 
 class Inline:
@@ -90,7 +125,14 @@ class BridgeCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name) / "hermes-bridge"
         self.dir.mkdir(mode=0o700)
-        self.agents = {"s1": FakeAgent()}
+        # The Claude Code credentials file lives outside the scanned tree: it holds a token.
+        self._claude_tmp = tempfile.TemporaryDirectory()
+        self.claude_path = Path(self._claude_tmp.name) / ".credentials.json"
+        write_claude_credentials(self.claude_path, KEY_C)
+        self.claude_stamp = bridge_module.claude_credentials_stamp(os.path.realpath(self.claude_path))
+        self.claude_reads = 0
+        self.adopts = True
+        self.agents: dict = {"s1": FakeAgent()}
         self.clock = [1_000_000.0]
         self.fetched = []
         self.answer = WEEK
@@ -101,6 +143,7 @@ class BridgeCase(unittest.TestCase):
         self.bridge.close()
         self.assert_no_secret_on_disk()
         self._tmp.cleanup()
+        self._claude_tmp.cleanup()
 
     def make_bridge(self, **overrides):
         options = dict(
@@ -110,9 +153,17 @@ class BridgeCase(unittest.TestCase):
             now=lambda: self.clock[0],
             spawn_thread=lambda target, *args: Inline(target, args),
             poll_seconds=3600,
+            claude_file_stamp=self.claude_file_stamp,
         )
         options.update(overrides)
         return bridge_module.Bridge(self.dir, "w1:p1", **options)
+
+    def claude_file_stamp(self, api_key):
+        """The real file check, pointed at this test's file."""
+        self.claude_reads += 1
+        return bridge_module.claude_credentials_file_stamp(
+            api_key, credentials_path=lambda: self.claude_path, adopts=lambda: self.adopts
+        )
 
     def fetch(self, base_url, api_key):
         self.fetched.append((base_url, api_key))
@@ -260,6 +311,139 @@ class RouteTests(unittest.TestCase):
             )
             self.assertEqual((signature.supported, signature.principal), (False, None))
 
+    def test_the_claude_credentials_stamp_is_pinned(self):
+        # src/providers/hermes.rs `the_claude_credentials_stamp_is_pinned` asserts the same digest.
+        self.assertEqual(
+            bridge_module.claude_credentials_stamp("/home/u/.claude/.credentials.json"),
+            "c04c99582d1c677beac50010fc7e9d060fe8994bf50b45c80a9bfd8a45b7fab4",
+        )
+
+    def test_a_native_anthropic_route_is_unsupported_and_read_as_one_key(self):
+        agent = FakeClaudeAgent()
+        signature, model, secret = bridge_module.read_route(agent, HMAC_KEY)
+        # Nothing is ever fetched for it, and `read_route` alone never names a file.
+        self.assertEqual(tuple(signature), ("anthropic", False, None, None, None))
+        self.assertEqual((model, secret), ("claude-a", None))
+        identity, key = bridge_module.read_claude_route(agent, HMAC_KEY)
+        self.assertEqual(key, KEY_C)
+        self.assertRegex(identity, r"^[0-9a-f]{64}$")
+        self.assertNotIn(KEY_C, identity)
+        self.assertNotEqual(identity, bridge_module.read_claude_route(agent, b"z" * 32)[0])
+        agent.set_key(KEY_C2)
+        self.assertNotEqual(identity, bridge_module.read_claude_route(agent, HMAC_KEY)[0])
+
+    def test_only_a_native_anthropic_route_on_one_plain_key_is_read(self):
+        cases = {
+            "codex": dict(provider="openai-codex"),
+            "another api mode": dict(api_mode="chat_completions"),
+            "proxy host": dict(base_url="https://relay.example/anthropic"),
+            "look-alike host": dict(base_url="https://api.anthropic.com.evil.example"),
+            "plain http": dict(base_url="http://api.anthropic.com"),
+            "userinfo": dict(base_url="https://user:pw@api.anthropic.com"),
+            "another port": dict(base_url="https://api.anthropic.com:8443"),
+            "empty key": dict(key=""),
+        }
+        agents: dict = {label: FakeClaudeAgent(**overrides) for label, overrides in cases.items()}
+        agents["token provider"] = FakeClaudeAgent()
+        agents["token provider"].api_key = agents["token provider"]._anthropic_api_key = lambda: KEY_C
+        agents["client disagrees"] = FakeClaudeAgent()
+        agents["client disagrees"]._anthropic_api_key = KEY_D
+        agents["client endpoint disagrees"] = FakeClaudeAgent()
+        agents["client endpoint disagrees"]._anthropic_base_url = "https://relay.example"
+        agents["no anthropic client"] = FakeAgent(provider="anthropic", api_mode="anthropic_messages",
+                                                  base_url=ANTHROPIC_BASE, key=KEY_C)
+        for label, agent in agents.items():
+            self.assertIsNone(bridge_module.read_claude_route(agent, HMAC_KEY), label)
+        # A trailing slash is the same endpoint.
+        slash = FakeClaudeAgent(base_url=ANTHROPIC_BASE + "/")
+        self.assertIsNotNone(bridge_module.read_claude_route(slash, HMAC_KEY))
+
+    def test_a_native_anthropic_route_caught_mid_swap_is_not_read(self):
+        class Swapping(FakeClaudeAgent):
+            reads = 0
+
+            @property
+            def api_key(self):
+                type(self).reads += 1
+                return KEY_C if type(self).reads == 1 else KEY_C2
+
+            @api_key.setter
+            def api_key(self, _value):
+                pass
+
+        self.assertIsNone(bridge_module.read_claude_route(Swapping(), HMAC_KEY))
+
+
+class ClaudeFileTests(unittest.TestCase):
+    """`claude_credentials_file_stamp`: the file is read, compared, and only its path is hashed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.path = self.home / ".credentials.json"
+        write_claude_credentials(self.path, KEY_C)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def stamp(self, key, path=None, adopts=True):
+        target = self.path if path is None else path
+        return bridge_module.claude_credentials_file_stamp(
+            key, credentials_path=lambda: target, adopts=lambda: adopts
+        )
+
+    def test_the_files_own_token_names_the_file_by_its_resolved_path(self):
+        expected = bridge_module.claude_credentials_stamp(os.path.realpath(self.path))
+        self.assertEqual(self.stamp(KEY_C), expected)
+        self.assertNotIn(str(self.path), expected)
+        # A symlinked config directory is the same file, so the same stamp.
+        (self.home / "link").symlink_to(self.home, target_is_directory=True)
+        self.assertEqual(self.stamp(KEY_C, self.home / "link" / ".credentials.json"), expected)
+
+    def test_any_other_key_names_nothing(self):
+        for key in (KEY_C2, KEY_D, KEY_C[:-1], KEY_C + "x", ""):
+            self.assertIsNone(self.stamp(key), key)
+
+    def test_an_opted_out_user_has_the_file_left_alone(self):
+        def never():
+            raise AssertionError("the file was located although borrowing is off")
+
+        self.assertIsNone(bridge_module.claude_credentials_file_stamp(
+            KEY_C, credentials_path=never, adopts=lambda: False))
+
+    def test_a_missing_strange_or_malformed_file_names_nothing(self):
+        def broken():
+            raise ImportError("Hermes moved its helper")
+
+        self.assertIsNone(bridge_module.claude_credentials_file_stamp(
+            KEY_C, credentials_path=broken, adopts=lambda: True))
+        self.assertIsNone(self.stamp(KEY_C, self.home / "absent.json"))
+        self.assertIsNone(self.stamp(KEY_C, self.home))  # a directory
+        fifo = self.home / "fifo.json"
+        os.mkfifo(fifo)
+        self.assertIsNone(self.stamp(KEY_C, fifo))  # and it did not block
+        bodies = {
+            "not json": b"{not json",
+            "a list": b"[]",
+            "no oauth": json.dumps({"other": {"accessToken": KEY_C}}).encode(),
+            "oauth not a dict": json.dumps({"claudeAiOauth": KEY_C}).encode(),
+            "no token": json.dumps({"claudeAiOauth": {"refreshToken": "x"}}).encode(),
+            "empty token": json.dumps({"claudeAiOauth": {"accessToken": ""}}).encode(),
+            "number token": json.dumps({"claudeAiOauth": {"accessToken": 7}}).encode(),
+            "too large": json.dumps({"claudeAiOauth": {"accessToken": KEY_C}, "pad": "x" * (
+                bridge_module.MAX_CLAUDE_CREDENTIALS_BYTES)}).encode(),
+        }
+        for label, body in bodies.items():
+            path = self.home / (label.replace(" ", "-") + ".json")
+            path.write_bytes(body)
+            self.assertIsNone(self.stamp(KEY_C, path), label)
+
+    def test_without_hermes_nothing_is_proven(self):
+        if importlib.util.find_spec("agent") is not None:
+            # Hermes is importable from this interpreter: the defaults would read the real file.
+            self.skipTest("Hermes's `agent` package is importable here")
+        self.assertIsNone(bridge_module.claude_credentials_file_stamp(KEY_C))
+
 
 class MailboxTests(BridgeCase):
     def test_the_first_observation_writes_a_route_and_the_first_tick_its_quota(self):
@@ -275,9 +459,13 @@ class MailboxTests(BridgeCase):
         self.assertEqual(
             set(record), {"schema", "session_id", "pane_id", "profile", "pid", "route", "quota"}
         )
-        self.assertEqual(set(record["route"]), {"epoch", "provider", "supported", "identity", "principal", "observed_at"})
+        self.assertEqual(set(record["route"]), {"epoch", "provider", "supported", "identity", "principal",
+                                                "claude_credentials", "observed_at"})
         # A token that is not a ChatGPT access token names no principal.
         self.assertIsNone(record["route"]["principal"])
+        # A Codex route never names a Claude credentials file, and never looks for one.
+        self.assertIsNone(record["route"]["claude_credentials"])
+        self.assertEqual(self.claude_reads, 0)
         self.assertEqual(set(record["quota"]), {"epoch", "identity", "fetched_at", "windows"})
         self.assertEqual((record["schema"], record["session_id"], record["pane_id"]), (1, "s1", "w1:p1"))
         self.assertEqual(record["quota"]["epoch"], record["route"]["epoch"])
@@ -561,6 +749,119 @@ class MailboxTests(BridgeCase):
             self.assertEqual(len(self.notified), nudges)
         finally:
             os.chmod(self.dir, 0o700)
+
+
+class ClaudeMailboxTests(BridgeCase):
+    """A native Anthropic session names the Claude Code credentials file only for the file's key."""
+
+    def setUp(self):
+        super().setUp()
+        self.agents["s1"] = FakeClaudeAgent()
+
+    def claude(self, session_id="s1"):
+        return self.record(session_id)["route"]["claude_credentials"]
+
+    def test_a_session_on_the_files_token_names_the_file_and_fetches_nothing(self):
+        self.bridge.observe("s1")
+        route = self.record()["route"]
+        self.assertEqual(
+            {key: route[key] for key in ("epoch", "provider", "supported", "identity", "principal")},
+            {"epoch": 1, "provider": "anthropic", "supported": False, "identity": None, "principal": None},
+        )
+        self.assertEqual(route["claude_credentials"], self.claude_stamp)
+        self.assertIsNone(self.record()["quota"])
+        for _ in range(5):
+            self.advance(bridge_module.DEBOUNCE_SECONDS + 1)
+            self.bridge.observe("s1", activity=True)
+            self.bridge.tick()
+        self.assertEqual(self.fetched, [], "no quota is ever asked for this route")
+        self.assertEqual(self.claude_reads, 1, "a proven key is not compared again")
+        self.assertEqual(self.record()["route"]["epoch"], 1)
+        self.assertEqual(self.claude(), self.claude_stamp)
+
+    def test_any_other_anthropic_credential_names_nothing(self):
+        # ANTHROPIC_API_KEY, Hermes's own OAuth login, a pasted token: none is the file's.
+        self.agents["s1"].set_key(KEY_D)
+        self.bridge.observe("s1")
+        self.assertEqual(self.record()["route"]["provider"], "anthropic")
+        self.assertIsNone(self.claude())
+        # Borrowing turned off: the file is not even read, whatever the key.
+        self.adopts = False
+        self.agents["s2"] = FakeClaudeAgent("s2", KEY_C)
+        self.bridge.observe("s2")
+        self.assertIsNone(self.claude("s2"))
+        # An Anthropic-compatible proxy is not the Claude row's endpoint.
+        self.adopts = True
+        self.agents["s3"] = FakeClaudeAgent("s3", KEY_C, base_url="https://relay.example/anthropic")
+        reads = self.claude_reads
+        self.bridge.observe("s3")
+        self.assertIsNone(self.claude("s3"))
+        self.assertEqual(self.claude_reads, reads, "a route that is not read is not compared")
+
+    def test_the_proof_stays_with_the_key_when_claude_code_refreshes_the_file(self):
+        self.bridge.observe("s1")
+        self.bridge.tick()  # sends the first epoch's nudge
+        nudges = len(self.notified)
+        write_claude_credentials(self.claude_path, KEY_C2)  # Claude Code refreshed on its own
+        for _ in range(10):
+            self.advance(bridge_module.CLAUDE_RECHECK_SECONDS + 1)
+            self.bridge.tick()
+        self.assertEqual(self.claude(), self.claude_stamp)
+        self.assertEqual(self.record()["route"]["epoch"], 1)
+        self.assertEqual((self.claude_reads, len(self.notified)), (1, nudges))
+
+    def test_a_new_key_is_compared_at_once(self):
+        self.bridge.observe("s1")
+        self.bridge.tick()
+        nudges = len(self.notified)
+        # Hermes moves on to the token Claude Code refreshed to: still the file's, nothing churns.
+        write_claude_credentials(self.claude_path, KEY_C2)
+        self.agents["s1"].set_key(KEY_C2)
+        self.advance(5)
+        self.bridge.tick()
+        self.assertEqual(self.claude_reads, 2)
+        self.assertEqual((self.record()["route"]["epoch"], self.claude()), (1, self.claude_stamp))
+        self.assertEqual(len(self.notified), nudges)
+        # A key from anywhere else: a new epoch that names no file, and the sidebar hears of it.
+        self.agents["s1"].set_key(KEY_D)
+        self.advance(5)
+        self.bridge.tick()
+        self.assertEqual((self.record()["route"]["epoch"], self.claude()), (2, None))
+        self.assertEqual(len(self.notified), nudges + 1)
+
+    def test_a_key_not_in_the_file_is_compared_again_only_now_and_then(self):
+        # Hermes holds the new token a moment before its write to the file lands.
+        self.agents["s1"].set_key(KEY_C2)
+        self.bridge.observe("s1")
+        self.assertIsNone(self.claude())
+        write_claude_credentials(self.claude_path, KEY_C2)
+        self.advance(bridge_module.CLAUDE_RECHECK_SECONDS - 1)
+        self.bridge.tick()
+        self.assertEqual((self.claude_reads, self.claude()), (1, None))
+        self.advance(1)
+        self.bridge.tick()
+        self.assertEqual((self.claude_reads, self.claude()), (2, self.claude_stamp))
+        self.assertEqual(self.record()["route"]["epoch"], 2)
+
+    def test_leaving_anthropic_drops_the_name_and_coming_back_on_the_same_key_restores_it(self):
+        self.bridge.observe("s1")
+        self.agents["s1"] = FakeAgent()  # /model to Codex
+        self.bridge.tick()
+        self.assertEqual((self.record()["route"]["provider"], self.claude()), ("openai-codex", None))
+        write_claude_credentials(self.claude_path, KEY_C2)
+        self.agents["s1"] = FakeClaudeAgent()  # back, on the key that was proven
+        self.bridge.tick()
+        self.assertEqual(self.claude(), self.claude_stamp)
+        self.assertEqual(self.claude_reads, 1)
+
+    def test_a_check_that_fails_names_nothing(self):
+        def broken(_api_key):
+            raise RuntimeError("unexpected")
+
+        self.bridge.close()
+        self.bridge = self.make_bridge(claude_file_stamp=broken)
+        self.bridge.observe("s1")
+        self.assertIsNone(self.claude())
 
 
 class LateAnswerTests(BridgeCase):

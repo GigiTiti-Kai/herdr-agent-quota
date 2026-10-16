@@ -1875,26 +1875,65 @@ fn desired_workspace_summary(
 }
 
 /// How many live Hermes sessions are proven to bill each footer row's
-/// account. A session counts only when the principal stamp its own process
-/// published equals the stamp of the Codex login the row's snapshot belongs
-/// to. Only the Codex row has such a login (`AccountFamily::HERMES_BADGED`);
-/// nothing is counted while Hermes is not an enabled agent.
+/// account (`AccountFamily::HERMES_BADGED`). Codex: the principal stamp a
+/// session's own process published equals the stamp of the Codex login the
+/// row's snapshot belongs to. Claude: the session's key was seen to be the
+/// token in the credentials file the Claude row reads. Nothing is counted
+/// while Hermes is not an enabled agent.
 fn hermes_sessions_by_provider(
     cache: &CacheStore,
     snapshots: &[ProviderSnapshot],
     now: u64,
 ) -> Vec<(Provider, usize)> {
-    if !AgentSelection::from_args_or_env(&[]).contains(&Harness::Hermes)
-        || !snapshots
-            .iter()
-            .any(|snapshot| snapshot.provider == Provider::Codex)
-    {
+    if !AgentSelection::from_args_or_env(&[]).contains(&Harness::Hermes) {
         return Vec::new();
     }
-    let login = codex::current_login_principal();
-    hermes_sessions_on_rows(snapshots, login.as_ref(), || {
-        crate::providers::hermes::live_principals(cache.root(), now)
-    })
+    let mut rows = Vec::new();
+    if snapshots
+        .iter()
+        .any(|snapshot| snapshot.provider == Provider::Codex)
+    {
+        let login = codex::current_login_principal();
+        rows.extend(hermes_sessions_on_rows(snapshots, login.as_ref(), || {
+            crate::providers::hermes::live_principals(cache.root(), now)
+        }));
+    }
+    rows.extend(claude_sessions_on_row(
+        snapshots,
+        claude_row_file_stamp,
+        || crate::providers::hermes::live_claude_credentials(cache.root(), now),
+    ));
+    rows
+}
+
+/// The stamp of the credentials file the Claude row's account windows are
+/// fetched with (`claude_api::credentials_path`, resolved). `None` when
+/// there is no such file.
+fn claude_row_file_stamp() -> Option<String> {
+    let path = crate::providers::claude_api::credentials_path().ok()?;
+    let resolved = std::fs::canonicalize(path).ok()?;
+    crate::providers::hermes::claude_credentials_stamp(&resolved)
+}
+
+/// The Claude row's Hermes sessions: live Anthropic sessions whose key was
+/// seen in the file this row reads. Only a row with account windows (the
+/// endpoint reading that file's token returned) is that file's row; the
+/// file is resolved and the mailbox scanned only for such a row.
+fn claude_sessions_on_row(
+    snapshots: &[ProviderSnapshot],
+    file_stamp: impl FnOnce() -> Option<String>,
+    live_claude_credentials: impl FnOnce() -> Vec<String>,
+) -> Option<(Provider, usize)> {
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.provider == Provider::Claude)
+        .filter(|snapshot| !snapshot.account_windows.is_empty())?;
+    let file = file_stamp()?;
+    let sessions = live_claude_credentials()
+        .iter()
+        .filter(|stamp| **stamp == file)
+        .count();
+    (sessions > 0).then_some((Provider::Claude, sessions))
 }
 
 /// [`hermes_sessions_by_provider`] once Hermes is known to be enabled. The
@@ -2652,6 +2691,147 @@ mod tests {
         assert_eq!(
             crate::herdr::desired_summary_tokens(&same),
             crate::herdr::desired_summary_tokens(&unproven)
+        );
+    }
+
+    /// A Claude snapshot whose windows came from the usage endpoint, as
+    /// `overlay_claude_windows` saves it: the row of the credentials file.
+    fn claude_account(windows: Vec<UsageWindow>) -> ProviderSnapshot {
+        ProviderSnapshot::new(Provider::Claude, Vec::new(), SUMMARY_NOW)
+            .session_local()
+            .with_account_windows(windows)
+    }
+
+    fn claude_windows() -> Vec<UsageWindow> {
+        vec![
+            window(WindowKind::FiveHour, 10.0, SUMMARY_NOW + 3_600),
+            window(WindowKind::Weekly, 30.0, SUMMARY_NOW + 86_400),
+        ]
+    }
+
+    /// Live Hermes sessions count toward the Claude row only by the stamp of
+    /// the credentials file that row reads, and only a row with account
+    /// windows is that file's row. Without such a row the file is not even
+    /// resolved and the mailbox not scanned.
+    #[test]
+    fn hermes_sessions_count_toward_the_claude_row_only_by_its_credentials_file() {
+        use crate::providers::hermes::claude_credentials_stamp;
+        let stamp = |path: &str| claude_credentials_stamp(std::path::Path::new(path)).unwrap();
+        let file = stamp("/home/u/.claude/.credentials.json");
+        let other = stamp("/srv/claude/.credentials.json");
+        let claude = claude_account(claude_windows());
+        let rows = std::slice::from_ref(&claude);
+        let mine = || Some(file.clone());
+        assert_eq!(
+            claude_sessions_on_row(rows, mine, || vec![
+                file.clone(),
+                other.clone(),
+                file.clone()
+            ]),
+            Some((Provider::Claude, 2))
+        );
+        assert_eq!(
+            claude_sessions_on_row(rows, mine, || vec![other.clone()]),
+            None
+        );
+        assert_eq!(claude_sessions_on_row(rows, mine, Vec::new), None);
+        // The raw path is never what is compared.
+        assert_eq!(
+            claude_sessions_on_row(rows, mine, || vec![
+                "/home/u/.claude/.credentials.json".to_string()
+            ]),
+            None
+        );
+        // No credentials file for the row: nothing to compare with.
+        let unscanned = || -> Vec<String> { panic!("scanned without a file") };
+        assert_eq!(claude_sessions_on_row(rows, || None, unscanned), None);
+        // A statusLine-only reading is no file's row, and neither is another
+        // provider's or no row at all.
+        let unresolved = || -> Option<String> { panic!("resolved without a row") };
+        let mut statusline =
+            ProviderSnapshot::new(Provider::Claude, Vec::new(), SUMMARY_NOW).session_local();
+        statusline
+            .session_windows
+            .insert("s1".to_string(), claude_windows());
+        for rows in [
+            vec![statusline],
+            vec![three_window_snapshot(Provider::Codex)],
+            Vec::new(),
+        ] {
+            assert_eq!(claude_sessions_on_row(&rows, unresolved, unscanned), None);
+        }
+    }
+
+    /// The badge rides the Claude row for Claude sessions, carries the
+    /// session count, and costs one workspace key; the Codex row is left as
+    /// it was, and each row counts its own sessions.
+    #[test]
+    fn workspace_summary_marks_the_claude_row_with_the_hermes_badge() {
+        let hermes_mark = crate::icons::for_harness(Harness::Hermes);
+        for format in crate::cli::SummaryFormat::CHOICES
+            .into_iter()
+            .filter(|format| format.is_on())
+        {
+            let row = summary_row(format);
+            let snapshots = [claude_account(claude_windows()), stamped_codex("acc-1")];
+            let plain = workspace_summary(&snapshots, SUMMARY_NOW, row, &[]);
+            assert!(!plain.contains_key("quota_acct_cl_hermes"), "{format:?}");
+            let badged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[(Provider::Claude, 3)]);
+            assert_eq!(
+                badged.get("quota_acct_cl_hermes"),
+                Some(&format!("{hermes_mark} 3")),
+                "{format:?}"
+            );
+            assert!(!badged.contains_key("quota_acct_cx_hermes"), "{format:?}");
+            assert_eq!(
+                family_names(&badged, "cx"),
+                family_names(&plain, "cx"),
+                "{format:?}"
+            );
+            assert_eq!(
+                family_names(&badged, "cl").len(),
+                family_names(&plain, "cl").len() + 1,
+                "{format:?}"
+            );
+            let both = workspace_summary(
+                &snapshots,
+                SUMMARY_NOW,
+                row,
+                &[(Provider::Codex, 1), (Provider::Claude, 2)],
+            );
+            assert_eq!(
+                both.get("quota_acct_cl_hermes"),
+                Some(&format!("{hermes_mark} 2"))
+            );
+            assert_eq!(
+                both.get("quota_acct_cx_hermes"),
+                Some(&format!("{hermes_mark} 1"))
+            );
+        }
+    }
+
+    /// Claude's real reading has a third, model-scoped weekly window. In the
+    /// lines footer the badge still fits on the 5h line.
+    #[test]
+    fn the_claude_badge_fits_the_lines_footer_with_a_scoped_window() {
+        let mut windows = claude_windows();
+        windows.push(
+            window(WindowKind::WeeklyScoped, 92.0, SUMMARY_NOW + 86_400)
+                .with_source_window("Fab".to_string(), None),
+        );
+        let row = summary_row(crate::cli::SummaryFormat::Lines);
+        let badged = workspace_summary(
+            &[claude_account(windows)],
+            SUMMARY_NOW,
+            row,
+            &[(Provider::Claude, 1)],
+        );
+        assert!(badged.contains_key("quota_acct_cl_hermes"), "{badged:?}");
+        assert!(
+            badged
+                .keys()
+                .any(|name| name.starts_with("quota_acct_cl_w3_")),
+            "{badged:?}"
         );
     }
 

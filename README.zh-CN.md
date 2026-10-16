@@ -66,7 +66,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Agent order | 按 Space 分组，组内剩余额度最少优先（默认）；或使用 Herdr 自己的排序 |
 | Low quota alert | 关闭，或设置 1%–100% 的提醒阈值 |
 | Icon size | 侧栏图标小、中（默认）、大。仅 WezTerm：尺寸名写入 WezTerm 配置目录的 `herdr-icon-size.local.json`，应用后按 Ctrl+Shift+R。其他终端保持原有图标大小；正文字号不变 |
-| Account summary | `off`（默认）在每个 agent 行显示额度条。`compact`（3 格条 + 重置时间）、`bars`（4 格条）或 `numbers` 改为在 Agent 面板底部按账号各显示一行；`lines` 则每个额度窗口各占一行并带各自的重置倒计时，标题下及账号之间各空一行。都需要支持 `[ui.sidebar.agents] footer` 的 Herdr；`lines` 还要求 footer 允许 64 行（`MAX_AGENT_FOOTER_ROWS`），旧版客户端遇到超过 16 行的 footer 会拒绝整个配置。已启用的 Claude、Codex、Grok、Agy、Devin、Muse、Cursor 的行按缓存读数发布到每个 workspace，没有运行中的 agent 也会保留（需要 footer 能回退到 workspace token 的 Herdr）；Agy 的行显示最近一次 Agy 读数的窗口，Claude 在 usage API 提供账号级窗口之前仍留在各自的 pane 上；计量型 DS/OR、Hermes、OpenCode Go、omp 的行仍来自各自的 pane；但已证实与 Codex 行使用同一 ChatGPT 账号且同一用户的 Hermes 会话不再单独占一行，而是在 Codex 行上显示带会话数的 Hermes 徽标。已知限制：Herdr 从该账号第一个带有某行的 pane 填充每条按 pane 发布的行，因此两个窗口数不同的此类 pane 可能在同一块中混合显示 |
+| Account summary | `off`（默认）在每个 agent 行显示额度条。`compact`（3 格条 + 重置时间）、`bars`（4 格条）或 `numbers` 改为在 Agent 面板底部按账号各显示一行；`lines` 则每个额度窗口各占一行并带各自的重置倒计时，标题下及账号之间各空一行。都需要支持 `[ui.sidebar.agents] footer` 的 Herdr；`lines` 还要求 footer 允许 64 行（`MAX_AGENT_FOOTER_ROWS`），旧版客户端遇到超过 16 行的 footer 会拒绝整个配置。已启用的 Claude、Codex、Grok、Agy、Devin、Muse、Cursor 的行按缓存读数发布到每个 workspace，没有运行中的 agent 也会保留（需要 footer 能回退到 workspace token 的 Herdr）；Agy 的行显示最近一次 Agy 读数的窗口，Claude 在 usage API 提供账号级窗口之前仍留在各自的 pane 上；计量型 DS/OR、Hermes、OpenCode Go、omp 的行仍来自各自的 pane；但已证实与 Codex 行使用同一 ChatGPT 账号且同一用户的 Hermes 会话，或运行在 Claude 行所读 Claude Code 凭据文件中 token 上的 Hermes 会话，不再单独占一行，而是在对应行上显示带会话数的 Hermes 徽标。已知限制：Herdr 从该账号第一个带有某行的 pane 填充每条按 pane 发布的行，因此两个窗口数不同的此类 pane 可能在同一块中混合显示 |
 | Agents | Claude、Codex、Grok、Agy、OpenCode、Pi、OMP、Devin、Muse、Cursor、Hermes |
 
 方向键或空格修改，`a` 应用，`q` 关闭。脚本配置选项见 `./install.sh --help`。
@@ -113,9 +113,18 @@ footer 行，而是在 Codex 行第一行末尾显示 Hermes 徽标：Hermes 标
 会话数。只有当会话当前 access token 所指的账号和用户（`sub`）就是 Codex 读数所属登录的账号和
 用户时才显示；双方只比较这一对值的域分离 sha256，从不比较 ID 本身。同一 ChatGPT workspace 的
 成员共享账号 ID 但额度各自独立，因此用户也参与比较。使用其他账号或其他席位的 Hermes 会话保留
-自己的 Hermes 行，其他 provider 的会话不显示徽标。Claude 行从不显示徽标：Claude Code 的
-statusLine 和 usage 读数都没有可与 Hermes 凭据比较的账号。bridge 更新前启动的 Hermes 进程在
-重启前不会报告。
+自己的 Hermes 行，其他 provider 的会话不显示徽标。bridge 更新前启动的 Hermes 进程在重启前不会报告。
+
+在原生 Anthropic 路由（`api.anthropic.com`）上使用 Claude Code 自身登录的 Hermes 会话，会在
+Claude 行显示同样的徽标。Hermes 从 Claude Code 的凭据文件（`$CLAUDE_CONFIG_DIR` 或 `~/.claude`
+下的 `.credentials.json`）借用该登录，Claude 行的 usage 读数也使用同一文件。bridge 在 Hermes
+进程内、在密钥首次出现时于内存中比较会话的当前密钥与该文件中的 token；只有相等时才写入该文件解析后
+路径的域分离 sha256。插件以同样方式对 Claude 行所读文件的路径求哈希，徽标统计印记一致的存活会话。
+证明属于密钥本身：Claude Code 自行刷新文件时会话仍保留徽标，换成新密钥时重新比较。
+`ANTHROPIC_API_KEY`、Hermes 自己的 Anthropic 登录、代理端点、`auth.adopt_external_logins: false`，
+或 Claude 行读取的是另一个文件时，都不显示徽标。Anthropic 路由不获取额度，判断过程也不向任何地方
+发送请求。已知限制：若 Claude Code 登录到另一个账号，仍持有旧登录密钥的 Hermes 会话会保留徽标，
+直到 Hermes 换用新密钥（下次刷新或请求被拒绝）为止，因为双方都没有账号 ID 可用。
 
 原生 Codex、Grok、Devin、Muse、Cursor collector 跟随插件的当前登录，不为每个窗格分别识别账号。
 Claude/Agy 没有可靠的服务账号 ID，因此不跨会话共享观测值。

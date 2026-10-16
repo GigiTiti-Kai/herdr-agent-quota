@@ -3543,34 +3543,41 @@ mod field_tests {
         }
     }
 
-    /// Only the Codex row can carry the Hermes badge, last on its row in
-    /// every format, inked like the footer marks; the Hermes row itself stays
-    /// for a Hermes session whose account no other row shows.
+    /// Only the Claude and Codex rows can carry the Hermes badge, each last on
+    /// its own row in every format, inked like the footer marks; the Hermes
+    /// row itself stays for a Hermes session whose account no other row shows.
     #[test]
-    fn only_the_codex_footer_row_carries_the_hermes_badge() {
+    fn only_the_claude_and_codex_footer_rows_carry_the_hermes_badge() {
         for summary in SummaryFormat::CHOICES.into_iter().filter(|s| s.is_on()) {
             let (updated, rows) = written_footer(summary);
             let carriers: Vec<&Vec<String>> = rows
                 .iter()
                 .filter(|row| row.iter().any(|token| token.ends_with("_hermes")))
                 .collect();
-            assert_eq!(carriers.len(), 1, "{summary:?}: {carriers:?}");
-            assert_eq!(
-                carriers[0].last().map(String::as_str),
-                Some("$quota_acct_cx_hermes"),
-                "{summary:?}"
-            );
-            assert!(
-                carriers[0].contains(&"$quota_acct_cx_icon".to_string()),
-                "{summary:?}"
-            );
+            assert_eq!(carriers.len(), 2, "{summary:?}: {carriers:?}");
+            for (carrier, id) in carriers.iter().zip(["cl", "cx"]) {
+                assert_eq!(
+                    carrier.last().map(String::as_str),
+                    Some(format!("$quota_acct_{id}_hermes").as_str()),
+                    "{summary:?}"
+                );
+                assert!(
+                    carrier.contains(&format!("$quota_acct_{id}_icon")),
+                    "{summary:?}"
+                );
+                assert_eq!(
+                    carrier.iter().filter(|t| t.ends_with("_hermes")).count(),
+                    1,
+                    "{summary:?}"
+                );
+                let badge = updated
+                    .split(&format!("{{ token = \"$quota_acct_{id}_hermes\""))
+                    .nth(1)
+                    .and_then(|rest| rest.split('}').next())
+                    .unwrap_or_else(|| panic!("{summary:?}: {updated}"));
+                assert!(badge.contains(IDLE_ICON_COLOR), "{badge}");
+            }
             assert!(updated.contains("$quota_acct_hm_icon"), "{summary:?}");
-            let badge = updated
-                .split("{ token = \"$quota_acct_cx_hermes\"")
-                .nth(1)
-                .and_then(|rest| rest.split('}').next())
-                .unwrap_or_else(|| panic!("{summary:?}: {updated}"));
-            assert!(badge.contains(IDLE_ICON_COLOR), "{badge}");
         }
     }
 

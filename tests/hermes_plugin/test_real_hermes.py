@@ -2,11 +2,13 @@
 
 Real here: the launcher's interpreter and prelude, Hermes' bootstrap, plugin discovery and
 context, hook dispatch, the agent object, the in-session model switch, the usage parser, the
-session finalizer, one whole `hermes chat -q` process (its own CLI object, agent, and hooks), and
-the TUI's gateway process driven over its stdio JSON-RPC (session table, agent build, turn).
-Stubbed: the HTTP answer of the usage endpoint, the notify executable, and in tests 2-6 the CLI
-object that holds the agent. The sandbox has no network, so a request that escaped the stub
-fails instead of reaching a provider.
+session finalizer, Hermes's Anthropic credential resolution (the borrowed Claude Code file, its
+credential pool, an API key), one whole `hermes chat -q` process (its own CLI object, agent, and
+hooks), and the TUI's gateway process driven over its stdio JSON-RPC (session table, agent build,
+turn). Stubbed: the HTTP answer of the usage endpoint, the notify executable, the Claude Code
+credentials file (made-up tokens under /tmp), and in tests 2-6c the CLI object that holds the
+agent. The sandbox has no network, so a request that escaped the stub fails instead of reaching a
+provider.
 
 Outside the sandbox this file refuses to start. Hermes' bootstrap rewrites its launchers and
 syncs dependencies when it runs somewhere it can write, which is what this file must never do.
@@ -37,6 +39,14 @@ KEY_A = "fake-token-" + "A" * 40
 KEY_B = "fake-token-" + "B" * 40
 KEY_CLI = "fake-token-" + "D" * 40
 CODEX_BASE = "https://chatgpt.com/backend-api/codex"
+# Claude Code's credentials file, outside /work so test 9's scan of /work only sees what the bridge
+# wrote. CC is the token in it, CC2 what Claude Code refreshes it to, API an Anthropic API key.
+CLAUDE_DIR = Path("/tmp/claude")
+KEY_CC = "sk-ant-oat01-fake-" + "E" * 40
+KEY_CC2 = "sk-ant-oat01-fake-" + "F" * 40
+KEY_API = "sk-ant-api03-fake-" + "G" * 40
+ANTHROPIC_BASE = "https://api.anthropic.com"
+SESSION_C = "sandbox-session-claude"
 HOOKS = (
     "on_session_start", "on_session_reset", "pre_llm_call", "pre_api_request",
     "post_api_request", "on_session_finalize",
@@ -176,6 +186,32 @@ def record():
         return json.loads((MAILBOX / f"{SESSION}.json").read_text())
     except (OSError, ValueError):
         return None
+
+
+def claude_record():
+    try:
+        return json.loads((MAILBOX / f"{SESSION_C}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_claude_credentials(token):
+    """Claude Code's credentials file, where `CLAUDE_CONFIG_DIR` points Hermes."""
+    CLAUDE_DIR.mkdir(mode=0o700, exist_ok=True)
+    path = CLAUDE_DIR / ".credentials.json"
+    path.write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": token, "refreshToken": "fake-refresh-" + token[-8:], "expiresAt": 4_102_444_800_000,
+    }}))
+    path.chmod(0o600)
+    return path
+
+
+def expected_claude_stamp():
+    """Computed here, not by the plugin: sha256(domain || resolved path of the file)."""
+    import hashlib
+
+    resolved = os.path.realpath(CLAUDE_DIR / ".credentials.json")
+    return hashlib.sha256(b"herdr-agent-quota/claude-credentials-file\0" + os.fsencode(resolved)).hexdigest()
 
 
 def wait_for(predicate, seconds=15.0):
@@ -344,6 +380,87 @@ class RealHermes(unittest.TestCase):
         finalize_session(session_id=SESSION, platform="cli")
         self.assertEqual(sorted(p.name for p in MAILBOX.iterdir()), [])
 
+    def test_6a_a_session_on_claude_codes_borrowed_login_names_the_credentials_file(self):
+        # This machine's shape: anthropic is not configured in Hermes, so no pool entry is seeded
+        # and Hermes's own resolver borrows the token from Claude Code's file.
+        from hermes_cli import plugins
+        from hermes_cli.lifecycle import invoke_hook
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from run_agent import AIAgent
+
+        write_claude_credentials(KEY_CC)
+        os.environ["CLAUDE_CONFIG_DIR"] = str(CLAUDE_DIR)
+        write_config(PLUGIN, model="gpt-5.5", provider="openai-codex")
+        runtime = resolve_runtime_provider(requested="anthropic", target_model="claude-sonnet-4-5")
+        self.assertEqual((runtime["provider"], runtime["api_mode"]), ("anthropic", "anthropic_messages"))
+        self.assertIsNone(runtime.get("credential_pool"))
+        self.assertTrue(runtime["api_key"] == KEY_CC, "Hermes did not borrow the file's token")
+        agent = AIAgent(
+            base_url=runtime["base_url"], api_key=runtime["api_key"], provider="anthropic",
+            api_mode="anthropic_messages", model="claude-sonnet-4-5", quiet_mode=True, platform="cli",
+            session_id=SESSION_C, skip_context_files=True, skip_memory=True,
+            skip_background_review=True, enabled_toolsets=[],
+        )
+        self.state.claude_agent = agent
+        plugins.get_plugin_manager()._cli_ref = types.SimpleNamespace(agent=agent)
+        invoke_hook("on_session_start", session_id=SESSION_C, model=agent.model, platform="cli")
+        route = claude_record()["route"]
+        self.assertEqual((route["provider"], route["supported"], route["identity"], route["principal"]),
+                         ("anthropic", False, None, None))
+        self.assertEqual(route["claude_credentials"], expected_claude_stamp())
+        self.assertIsNone(claude_record()["quota"])
+        epoch = route["epoch"]
+
+        # Claude Code refreshes its file on its own; the session keeps the key it was proven on.
+        write_claude_credentials(KEY_CC2)
+        time.sleep(3 * self.state.plugin.POLL_SECONDS)
+        route = claude_record()["route"]
+        self.assertEqual((route["epoch"], route["claude_credentials"]), (epoch, expected_claude_stamp()))
+        self.state.claude_epoch = epoch
+
+    def test_6b_an_anthropic_api_key_never_names_the_file(self):
+        from agent.agent_runtime_helpers import switch_model
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        agent = self.state.claude_agent
+        os.environ["ANTHROPIC_API_KEY"] = KEY_API
+        try:
+            write_config(PLUGIN, model="claude-sonnet-4-5", provider="anthropic")
+            runtime = resolve_runtime_provider(requested="anthropic", target_model="claude-sonnet-4-5")
+            self.assertTrue(runtime["api_key"] == KEY_API, "Hermes did not pick the API key")
+            switch_model(agent, "claude-sonnet-4-5", "anthropic", api_key=runtime["api_key"],
+                         base_url=runtime["base_url"], api_mode="anthropic_messages")
+        finally:
+            del os.environ["ANTHROPIC_API_KEY"]
+        moved = wait_for(lambda: (claude_record() or {}).get("route", {}).get("epoch", 0) > self.state.claude_epoch
+                         and claude_record())
+        self.assertIsNotNone(moved, "the poller did not follow the key change")
+        self.assertEqual(moved["route"]["provider"], "anthropic")
+        self.assertIsNone(moved["route"]["claude_credentials"])
+        self.state.claude_epoch = moved["route"]["epoch"]
+
+    def test_6c_a_claude_code_pool_entry_names_the_file_again(self):
+        # Anthropic configured in Hermes: the pool seeds a `claude_code` entry from the same file
+        # (which Claude Code refreshed in 6a). Its key is the file's token, so it is named again.
+        from agent.agent_runtime_helpers import switch_model
+        from agent.credential_pool import load_pool
+        from hermes_cli.lifecycle import finalize_session
+
+        agent = self.state.claude_agent
+        entries = [e for e in load_pool("anthropic").entries() if e.source == "claude_code"]
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0].runtime_api_key == KEY_CC2, "the pool entry is not the file's token")
+        switch_model(agent, "claude-sonnet-4-5", "anthropic", api_key=entries[0].runtime_api_key,
+                     base_url=ANTHROPIC_BASE, api_mode="anthropic_messages")
+        named = wait_for(lambda: (claude_record() or {}).get("route", {}).get("claude_credentials") and claude_record())
+        self.assertIsNotNone(named, "the pool entry's key was not seen in the file")
+        self.assertEqual(named["route"]["claude_credentials"], expected_claude_stamp())
+        self.assertGreater(named["route"]["epoch"], self.state.claude_epoch)
+        self.assertIsNone(named["quota"])
+        finalize_session(session_id=SESSION_C, platform="cli")
+        self.assertEqual(sorted(p.name for p in MAILBOX.iterdir()), [])
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
     def test_7_a_real_cli_session_is_found_through_the_real_cli_reference(self):
         # A whole `hermes chat -q` process: Hermes builds the CLI object and the agent, and fires
         # its hooks itself. The model request then dies on the missing network.
@@ -447,7 +564,7 @@ class RealHermes(unittest.TestCase):
         for path in WORK.rglob("*"):
             if path.is_file():
                 data = path.read_bytes()
-                for key in (KEY_A, KEY_B, KEY_CLI):
+                for key in (KEY_A, KEY_B, KEY_CLI, KEY_CC, KEY_CC2, KEY_API):
                     self.assertNotIn(key.encode(), data, path)
 
 

@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Account summary: the Claude row now carries the Hermes badge too, for
+  Hermes sessions on the native Anthropic route that run on Claude Code's own
+  login. The bridge (version 3) compares the session's live key with the
+  token in Claude Code's credentials file in memory and, only when they are
+  equal, records a domain-separated sha256 of the file's resolved path
+  (`route.claude_credentials`); the plugin hashes the file its Claude row
+  reads the same way. The proof stays with the key, so Claude Code refreshing
+  the file does not drop the badge. API keys, Hermes-owned logins, proxies,
+  and an opted-out `auth.adopt_external_logins` give no badge. No quota is
+  fetched for the Anthropic route and nothing new is sent. Run `configure` to
+  add `$quota_acct_cl_hermes` to the footer; Hermes processes pick up the new
+  bridge on restart.
 - Account summary: a Hermes session that bills the same ChatGPT account as
   the Codex row, as the same user, no longer gets a duplicate Hermes footer
   row. The Codex row carries a Hermes badge instead (the Hermes mark and the
@@ -15,7 +27,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bridge plugin now records a domain-separated sha256 of the account id and
   user (`sub`) its live access token names; the badge appears only when it
   equals the same stamp of the Codex login the Codex reading belongs to.
-  Other accounts or seats keep their Hermes row; the Claude row has no badge.
+  Other accounts or seats keep their Hermes row.
   Run `configure` to add the badge token to the footer; Hermes processes pick
   up the new bridge on restart.
 

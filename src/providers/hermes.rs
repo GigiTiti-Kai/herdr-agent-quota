@@ -20,6 +20,14 @@
 //! compared with the same stamp of the Codex login the Codex row belongs to,
 //! never with a raw id. Both halves matter: members of one ChatGPT workspace
 //! share the account id but each has their own quota.
+//!
+//! A native Anthropic route (never supported: no quota is fetched for it) may
+//! carry `claude_credentials`: [`claude_credentials_stamp`] of Claude Code's
+//! credentials file, written once the producer saw the live key equal the
+//! token in that file. The Claude row reads the same file, so an equal stamp
+//! is a session on that row's login. The file follows one login however often
+//! its token is refreshed, which is why the path is the identity and the
+//! token never is.
 
 use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
 use serde_json::Value;
@@ -29,6 +37,8 @@ use std::path::Path;
 pub const MAILBOX_DIR: &str = "hermes-bridge";
 /// The only route the bridge fetches for.
 pub const BRIDGED_PROVIDER: &str = "openai-codex";
+/// The route whose records may carry a Claude credentials file stamp.
+pub const CLAUDE_ROUTE_PROVIDER: &str = "anthropic";
 
 const SCHEMA: u64 = 1;
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
@@ -43,6 +53,21 @@ const MAX_SCANNED_ENTRIES: usize = 512;
 /// Domain of [`chatgpt_principal_stamp`]. The bridge plugin hashes the same
 /// bytes; `the_principal_stamp_is_pinned` keeps the two from drifting apart.
 const PRINCIPAL_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/chatgpt-principal\0";
+/// Domain of [`claude_credentials_stamp`]. The bridge plugin hashes the same
+/// bytes; `the_claude_credentials_stamp_is_pinned` keeps the two together.
+const CLAUDE_CREDENTIALS_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/claude-credentials-file\0";
+
+fn hex_sha256(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// The comparable form of a ChatGPT principal: lowercase hex of
 /// `sha256("herdr-agent-quota/chatgpt-principal\0" || account id || "\0" || sub)`,
@@ -53,16 +78,34 @@ const PRINCIPAL_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/chatgpt-principal\0";
 /// Codex login's. Equal stamps are the same seat of the same account, the
 /// identity Hermes itself uses to tell two Codex credentials apart.
 pub fn chatgpt_principal_stamp(account_id: &str, subject: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(PRINCIPAL_STAMP_DOMAIN);
-    hasher.update(account_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(subject.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_sha256(&[
+        PRINCIPAL_STAMP_DOMAIN,
+        account_id.as_bytes(),
+        &[0],
+        subject.as_bytes(),
+    ])
+}
+
+/// The comparable form of a Claude credentials file: lowercase hex of
+/// `sha256("herdr-agent-quota/claude-credentials-file\0" || resolved path)`.
+///
+/// `resolved` must already be canonical (symlinks and `..` resolved); the
+/// bridge hashes `os.path.realpath(..., strict=True)` of the file Hermes
+/// borrows its Claude login from, and the Claude row hashes
+/// `fs::canonicalize` of the file it reads. Neither side writes the token.
+/// `None` where paths are not bytes: the bridge never runs there.
+#[cfg(unix)]
+pub fn claude_credentials_stamp(resolved: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(hex_sha256(&[
+        CLAUDE_CREDENTIALS_STAMP_DOMAIN,
+        resolved.as_os_str().as_bytes(),
+    ]))
+}
+
+#[cfg(not(unix))]
+pub fn claude_credentials_stamp(_resolved: &Path) -> Option<String> {
+    None
 }
 
 /// One mailbox record that passed every gate.
@@ -113,6 +156,38 @@ pub fn load(
 /// whichever pane it reports from. A session whose token names no
 /// principal, or that is on any other route, is not counted.
 pub fn live_principals(state: &Path, now_unix: u64) -> Vec<String> {
+    live_records(state)
+        .into_iter()
+        .filter_map(|(session_id, record)| {
+            let pane_id = record_pane_id(&record)?;
+            parse_route(&record, pane_id, &session_id, BRIDGED_PROVIDER, now_unix)?.principal
+        })
+        .collect()
+}
+
+/// The Claude credentials file stamp of every Hermes session a live
+/// producer is watching on the native Anthropic route right now, one entry
+/// per session.
+///
+/// The Claude row's Hermes badge counts these. Same rules as
+/// [`live_principals`]: only this plugin's mailbox is read, the producer
+/// must hold the lock and have re-checked the route within
+/// [`ROUTE_TTL_SECONDS`]. A session whose key was not seen in the file, or
+/// that is on any other route, is not counted.
+pub fn live_claude_credentials(state: &Path, now_unix: u64) -> Vec<String> {
+    live_records(state)
+        .into_iter()
+        .filter_map(|(session_id, record)| {
+            let pane_id = record_pane_id(&record)?;
+            parse_claude_credentials(&record, pane_id, &session_id, now_unix)
+        })
+        .collect()
+}
+
+/// Every record whose producer still holds its lock, by session id, in
+/// session id order. At most [`MAX_SCANNED_ENTRIES`] directory entries are
+/// looked at.
+fn live_records(state: &Path) -> Vec<(String, Value)> {
     let directory = state.join(MAILBOX_DIR);
     if !files::is_private_directory(&directory) {
         return Vec::new();
@@ -130,16 +205,21 @@ pub fn live_principals(state: &Path, now_unix: u64) -> Vec<String> {
         .collect();
     sessions.sort();
     sessions
-        .iter()
+        .into_iter()
         .filter_map(|session_id| {
-            let record = live_record(&directory, session_id)?;
-            let pane_id = record
-                .get("pane_id")
-                .and_then(Value::as_str)
-                .filter(|pane| is_pane_id(pane))?;
-            parse_route(&record, pane_id, session_id, BRIDGED_PROVIDER, now_unix)?.principal
+            let record = live_record(&directory, &session_id)?;
+            Some((session_id, record))
         })
         .collect()
+}
+
+/// The pane a record reports from, when it has the shape the producer
+/// accepts.
+fn record_pane_id(record: &Value) -> Option<&str> {
+    record
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .filter(|pane| is_pane_id(pane))
 }
 
 /// The record of `session_id`, only while its producer still holds the lock.
@@ -217,14 +297,7 @@ fn parse_route(
     now_unix: u64,
 ) -> Option<Route> {
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
-    if record.get("schema").and_then(Value::as_u64) != Some(SCHEMA)
-        || text(record, "session_id").as_deref() != Some(session_id)
-        || text(record, "pane_id").as_deref() != Some(pane_id)
-        || text(record, "profile").as_deref() != Some("default")
-    {
-        return None;
-    }
-    let route = record.get("route")?;
+    let route = checked_route(record, pane_id, session_id, now_unix)?;
     let epoch = route.get("epoch").and_then(Value::as_u64)?;
     let identity = text(route, "identity").filter(|identity| is_identity(identity))?;
     if text(route, "provider").as_deref() != Some(provider_id)
@@ -232,6 +305,49 @@ fn parse_route(
     {
         return None;
     }
+    // Absent from records written before the stamp existed, and null when the
+    // token names no principal. Anything else that is not a stamp is malformed.
+    let principal = optional_stamp(route, "principal")?;
+    Some(Route {
+        epoch,
+        identity,
+        principal,
+    })
+}
+
+/// The Claude credentials file stamp of a native Anthropic route its
+/// producer checked recently. That route is never supported and carries no
+/// identity or quota; only the stamp is read.
+fn parse_claude_credentials(
+    record: &Value,
+    pane_id: &str,
+    session_id: &str,
+    now_unix: u64,
+) -> Option<String> {
+    let route = checked_route(record, pane_id, session_id, now_unix)?;
+    if route.get("provider").and_then(Value::as_str) != Some(CLAUDE_ROUTE_PROVIDER) {
+        return None;
+    }
+    optional_stamp(route, "claude_credentials")?
+}
+
+/// The record's route, once the record is for this session and pane in the
+/// default profile and its producer checked that route recently.
+fn checked_route<'a>(
+    record: &'a Value,
+    pane_id: &str,
+    session_id: &str,
+    now_unix: u64,
+) -> Option<&'a Value> {
+    let text = |key: &str| record.get(key).and_then(Value::as_str);
+    if record.get("schema").and_then(Value::as_u64) != Some(SCHEMA)
+        || text("session_id") != Some(session_id)
+        || text("pane_id") != Some(pane_id)
+        || text("profile") != Some("default")
+    {
+        return None;
+    }
+    let route = record.get("route")?;
     // A producer whose poller died or hangs still holds its lock, but no longer
     // sees an idle `/model` or account switch. Its last check goes stale; how
     // long ago the quota itself was fetched does not matter here.
@@ -242,22 +358,21 @@ fn parse_route(
     if now_unix.saturating_sub(observed_at) > ROUTE_TTL_SECONDS {
         return None;
     }
-    // Absent from records written before the stamp existed, and null when the
-    // token names no principal. Anything else that is not a stamp is malformed.
-    let principal = match route.get("principal") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(
+    Some(route)
+}
+
+/// `Some(None)` for an absent or null stamp, `Some(Some(_))` for a stamp,
+/// `None` for anything else (a malformed record).
+fn optional_stamp(route: &Value, key: &str) -> Option<Option<String>> {
+    match route.get(key) {
+        None | Some(Value::Null) => Some(None),
+        Some(value) => Some(Some(
             value
                 .as_str()
                 .filter(|stamp| is_identity(stamp))?
                 .to_owned(),
-        ),
-    };
-    Some(Route {
-        epoch,
-        identity,
-        principal,
-    })
+        )),
+    }
 }
 
 /// A Hermes session id that is safe to use as a file name.
@@ -532,6 +647,108 @@ mod tests {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(directory.join("s1.json"), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(live_principals(state.path(), NOW).is_empty());
+    }
+
+    /// The bridge plugin hashes the same bytes
+    /// (`test_the_claude_credentials_stamp_is_pinned` in
+    /// `tests/hermes_plugin/test_bridge.py` asserts this exact digest).
+    #[test]
+    fn the_claude_credentials_stamp_is_pinned() {
+        let stamp = |path: &str| claude_credentials_stamp(Path::new(path)).unwrap();
+        assert_eq!(
+            stamp("/home/u/.claude/.credentials.json"),
+            "c04c99582d1c677beac50010fc7e9d060fe8994bf50b45c80a9bfd8a45b7fab4"
+        );
+        assert_ne!(
+            stamp("/home/u/.claude/.credentials.json"),
+            stamp("/home/v/.claude/.credentials.json")
+        );
+        // Not a principal stamp of anything: another domain.
+        assert!(is_identity(&stamp("/home/u/.claude/.credentials.json")));
+        assert!(!stamp("/home/u/.claude/.credentials.json").contains("claude"));
+    }
+
+    /// An Anthropic record with the given `claude_credentials` value, as the
+    /// bridge writes it: never supported, no identity, no quota.
+    fn claude_record(pane: &str, session: &str, stamp: Option<Value>) -> Value {
+        let mut value = record(pane, session, 12.0);
+        value["route"] = json!({
+            "epoch": 2, "provider": "anthropic", "supported": false, "identity": null,
+            "principal": null, "observed_at": NOW - 10,
+        });
+        if let Some(stamp) = stamp {
+            value["route"]["claude_credentials"] = stamp;
+        }
+        value["quota"] = Value::Null;
+        value
+    }
+
+    /// The Claude badge counts live Anthropic sessions whose producer stamped
+    /// the credentials file, and nothing else: not another route, not a stale
+    /// check, not a malformed or missing stamp, not a dead producer.
+    #[test]
+    fn live_claude_credentials_are_the_stamps_of_live_anthropic_sessions() {
+        let state = tempfile::tempdir().unwrap();
+        let file =
+            claude_credentials_stamp(Path::new("/home/u/.claude/.credentials.json")).unwrap();
+        let other = claude_credentials_stamp(Path::new("/srv/claude/.credentials.json")).unwrap();
+        let mut producers = Vec::new();
+        let mut put =
+            |session: &str, value: Value| producers.push(write(state.path(), session, &value));
+        put("s1", claude_record("w1:p1", "s1", Some(json!(file))));
+        put("s2", claude_record("w2:p4", "s2", Some(json!(file))));
+        put("s3", claude_record("w1:p2", "s3", Some(json!(other))));
+        // A key that was not seen in the file.
+        put("s4", claude_record("w1:p3", "s4", Some(Value::Null)));
+        put("s5", claude_record("w1:p5", "s5", None));
+        // Another route never counts, whatever it carries.
+        let mut codex = record("w1:p6", "s6", 12.0);
+        codex["route"]["claude_credentials"] = json!(file);
+        put("s6", codex);
+        let mut stale = claude_record("w1:p7", "s7", Some(json!(file)));
+        stale["route"]["observed_at"] = json!(NOW - ROUTE_TTL_SECONDS - 1);
+        put("s7", stale);
+        let mut future = claude_record("w1:p8", "s8", Some(json!(file)));
+        future["route"]["observed_at"] = json!(NOW + FUTURE_SLACK_SECONDS + 1);
+        put("s8", future);
+        for (session, malformed) in [
+            ("s9", json!("/home/u/.claude/.credentials.json")),
+            ("sa", json!(file.to_uppercase())),
+            ("sb", json!(7)),
+        ] {
+            put(session, claude_record("w1:p9", session, Some(malformed)));
+        }
+        let mut profile = claude_record("w1:pc", "sc", Some(json!(file)));
+        profile["profile"] = json!("work");
+        put("sc", profile);
+        let mut renamed = claude_record("w1:pd", "s1", Some(json!(file)));
+        renamed["session_id"] = json!("s1");
+        put("sd", renamed);
+        drop(write(
+            state.path(),
+            "se",
+            &claude_record("w1:pe", "se", Some(json!(file))),
+        ));
+
+        assert_eq!(
+            live_claude_credentials(state.path(), NOW),
+            vec![file.clone(), file, other]
+        );
+        // The Codex principals ignore Anthropic records.
+        assert!(live_principals(state.path(), NOW).is_empty());
+        drop(producers);
+        assert!(live_claude_credentials(state.path(), NOW).is_empty());
+    }
+
+    /// Records written by a bridge that predates `claude_credentials`, and
+    /// the Codex route's own reading, read exactly as before.
+    #[test]
+    fn a_claude_stamp_changes_nothing_on_the_codex_route() {
+        let mut value = record("w1:p1", "s1", 12.0);
+        value["route"]["claude_credentials"] =
+            json!(claude_credentials_stamp(Path::new("/x/.credentials.json")).unwrap());
+        assert_eq!(parsed(&value), parsed(&record("w1:p1", "s1", 12.0)));
+        assert!(parsed(&value).is_some());
     }
 
     #[test]

@@ -76,7 +76,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
 | Low quota alert | Off or a threshold from 1% to 100% |
 | Icon size | Small, medium (default), or large sidebar icon. WezTerm only: the size name goes to `herdr-icon-size.local.json` in the WezTerm config folder; press Ctrl+Shift+R after applying. Other terminals keep their own icon size; body text never changes |
-| Account summary | `off` (default) keeps quota meters on every agent row. `compact` (3-cell bars + reset), `bars` (4-cell bars), or `numbers` show one footer row per account at the bottom of the Agent panel instead; `lines` shows one footer line per quota window, each with its own reset countdown, and a blank line below the title and between accounts. All need a Herdr build with `[ui.sidebar.agents] footer`; `lines` also needs a footer that allows 64 rows (`MAX_AGENT_FOOTER_ROWS`), because an older client rejects the whole config on a footer longer than 16 rows. Enabled Claude, Codex, Grok, Agy, Devin, Muse, and Cursor rows are published to every workspace from the cached reading, so they stay without a running agent (needs a Herdr whose footer falls back to workspace tokens); Agy's row shows the windows of the most recent Agy reading, and Claude stays on its panes until the usage API has supplied account windows; metered DS/OR, Hermes, OpenCode Go, and omp rows still come from their panes, except that a Hermes session proven to bill the Codex row's ChatGPT account as the same user shows as a Hermes badge with a session count on the Codex row instead of a row of its own. Known limitation: Herdr fills each per-pane footer line from the first pane of that account that has it, so two such panes with different window counts can mix lines in one block |
+| Account summary | `off` (default) keeps quota meters on every agent row. `compact` (3-cell bars + reset), `bars` (4-cell bars), or `numbers` show one footer row per account at the bottom of the Agent panel instead; `lines` shows one footer line per quota window, each with its own reset countdown, and a blank line below the title and between accounts. All need a Herdr build with `[ui.sidebar.agents] footer`; `lines` also needs a footer that allows 64 rows (`MAX_AGENT_FOOTER_ROWS`), because an older client rejects the whole config on a footer longer than 16 rows. Enabled Claude, Codex, Grok, Agy, Devin, Muse, and Cursor rows are published to every workspace from the cached reading, so they stay without a running agent (needs a Herdr whose footer falls back to workspace tokens); Agy's row shows the windows of the most recent Agy reading, and Claude stays on its panes until the usage API has supplied account windows; metered DS/OR, Hermes, OpenCode Go, and omp rows still come from their panes, except that a Hermes session proven to bill the Codex row's ChatGPT account as the same user, or to run on the token in the Claude Code credentials file the Claude row reads, shows as a Hermes badge with a session count on that row instead. Known limitation: Herdr fills each per-pane footer line from the first pane of that account that has it, so two such panes with different window counts can mix lines in one block |
 | Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor, Hermes |
 
 Use arrows or Space to edit, `a` to apply, and `q` to close.
@@ -141,10 +141,27 @@ domain-separated sha256 of the pair, never the ids. Members of one ChatGPT
 workspace share the account id but each has their own quota, which is why the
 user is part of the comparison. A Hermes session on another account or seat
 keeps its own Hermes row, and a session on any other provider gets no badge.
-The Claude row never carries one: neither Claude Code's statusLine nor its
-usage reading names an account a Hermes credential could be compared with. A
-Hermes process started before the bridge was updated reports no principal
+A Hermes process started before the bridge was updated reports no principal
 until it restarts.
+
+The Claude row carries the same badge for Hermes sessions on the native
+Anthropic route (`api.anthropic.com`) that run on Claude Code's own login.
+Hermes borrows that login from Claude Code's credentials file
+(`$CLAUDE_CONFIG_DIR` or `~/.claude`, `.credentials.json`), the same file the
+Claude row's usage reading uses. Inside the Hermes process the bridge compares
+the session's live key with the token in that file, in memory, when the key
+first appears; only once they are equal does it write a domain-separated
+sha256 of the file's resolved path. The plugin hashes the path of the file it
+reads for the Claude row the same way, and the badge counts the live sessions
+whose stamp matches. The proof belongs to the key: when Claude Code refreshes
+the file on its own the session keeps its badge, and a new key is compared
+again. An `ANTHROPIC_API_KEY`, a Hermes-owned Anthropic login, a proxy
+endpoint, `auth.adopt_external_logins: false`, or a Claude row that reads
+another file gives no badge. No quota is fetched for the Anthropic route and
+nothing is sent anywhere to decide this. Known limit: if Claude Code logs into
+a different account, a Hermes session still holding the previous login's key
+keeps its badge until Hermes picks up a new key (its next refresh or a
+rejected request), because no account id is available on either side.
 
 Native Codex, Grok, Devin, Muse, and Cursor collectors follow the plugin's current login,
 not separate accounts for each pane. Claude/Agy do not report a reliable serving
