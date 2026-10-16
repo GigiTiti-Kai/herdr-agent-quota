@@ -759,6 +759,24 @@ impl IconSize {
             _ => None,
         }
     }
+
+    /// Blank rows a lines footer keeps between two vendor marks stacked in
+    /// its icon column: a provider mark and the Hermes badge under it, and
+    /// that badge and the next account's mark.
+    ///
+    /// WezTerm draws the icon font `scale` times a cell's height (the scale
+    /// of each name lives in WezTerm's `herdr_icon_size.lua`, never here),
+    /// so a mark is `scale - 1` rows taller than its own row and spills into
+    /// its neighbours. Two marks on neighbouring rows can then overlap by
+    /// that much; whole blank rows between them absorb it once there are
+    /// `ceil(scale - 1)` of them. Every preset there enlarges the mark by
+    /// more than nothing and less than a full row (1 < scale < 2), so each
+    /// name needs one row; a preset of scale 2 or more needs its own number.
+    pub fn mark_clearance_rows(self) -> usize {
+        match self {
+            Self::Small | Self::Medium | Self::Large => 1,
+        }
+    }
 }
 
 /// How the Agent panel footer summarises each account's quota.

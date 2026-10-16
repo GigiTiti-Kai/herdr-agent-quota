@@ -4,7 +4,7 @@ use crate::cli::{
 };
 use crate::identity::{self, PLUGIN_ID};
 use crate::model::Harness;
-use crate::presentation::AccountFamily;
+use crate::presentation::{hermes_block_lines, AccountFamily};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1487,23 +1487,31 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
         ));
         if summary == SummaryFormat::Lines {
             // The blank row keeps tall provider marks from overlapping. The
-            // Hermes badge sits in the icon column under the mark: first on
-            // line 2, or on that blank row when the block has one line.
-            for slot in 1..=3 {
-                if slot == 2 {
-                    append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes"), id);
+            // Hermes badge sits in the icon column under the mark, as many
+            // lines down as the icon size needs: each line of the block
+            // starts with its slot, and lines past the windows are rows of
+            // their own that only a badged block fills.
+            for line in 1..=hermes_block_lines() {
+                if line > 1 {
+                    append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes_l{line}"), id);
                 }
-                append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
-                rows.push(Value::Array(std::mem::take(&mut row)));
+                if line <= 3 {
+                    append_window_style_tokens(
+                        &mut row,
+                        &format!("quota_acct_{id}_w{line}"),
+                        palette,
+                    );
+                }
+                if !row.is_empty() {
+                    rows.push(Value::Array(std::mem::take(&mut row)));
+                }
             }
-            append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes_gap"), id);
-            row.push(styled_token(
+            rows.push(Value::Array(styled_row(
                 &format!("$quota_acct_{id}_gap"),
                 None,
                 None,
                 None,
-            ));
-            rows.push(Value::Array(std::mem::take(&mut row)));
+            )));
             continue;
         }
         for slot in 1..=3 {
@@ -1522,7 +1530,8 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
 }
 
 /// The Hermes badge token `name`, inked like the footer marks: last on a
-/// one-row format's line, in the icon column of a lines block. Only rows
+/// one-row format's line, first on each line of a lines block below the
+/// mark (`quota_acct_<id>_hermes_l<line>`, the badge or a blank). Only rows
 /// that can be proven to share a live Hermes session's account carry it
 /// (`AccountFamily::HERMES_BADGED`).
 fn append_hermes_badge(row: &mut Array, name: &str, id: &str) {
@@ -3712,27 +3721,27 @@ mod field_tests {
             let mut first = vec![format!("$quota_acct_{id}_icon")];
             first.extend(windows(id, 1));
             assert_eq!(rows[at], first, "{id}");
-            // The Hermes badge sits in the icon column under the mark: first
-            // on line 2, or on the blank row closing a one-line block.
+            // Lines 2 and 3 of a block that can carry the Hermes badge start
+            // with its slot, the badge or a blank in the icon column; every
+            // icon size fits its badge inside the three window lines.
+            assert_eq!(hermes_block_lines(), 3);
             let badged = AccountFamily::HERMES_BADGED.contains(&id);
-            let mut second = Vec::new();
-            let mut gap = Vec::new();
-            if badged {
-                second.push(format!("$quota_acct_{id}_hermes"));
-                gap.push(format!("$quota_acct_{id}_hermes_gap"));
+            for line in 2..=3 {
+                let mut expected = Vec::new();
+                if badged {
+                    expected.push(format!("$quota_acct_{id}_hermes_l{line}"));
+                }
+                expected.extend(windows(id, line));
+                assert_eq!(rows[at + line - 1], expected, "{id} line {line}");
             }
-            second.extend(windows(id, 2));
-            gap.push(format!("$quota_acct_{id}_gap"));
-            assert_eq!(rows[at + 1], second, "{id}");
-            assert_eq!(rows[at + 2], windows(id, 3), "{id}");
-            assert_eq!(rows[at + 3], gap, "{id}");
+            assert_eq!(rows[at + 3], [format!("$quota_acct_{id}_gap")], "{id}");
         }
     }
 
     /// Only the Claude and Codex rows can carry the Hermes badge, inked like
     /// the footer marks: last on the one-row formats' row, in the icon column
-    /// of a lines block (line 2 and its blank row, one name each). The Hermes
-    /// row itself stays for a Hermes session whose account no other row shows.
+    /// of a lines block (one slot on each of lines 2 and 3). The Hermes row
+    /// itself stays for a Hermes session whose account no other row shows.
     #[test]
     fn only_the_claude_and_codex_footer_rows_carry_the_hermes_badge() {
         for summary in SummaryFormat::CHOICES.into_iter().filter(|s| s.is_on()) {
@@ -3750,8 +3759,8 @@ mod field_tests {
             for id in ["cl", "cx"] {
                 let names: &[String] = if lines {
                     &[
-                        format!("$quota_acct_{id}_hermes"),
-                        format!("$quota_acct_{id}_hermes_gap"),
+                        format!("$quota_acct_{id}_hermes_l2"),
+                        format!("$quota_acct_{id}_hermes_l3"),
                     ]
                 } else {
                     &[format!("$quota_acct_{id}_hermes")]
@@ -3786,6 +3795,103 @@ mod field_tests {
                 }
             }
             assert!(updated.contains("$quota_acct_hm_icon"), "{summary:?}");
+        }
+    }
+
+    /// The written lines footer, filled with what a workspace publishes for
+    /// a three-window Claude row and a one-window Codex row that both carry
+    /// a Hermes badge, then a one-window Grok row: each Hermes mark is one
+    /// blank icon-column row below its provider mark and one above the next
+    /// account's, at every icon size. Without Hermes the panel is drawn as
+    /// before. Rows are drawn as Herdr does: present values joined by one
+    /// space, and a row with none is not drawn at all.
+    #[test]
+    fn the_lines_footer_parts_the_hermes_badge_from_both_neighbouring_marks() {
+        use crate::cli::IconSize;
+        use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
+        use crate::presentation::{hermes_badged_account, MetadataTokens, RowStyle};
+        use std::collections::BTreeMap;
+
+        let window = |kind, used| {
+            UsageWindow::new(kind, used, Some(ResetAt::from_unix_seconds(90_000))).unwrap()
+        };
+        let snapshots = [
+            ProviderSnapshot::new(
+                Provider::Claude,
+                vec![
+                    window(WindowKind::FiveHour, 4.0),
+                    window(WindowKind::Weekly, 27.0),
+                    window(WindowKind::Monthly, 6.0),
+                ],
+                0,
+            ),
+            ProviderSnapshot::new(Provider::Codex, vec![window(WindowKind::Weekly, 8.0)], 0),
+            ProviderSnapshot::new(Provider::Grok, vec![window(WindowKind::Weekly, 1.0)], 0),
+        ];
+        let (_, footer) = written_footer(SummaryFormat::Lines);
+        let mark_of = |harness| crate::icons::for_harness(harness);
+        let marks = [
+            (mark_of(Harness::Claude), "cl"),
+            (mark_of(Harness::Codex), "cx"),
+            (mark_of(Harness::Grok), "gk"),
+            (mark_of(Harness::Hermes), "hm"),
+        ];
+        let drawn = |row: RowStyle, sessions: usize| -> Vec<String> {
+            let mut tokens = BTreeMap::new();
+            for snapshot in &snapshots {
+                let mut values =
+                    MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, 0, None, row);
+                if snapshot.provider != Provider::Grok && sessions > 0 {
+                    values.account = hermes_badged_account(snapshot, 0, row, sessions);
+                }
+                tokens.extend(crate::herdr::desired_summary_tokens(&values));
+            }
+            footer
+                .iter()
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(|name| tokens.get(name.trim_start_matches('$')))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    // The icon column: a vendor mark, or blank (U+2800).
+                    marks
+                        .iter()
+                        .find(|(mark, _)| line.starts_with(*mark))
+                        .map(|(_, name)| name.to_string())
+                        .unwrap_or_else(|| {
+                            if line.starts_with('\u{2800}') {
+                                "_".to_string()
+                            } else {
+                                line
+                            }
+                        })
+                })
+                .collect()
+        };
+        for size in IconSize::CHOICES {
+            assert_eq!(size.mark_clearance_rows(), 1, "{size:?}");
+            let row = RowStyle {
+                summary: SummaryFormat::Lines,
+                icon_size: size,
+                ..RowStyle::default()
+            };
+            assert_eq!(
+                drawn(row, 0),
+                ["quota", "_", "cl", "_", "_", "_", "cx", "_", "gk", "_"],
+                "{size:?}"
+            );
+            for sessions in [1, 2, 12] {
+                assert_eq!(
+                    drawn(row, sessions),
+                    ["quota", "_", "cl", "_", "hm", "_", "cx", "_", "hm", "_", "gk", "_"],
+                    "{size:?} {sessions}"
+                );
+            }
         }
     }
 

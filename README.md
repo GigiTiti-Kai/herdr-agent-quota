@@ -230,10 +230,13 @@ With the account summary on, a Hermes session that bills the same ChatGPT
 account as the Codex row, as the same user, does not get a footer row of its
 own. The Codex row carries a Hermes badge instead: the Hermes mark for one
 live Hermes session on that login, the mark and the count for more (`9+` past
-nine). In `lines` it sits in the icon column directly under the provider mark,
-on the account's second line, or on the blank line below a one-line account,
-so the meters, percentages, and resets keep their columns and the block keeps
-its height. In `compact`, `bars`, and `numbers` it ends the account's row, and
+nine). In `lines` it sits in the icon column under the provider mark, with
+one line whose icon column is blank between the two marks and the account's
+blank line still below it, because WezTerm draws the marks larger than a row
+(Icon size): on the account's third line in place of its indent, or on lines
+that appear only while the badge is shown when the account has fewer lines.
+The meters, percentages, and resets keep their columns. In `compact`, `bars`,
+and `numbers` it ends the account's row, and
 is left off when the row has no room for it. The badge appears only
 when the account and user (`sub`) named by the session's live access token are
 those of the Codex login the Codex reading belongs to; both sides compare one

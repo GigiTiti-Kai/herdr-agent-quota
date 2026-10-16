@@ -38,6 +38,11 @@ impl Fixture {
             .map(|value| value.trim().to_string())
     }
 
+    /// The copy publishing reads to space the lines footer's marks.
+    fn state_size(&self) -> Option<String> {
+        fs::read_to_string(self.path("state/icon-size")).ok()
+    }
+
     fn configure(&self, size_file: &Path, arguments: &[&str]) -> String {
         let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
             .arg("configure")
@@ -92,6 +97,7 @@ fn configure_exports_the_size_name_and_reports_every_outcome() {
     );
     assert_eq!(json(&file), serde_json::json!({"icon_size": "large"}));
     assert_eq!(f.pref("icon-size").as_deref(), Some("large"));
+    assert_eq!(f.state_size().as_deref(), Some("large"));
     // Preferences the user set for other options survive the run.
     assert_eq!(f.pref("agents").as_deref(), Some("only,codex"));
     assert_eq!(f.pref("agent-order").as_deref(), Some("default"));
@@ -114,6 +120,8 @@ fn configure_exports_the_size_name_and_reports_every_outcome() {
     assert!(report.contains("Icon size small not exported:"), "{report}");
     assert!(!report.contains("Icon size small saved"), "{report}");
     assert_eq!(f.pref("icon-size").as_deref(), Some("small"));
+    // Publishing follows the saved size even when WezTerm was not told.
+    assert_eq!(f.state_size().as_deref(), Some("small"));
     assert_eq!(json(&file), serde_json::json!({"icon_size": "large"}));
 
     // The next apply retries from the preference.
@@ -148,6 +156,7 @@ fn a_full_uninstall_removes_only_the_size_file_it_wrote() {
         "return {}\n"
     );
     assert_eq!(f.pref("icon-size"), None);
+    assert_eq!(f.state_size(), None);
 
     // A file the plugin did not write survives an uninstall.
     fs::write(&file, "{\"icon_size\":\"large\"}\n").unwrap();
