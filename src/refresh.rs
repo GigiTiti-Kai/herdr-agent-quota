@@ -905,6 +905,7 @@ fn publish_row(cache: &CacheStore) -> RowStyle {
     RowStyle {
         fields: cache.fields().unwrap_or_default(),
         summary: cache.account_summary().unwrap_or_default(),
+        icon_size: cache.icon_size().unwrap_or_default(),
         ..RowStyle::new(
             cache.percent_style().unwrap_or_default(),
             sidebar_shape(cache),
@@ -1832,9 +1833,10 @@ fn on_workspace(values: &MetadataTokens, workspace: &BTreeMap<String, String>) -
     values.account.as_ref().is_some_and(|account| {
         workspace.contains_key(&format!("quota_acct_{}_icon", account.family.id))
             || account.same_account_as.is_some_and(|id| {
-                ["hermes", "hermes_gap"]
-                    .iter()
-                    .any(|slot| workspace.contains_key(&format!("quota_acct_{id}_{slot}")))
+                // `_hermes` on a one-row format, `_hermes_l<line>` in lines
+                // mode; no such token is published without the badge.
+                let badge = format!("quota_acct_{id}_hermes");
+                workspace.keys().any(|name| name.starts_with(&badge))
             })
     })
 }
@@ -2332,6 +2334,23 @@ mod tests {
         }
     }
 
+    /// Every publish path spaces the lines footer for the icon size
+    /// `configure` saved in the state directory, and for medium without one.
+    #[test]
+    fn publish_row_reads_the_saved_icon_size() {
+        use crate::cli::IconSize;
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        assert_eq!(publish_row(&cache).icon_size, IconSize::Medium);
+        for size in IconSize::CHOICES {
+            cache.set_icon_size(size).unwrap();
+            assert_eq!(publish_row(&cache).icon_size, size);
+        }
+        cache.clear_icon_size().unwrap();
+        assert_eq!(cache.icon_size(), None);
+        assert_eq!(publish_row(&cache).icon_size, IconSize::Medium);
+    }
+
     /// Three live windows, so a family costs icon + w1..w3 + reset = 5 keys.
     fn three_window_snapshot(provider: Provider) -> ProviderSnapshot {
         ProviderSnapshot::new(
@@ -2589,8 +2608,20 @@ mod tests {
         }
     }
 
+    /// Where a workspace publishes `id`'s Hermes badge: last on a one-row
+    /// format's row, on line 3 of a lines block (one blank line under the
+    /// mark at every icon size).
+    fn badge_name(format: crate::cli::SummaryFormat, id: &str) -> String {
+        if format == crate::cli::SummaryFormat::Lines {
+            format!("quota_acct_{id}_hermes_l3")
+        } else {
+            format!("quota_acct_{id}_hermes")
+        }
+    }
+
     /// The badge rides the Codex row only, carries the session count, and
-    /// costs one workspace key; without sessions the row is unchanged.
+    /// costs one workspace key (a block with a second window draws line 2
+    /// itself); without sessions the row is unchanged.
     #[test]
     fn workspace_summary_marks_the_codex_row_with_the_hermes_badge() {
         let hermes_mark = crate::icons::for_harness(Harness::Hermes);
@@ -2604,14 +2635,22 @@ mod tests {
                 stamped_codex("acc-1"),
             ];
             let plain = workspace_summary(&snapshots, SUMMARY_NOW, row, &[]);
-            assert!(!plain.contains_key("quota_acct_cx_hermes"), "{format:?}");
+            assert!(
+                !plain.keys().any(|name| name.contains("_hermes")),
+                "{format:?}"
+            );
             let badged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[(Provider::Codex, 2)]);
             assert_eq!(
-                badged.get("quota_acct_cx_hermes"),
+                badged.get(&badge_name(format, "cx")),
                 Some(&format!("{hermes_mark} 2\u{2800}")),
                 "{format:?}"
             );
-            assert!(!badged.contains_key("quota_acct_cl_hermes"), "{format:?}");
+            assert!(
+                !badged
+                    .keys()
+                    .any(|name| name.starts_with("quota_acct_cl_hermes")),
+                "{format:?}"
+            );
             assert_eq!(
                 family_names(&badged, "cl"),
                 family_names(&plain, "cl"),
@@ -2689,19 +2728,23 @@ mod tests {
         assert!(hm(&pane_summary(&same, &unbadged)));
         assert!(hm(&pane_summary(&unproven, &badged)));
         assert!(hm(&pane_summary(&unproven, &unbadged)));
-        // A one-window Codex block carries the badge on its blank line.
+        // A one-window Codex block draws a blank line 2 and the badge on
+        // line 3, ahead of its unchanged gap row.
         let mut weekly = stamped_codex("acc-1");
         weekly
             .windows
             .retain(|window| window.kind == WindowKind::Weekly);
-        let on_gap = workspace_summary(&[weekly], SUMMARY_NOW, row, &[(Provider::Codex, 1)]);
-        assert!(
-            on_gap.contains_key("quota_acct_cx_hermes_gap"),
-            "{on_gap:?}"
+        let below = workspace_summary(&[weekly], SUMMARY_NOW, row, &[(Provider::Codex, 1)]);
+        assert_eq!(
+            below.get("quota_acct_cx_hermes_l2").map(String::as_str),
+            Some("\u{2800}"),
+            "{below:?}"
         );
-        assert!(!on_gap.contains_key("quota_acct_cx_hermes"), "{on_gap:?}");
-        assert!(pane_summary(&same, &on_gap).is_empty());
-        assert!(hm(&pane_summary(&unproven, &on_gap)));
+        assert!(below.contains_key("quota_acct_cx_hermes_l3"), "{below:?}");
+        assert!(!below.contains_key("quota_acct_cx_hermes"), "{below:?}");
+        assert!(!below.contains_key("quota_acct_cx_hermes_gap"), "{below:?}");
+        assert!(pane_summary(&same, &below).is_empty());
+        assert!(hm(&pane_summary(&unproven, &below)));
         // `same_account_as` never leaks into what Herdr is sent.
         assert_eq!(
             crate::herdr::desired_summary_tokens(&same),
@@ -2790,14 +2833,22 @@ mod tests {
             let row = summary_row(format);
             let snapshots = [claude_account(claude_windows()), stamped_codex("acc-1")];
             let plain = workspace_summary(&snapshots, SUMMARY_NOW, row, &[]);
-            assert!(!plain.contains_key("quota_acct_cl_hermes"), "{format:?}");
+            assert!(
+                !plain.keys().any(|name| name.contains("_hermes")),
+                "{format:?}"
+            );
             let badged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[(Provider::Claude, 3)]);
             assert_eq!(
-                badged.get("quota_acct_cl_hermes"),
+                badged.get(&badge_name(format, "cl")),
                 Some(&format!("{hermes_mark} 3\u{2800}")),
                 "{format:?}"
             );
-            assert!(!badged.contains_key("quota_acct_cx_hermes"), "{format:?}");
+            assert!(
+                !badged
+                    .keys()
+                    .any(|name| name.starts_with("quota_acct_cx_hermes")),
+                "{format:?}"
+            );
             assert_eq!(
                 family_names(&badged, "cx"),
                 family_names(&plain, "cx"),
@@ -2815,20 +2866,21 @@ mod tests {
                 &[(Provider::Codex, 1), (Provider::Claude, 2)],
             );
             assert_eq!(
-                both.get("quota_acct_cl_hermes"),
+                both.get(&badge_name(format, "cl")),
                 Some(&format!("{hermes_mark} 2\u{2800}"))
             );
             // One session: the mark alone, as wide as the provider mark.
             assert_eq!(
-                both.get("quota_acct_cx_hermes"),
+                both.get(&badge_name(format, "cx")),
                 Some(&crate::icons::sidebar_mark(Harness::Hermes))
             );
         }
     }
 
     /// Claude's real reading has a third, model-scoped weekly window. In the
-    /// lines footer the badge goes under the mark on line 2, and the 5h line
-    /// is drawn exactly as without it.
+    /// lines footer the badge takes that window's line (line 3, one blank
+    /// line under the mark) in place of its pad, and the 5h and 7d lines are
+    /// drawn exactly as without it.
     #[test]
     fn the_claude_badge_fits_the_lines_footer_with_a_scoped_window() {
         let mut windows = claude_windows();
@@ -2843,21 +2895,22 @@ mod tests {
             row,
             &[(Provider::Claude, 1)],
         );
-        assert!(badged.contains_key("quota_acct_cl_hermes"), "{badged:?}");
+        assert!(badged.contains_key("quota_acct_cl_hermes_l3"), "{badged:?}");
         assert!(
-            badged
-                .keys()
-                .any(|name| name.starts_with("quota_acct_cl_w3_")),
+            !badged.contains_key("quota_acct_cl_hermes_l2"),
             "{badged:?}"
         );
-        let plain = workspace_summary(&[claude_account(claude_windows())], SUMMARY_NOW, row, &[]);
-        let first = |summary: &BTreeMap<String, String>| {
+        let line = |summary: &BTreeMap<String, String>, slot: usize| {
             summary
                 .iter()
-                .find(|(name, _)| name.starts_with("quota_acct_cl_w1_"))
+                .find(|(name, _)| name.starts_with(&format!("quota_acct_cl_w{slot}_")))
                 .map(|(_, value)| value.clone())
         };
-        assert_eq!(first(&badged), first(&plain));
+        let third = line(&badged, 3).expect("the scoped window's line");
+        assert!(third.starts_with("Fab"), "{third:?}");
+        let plain = workspace_summary(&[claude_account(claude_windows())], SUMMARY_NOW, row, &[]);
+        assert_eq!(line(&badged, 1), line(&plain, 1));
+        assert_eq!(line(&badged, 2), line(&plain, 2));
     }
 
     fn low(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {

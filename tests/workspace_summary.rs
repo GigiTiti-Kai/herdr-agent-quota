@@ -306,7 +306,8 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() 
     fs::write(root.join("herdr"), FAKE_HERDR).unwrap();
     fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
     // One session is the mark alone; more add the count. Both are as wide
-    // as the provider mark the badge sits under.
+    // as the provider mark the badge sits under, one blank line below it
+    // (line 3: this two-window block draws line 2 itself).
     let badge = |count: usize| match count {
         1 => "\u{e1aa}  \u{2800}".to_string(),
         _ => format!("\u{e1aa} {count}\u{2800}"),
@@ -319,7 +320,7 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() 
         "{published:?}"
     );
     assert!(
-        !published.contains_key("quota_acct_cx_hermes"),
+        !published.contains_key("quota_acct_cx_hermes_l3"),
         "{published:?}"
     );
 
@@ -338,7 +339,7 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() 
     );
     let published = refresh_codex(root);
     assert_eq!(
-        published.get("quota_acct_cx_hermes"),
+        published.get("quota_acct_cx_hermes_l3"),
         Some(&badge(2)),
         "{published:?}"
     );
@@ -351,11 +352,11 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() 
     // A session that ends (its producer releases the lock) stops counting.
     drop(second);
     assert_eq!(
-        refresh_codex(root).get("quota_acct_cx_hermes"),
+        refresh_codex(root).get("quota_acct_cx_hermes_l3"),
         Some(&badge(1))
     );
     drop(first);
-    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
+    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes_l3"));
 
     // The Codex CLI logs in as the teammate: the snapshot's account still
     // matches, but the login is another seat, so the session no longer counts
@@ -363,15 +364,15 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() 
     let again = hermes_session(root, "s4", &mine, now);
     codex_login(root, "acc-test-1", "user-test-2");
     assert_eq!(
-        refresh_codex(root).get("quota_acct_cx_hermes"),
+        refresh_codex(root).get("quota_acct_cx_hermes_l3"),
         Some(&badge(1))
     );
     drop(seat);
-    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
+    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes_l3"));
 
     // Another account: the snapshot no longer proves anything.
     codex_login(root, "acc-test-2", "user-test-1");
-    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes"));
+    assert!(!refresh_codex(root).contains_key("quota_acct_cx_hermes_l3"));
     drop((again, other));
 }
 
@@ -460,7 +461,8 @@ fn the_claude_row_carries_the_hermes_badge_only_for_live_sessions_on_its_credent
     fs::write(root.join("herdr"), FAKE_HERDR).unwrap();
     fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
     // One session is the mark alone; more add the count. Both are as wide
-    // as the provider mark the badge sits under.
+    // as the provider mark the badge sits under, one blank line below it
+    // (line 3: this two-window block draws line 2 itself).
     let badge = |count: usize| match count {
         1 => "\u{e1aa}  \u{2800}".to_string(),
         _ => format!("\u{e1aa} {count}\u{2800}"),
@@ -473,7 +475,7 @@ fn the_claude_row_carries_the_hermes_badge_only_for_live_sessions_on_its_credent
         "{published:?}"
     );
     assert!(
-        !published.contains_key("quota_acct_cl_hermes"),
+        !published.contains_key("quota_acct_cl_hermes_l3"),
         "{published:?}"
     );
 
@@ -486,12 +488,12 @@ fn the_claude_row_carries_the_hermes_badge_only_for_live_sessions_on_its_credent
     let codex = hermes_session(root, "s5", &chatgpt_principal_stamp("a", "u"), now);
     let published = refresh_claude(root, &credentials);
     assert_eq!(
-        published.get("quota_acct_cl_hermes"),
+        published.get("quota_acct_cl_hermes_l3"),
         Some(&badge(2)),
         "{published:?}"
     );
     assert!(
-        !published.contains_key("quota_acct_cx_hermes"),
+        !published.contains_key("quota_acct_cx_hermes_l3"),
         "{published:?}"
     );
     // Neither the stamp, the path nor the token ever reaches Herdr.
@@ -508,18 +510,20 @@ fn the_claude_row_carries_the_hermes_badge_only_for_live_sessions_on_its_credent
     // A session that ends stops counting.
     drop(second);
     assert_eq!(
-        refresh_claude(root, &credentials).get("quota_acct_cl_hermes"),
+        refresh_claude(root, &credentials).get("quota_acct_cl_hermes_l3"),
         Some(&badge(1))
     );
 
     // The Claude row reads another file now: nothing proves the sessions.
     let moved = root.join("moved.json");
     fs::copy(home.join(".credentials.json"), &moved).unwrap();
-    assert!(!refresh_claude(root, &moved).contains_key("quota_acct_cl_hermes"));
+    assert!(!refresh_claude(root, &moved).contains_key("quota_acct_cl_hermes_l3"));
     // ... and no file at all proves nothing either.
-    assert!(!refresh_claude(root, &root.join("absent.json")).contains_key("quota_acct_cl_hermes"));
+    assert!(
+        !refresh_claude(root, &root.join("absent.json")).contains_key("quota_acct_cl_hermes_l3")
+    );
 
     drop(first);
-    assert!(!refresh_claude(root, &credentials).contains_key("quota_acct_cl_hermes"));
+    assert!(!refresh_claude(root, &credentials).contains_key("quota_acct_cl_hermes_l3"));
     drop((other, unproven, codex));
 }

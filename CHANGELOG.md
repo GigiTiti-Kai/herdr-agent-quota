@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Account summary: in the `lines` footer the Hermes badge no longer touches
+  the marks around it. WezTerm draws the vendor marks larger than a row, so
+  the badge now keeps one line with a blank icon column between it and the
+  provider mark above (`IconSize::mark_clearance_rows`, one row for every
+  icon size: each preset enlarges a mark by less than a row), and the
+  account's blank line stays below it instead of carrying it. The badge sits
+  on the account's third line in place of its indent; an account with fewer
+  lines gets a blank line and the badge on lines that are drawn only while
+  the badge is shown, so without Hermes the footer is unchanged. Lines 2 and
+  3 now start with `$quota_acct_<id>_hermes_l2` / `_hermes_l3`, replacing
+  `$quota_acct_<id>_hermes` and `_hermes_gap` in `lines`; `configure --apply`
+  also copies the icon size to the state directory so every publish path
+  spaces the footer alike. Run `configure` to move the badge tokens.
 - Account summary: the Hermes badge moved into the icon column of the `lines`
   footer, directly under the provider mark: first on the account's second
   line (`$quota_acct_<id>_hermes`, which takes the place of that line's pad),

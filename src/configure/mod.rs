@@ -90,6 +90,7 @@ pub fn run(
             cache.clear_percent_style()?;
             cache.clear_fields()?;
             cache.clear_account_summary()?;
+            cache.clear_icon_size()?;
             cache.clear_brand_colors()?;
             cache.clear_agent_order()?;
             cache.clear_low_quota_alert()?;
@@ -162,6 +163,8 @@ pub fn run(
         // The preference is saved even when the export fails, so the next
         // apply retries it; the note says which happened.
         let size = persist_icon_size(options.icon_size)?;
+        // The lines footer spaces its marks for this size at publish time.
+        cache.set_icon_size(size)?;
         let export = wezterm::export(size, &wezterm::size_file(), cache.root());
         println!("{}", export.note(size));
         if agents.contains(&Harness::Claude) {
@@ -293,9 +296,11 @@ pub(crate) fn resolved_account_summary(
         .unwrap_or_default()
 }
 
-/// A flag wins, then the stored choice. There is no environment channel and
-/// no cache copy: install.sh and the settings pane both reach `configure`
-/// through the preference, so it is the one place the choice lives.
+/// A flag wins, then the stored choice. There is no environment channel:
+/// install.sh and the settings pane both reach `configure` through the
+/// preference, so it is the one place the choice lives. `--apply` also
+/// copies it to the state directory, where publishing reads it
+/// ([`CacheStore::icon_size`]).
 pub(crate) fn resolved_icon_size(explicit: Option<IconSize>) -> IconSize {
     explicit
         .or_else(|| prefs::read(prefs::ICON_SIZE).and_then(|value| IconSize::parse(&value)))
