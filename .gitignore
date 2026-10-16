@@ -5,6 +5,7 @@
 .env.*
 !.env.example
 .herdr-agent-quota/
+.herdr-agent-usage/
 .herdr-state/
 
 # Local agent state and implementation plans

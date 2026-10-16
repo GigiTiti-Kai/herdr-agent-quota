@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build, link, enable, and configure herdr-agent-quota in one step.
+# Build, link, enable, and configure herdr-agent-usage in one step.
 #
 # Usage:
 #   ./install.sh
@@ -175,11 +175,14 @@ case "$ICON_SIZE" in
 esac
 # The field list is validated by configure, which owns the field names.
 
-printf '%s\n' '→ building herdr-agent-quota'
+printf '%s\n' '→ building herdr-agent-usage'
 cargo build --release --locked --manifest-path "$ROOT/Cargo.toml"
 
 printf '%s\n' '→ linking and enabling the Herdr plugin'
+collect_alias_plugin_dirs
 herdr plugin link "$ROOT" --enabled
+adopt_alias_plugin_dirs || die "cannot resolve plugin config directory"
+unlink_alias_plugins
 
 # Herdr runs a plugin action with a fixed command line, in the server's own
 # environment: variables exported around `herdr plugin action invoke` never
@@ -189,7 +192,7 @@ write_plugin_pref() {
   local name="$1" value="$2"
   [[ -z "$value" ]] && return 0
   local directory
-  directory="$(herdr plugin config-dir herdr-agent-quota)" \
+  directory="$(herdr plugin config-dir "$PLUGIN_ID")" \
     || die "cannot resolve plugin config directory"
   mkdir -p "$directory"
   printf '%s\n' "$value" > "$directory/$name"

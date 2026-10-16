@@ -15,7 +15,7 @@
 | Codex app-server v2 | `thread/list` 返回的 `Thread` 摘要 | 只有 `modelProvider`，没有 thread-level `model` | `unsupported`（对当前 `thread/list` 调用）：不能把 provider 当模型。`thread/start`/`turn/start` 的 `model` 是请求覆盖，不会令 `thread/list` 返回活动模型。 [官方 Thread 定义](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs#L199-L243) |
 | Grok Build | 可选的 Grok `status_line` command/builtin | `model.id`、`model.display_name`，无法读取时省略 | `confirmed`（若接入 Grok status-line）；但本插件当前 Grok adapter 只读 billing endpoint，因此现有 quota 快照没有模型字段。 [官方可用字段](https://github.com/xai-org/grok-build/blob/77cd7eb675ba911c225c3aaeeece3a20cbccc426/crates/codegen/xai-grok-pager/docs/user-guide/25-status-line.md#available-data) |
 
-这意味着 issue #22 的 `$quota_model` 可以可靠覆盖 Claude 与 Agy；Grok 需要另有 status-line 输入才能覆盖，Codex 不能从现有独立 `thread/list` 轮询可靠得到活动模型。Issue 本身只把 Claude 的 `model.display_name` 作为已确认来源，并明确要求另外核查 Codex/Grok/Agy。[Issue #22](https://github.com/levi-qiao/herdr-agent-quota/issues/22#issue-3420898044)
+这意味着 issue #22 的 `$quota_model` 可以可靠覆盖 Claude 与 Agy；Grok 需要另有 status-line 输入才能覆盖，Codex 不能从现有独立 `thread/list` 轮询可靠得到活动模型。Issue 本身只把 Claude 的 `model.display_name` 作为已确认来源，并明确要求另外核查 Codex/Grok/Agy。[Issue #22](https://github.com/levi-qiao/herdr-agent-usage/issues/22#issue-3420898044)
 
 > **实现更新（2026-08-26）：** 上表刻意描述“仅凭 `thread/list`/billing”的边界；本插件随后增加了一个不改变该边界的本地补充层：Codex 只按返回的 thread id 读取对应 rollout 尾部的 `turn_context`，Grok 只读取本地 session 的 `signals.json`。因此现在 Codex/Grok 在本地文件提供字段时也会显示模型；context/cache 的字段来源和安全边界见 [`codex-grok-context-cache.md`](codex-grok-context-cache.md)。
 
@@ -24,9 +24,9 @@
 
 ## Issue #22 要解决什么
 
-Issue 描述的是同一 provider 打开多个 pane 时，只显示 `Claude`/`Codex`/`Grok`/`Agy` 不足以区分 Sonnet、Opus 等实际模型；请求是增加 `$quota_model`，显示人类可读 display name，而不是完整模型 id。[Issue #22](https://github.com/levi-qiao/herdr-agent-quota/issues/22)
+Issue 描述的是同一 provider 打开多个 pane 时，只显示 `Claude`/`Codex`/`Grok`/`Agy` 不足以区分 Sonnet、Opus 等实际模型；请求是增加 `$quota_model`，显示人类可读 display name，而不是完整模型 id。[Issue #22](https://github.com/levi-qiao/herdr-agent-usage/issues/22)
 
-Issue 作者已确认 Claude Code 的官方 statusLine stdin JSON 包含 `model` 对象，但没有伪造 Codex/Grok/Agy 的样例；因此以下把“官方字段存在”和“本插件当前采集链路能拿到”分开记录。[Issue #22 的来源说明](https://github.com/levi-qiao/herdr-agent-quota/issues/22#issue-3420898044)
+Issue 作者已确认 Claude Code 的官方 statusLine stdin JSON 包含 `model` 对象，但没有伪造 Codex/Grok/Agy 的样例；因此以下把“官方字段存在”和“本插件当前采集链路能拿到”分开记录。[Issue #22 的来源说明](https://github.com/levi-qiao/herdr-agent-usage/issues/22#issue-3420898044)
 
 ## 1. Claude Code：官方 statusLine 直接提供 display name
 
@@ -94,7 +94,7 @@ Issue 作者已确认 Claude Code 的官方 statusLine stdin JSON 包含 `model`
 3. **展示策略：** `$quota_model` 只在 display name 已确认时显示；默认布局用
    `$quota_provider_model` 将它与 provider 紧凑合并，但不要为 unknown 输出“默认模型”或
    provider 名的伪模型。Claude/Agy 可由 statusLine hook 提供，Codex/Grok 在本地
-   rollout/session 文件有证据时也可提供。[Issue #22 的 display-name 目标](https://github.com/levi-qiao/herdr-agent-quota/issues/22) · [Codex Thread schema](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs#L199-L243)
+   rollout/session 文件有证据时也可提供。[Issue #22 的 display-name 目标](https://github.com/levi-qiao/herdr-agent-usage/issues/22) · [Codex Thread schema](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs#L199-L243)
 4. **刷新和成本：** 只在已有 statusLine 输入/活动 app-server 事件中更新模型；不要为查模型读取 Herdr pane、resume Codex thread、扫描所有 rollout、发送 warm-up prompt 或触发网络模型请求。这个边界与本仓库“pane 读取有可见 repaint 成本、事件只读指定 pane”的约束一致。[仓库 AGENTS.md](../../AGENTS.md) · [Codex app-server 生命周期](https://github.com/openai/codex/blob/2764e83626efe55f64e04d153fc99a157327f3c2/codex-rs/app-server/README.md#L75-L83)
 
 ## Codex / Grok 不猜测边界

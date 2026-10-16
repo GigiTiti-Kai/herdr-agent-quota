@@ -98,6 +98,25 @@ CodexBar 取 Go key 的两条路径与本插件 Goal 2 已实现的完全一致�
 CodexBar 判定本地会话归属时用的 SQL 也是
 `json_extract(data, '$.providerID') = 'opencode-go'`，与本插件的会话解析口径相同。
 
+## OpenCode 2 的会话存储（2026-09-21 本机实测）
+
+OpenCode 2 不再把新会话写进 v1 的 `session` / `message`。本机 opencode
+`2.0.12` 的 `~/.local/share/opencode/opencode.db` 里两套表并存：
+
+| 布局 | 会话表 | 消息表 | 角色来源 | 最新消息 |
+|---|---|---|---|---|
+| ≤1.x | `session` | `message` | payload 的 `role` | `time_created DESC` |
+| 2.x | `session_v2` | `session_message` | `type` 列 | `seq DESC` |
+
+升级会把旧会话复制进 `session_v2` 并保留 v1 行，只有升级后新建的会话是 v2
+独有（本机实测：202 条旧会话两表都有，228 条 v2 会话中 26 条只在新表）。v2
+消息 payload 里没有 `role`，模型在 `model.id` / `model.providerID`，token 形状与
+v1 相同（`input`、`output`、`reasoning`、`cache.read`、`cache.write`）。
+
+所以解析会话要按「表是否存在」选布局，而不是按版本号：v1 表在，迁移过的会话
+继续用旧证据；v2 表在，新会话用 `type` 列。上面 CodexBar 那条
+`json_extract(data, '$.providerID')` 只覆盖 v1。
+
 ## 本仓库不采用的部分
 
 CodexBar 还实现了 web console cookie 抓取、`_server` RPC、Zen 余额、本地成本估算与

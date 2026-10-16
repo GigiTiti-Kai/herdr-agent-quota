@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "herdr-agent-quota",
+    name = "herdr-agent-usage",
     version,
     about = "Show AI agent subscription quota in Herdr"
 )]
@@ -28,12 +28,15 @@ pub enum Command {
         /// Print the per-provider outcome as JSON.
         #[arg(long)]
         json: bool,
-        /// Approve macOS Keychain access for Muse interactively (one-time).
+        /// Approve macOS Keychain access for Muse or Cursor interactively
+        /// (one-time).
         ///
         /// Without a recorded approval, background reads skip the keychain
         /// silently instead of prompting. Run once in a terminal and click
         /// Always Allow (not Allow) on the macOS prompt; afterwards all
-        /// refreshes work unattended.
+        /// refreshes work unattended. Cursor Agent CLI stores its login in
+        /// Keychain on macOS (`cursor-agent login`); Muse does the same for
+        /// `storage: "keychain"` logins.
         #[arg(long)]
         keychain_approve: bool,
     },

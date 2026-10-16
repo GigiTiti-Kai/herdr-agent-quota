@@ -1,6 +1,6 @@
 # Agent guide
 
-Notes for agents working on `herdr-agent-quota`. Read this before touching
+Notes for agents working on `herdr-agent-usage`. Read this before touching
 anything that talks to Herdr.
 
 ## Working method
@@ -146,7 +146,14 @@ than a wrong number.
 - Cursor stamps `sha256("cursor\0" || access token)`. Included is
   `planUsage.totalPercentUsed` when present — the CLI usage panel's Included
   row — and only then `includedSpend / limit`. The IDE `state.vscdb` mtime is
-  not a credential gate.
+  not a credential gate. On macOS without `$CURSOR_HOME` / `$CURSOR_AUTH_FILE`
+  / `$CURSOR_STATE_DB`, `auth_mtime_unix` is none — a `stat` of
+  `~/.cursor/auth.json` is enough for Ghostty TCC, and the Keychain approval
+  marker is not a login generation (`cursor-agent login` overwrites
+  `cursor-access-token` in place). Re-read that Keychain item; do not keep the
+  previous token in the watch process. On macOS, `cursor-agent login` stores
+  the token in Keychain, not `auth.json`; do not fall back to the IDE token
+  while the CLI still has `cli-config.json` `authInfo`.
 
 ## Devin's per-session model is local SQLite, not the quota API
 
@@ -201,13 +208,27 @@ pane: the generated session title (`meta.json` `title`, else `store.db`
 `<user_query>` in the session jsonl.
 
 Credentials, in order: `accessToken` in the CLI auth file (`$CURSOR_AUTH_FILE`,
-else `~/.cursor/auth.json` on macOS, else `$XDG_CONFIG_HOME/cursor/auth.json`),
-then `cursorAuth/accessToken` in the desktop `state.vscdb` (`$CURSOR_STATE_DB`
-or the platform Cursor config path). Open that SQLite file read-only and
-select only that one key. Never copy it, never use its mtime as a gate, never
-read `refreshToken`, never open Keychain, never send a `WorkosCursorSessionToken`
-cookie. The collector does not write, refresh, or exchange tokens; a 401
-re-reads the current files once.
+else `~/.cursor/auth.json` on macOS, else `$XDG_CONFIG_HOME/cursor/auth.json`);
+on macOS, Keychain item `cursor-access-token` / `cursor-user` (what
+`cursor-agent login` writes when `AGENT_CLI_CREDENTIAL_STORE` is default);
+then `cursorAuth/accessToken` in the desktop `state.vscdb` only when the CLI
+has no login of its own **and** `$CURSOR_STATE_DB` is set. On macOS, do not
+open `~/.cursor` or the default `~/Library/Application Support/Cursor/…/state.vscdb`
+from event/watch/refresh/hook: those trees are Cursor-provenance, this binary
+is ad-hoc, and TCC prompts Ghostty "would like to access data from other
+apps" on every process. File reads resume only with `$CURSOR_HOME` /
+`$CURSOR_AUTH_FILE` / `$CURSOR_STATE_DB`. Model/cache/context come from the
+hook mailbox; the Keychain approval marker lives in plugin state. Do not
+treat that marker as `auth_mtime_unix`, and do not process-cache the Keychain
+secret against it: a `stat` of `~/.cursor/auth.json` is Ghostty TCC, and a
+cached token keeps the previous account's quota while that token remains
+valid. Never copy the IDE database, never use its mtime as a gate, never read
+`refreshToken`, never send a `WorkosCursorSessionToken` cookie. Background
+processes never prompt for Keychain: without a recorded approval marker the
+keychain branch is skipped, and the user approves once via
+`refresh --provider cursor --keychain-approve` (click **Always Allow**, not
+Allow). The collector does not write, refresh, or exchange tokens; a 401
+re-reads the current files and Keychain once.
 
 Quota is `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage`
 with `Connect-Protocol-Version: 1`, the same call the CLI makes. Included is
@@ -215,8 +236,11 @@ with `Connect-Protocol-Version: 1`, the same call the CLI makes. Included is
 row — and only then `includedSpend / limit`. The three bars map onto at
 (`autoPercentUsed`, 5h), api (`apiPercentUsed`, 7d), and 30d (Included).
 `billingCycleEnd` is Unix milliseconds. Model is
-`cli-config.json` `model.displayName`, overridden per session by store.db meta
-`lastUsedModel` (never the encrypted blobs). Turn token counts are not in the
+`cli-config.json` `model.displayName` — the CLI footer after a model switch.
+store.db meta `lastUsedModel` overrides that only when it names a specific
+model; `default` / `auto` keep the catalog, because Cursor does not rewrite
+the store field when you change models in an existing session (never the
+encrypted blobs). Turn token counts are not in the
 jsonl. Cache and context come from the interactive CLI's `afterAgentResponse`,
 `stop`, and `preCompact` hooks: token counts map the same way the CLI
 statusLine `current_usage` does (`fresh = input - cache_read - cache_write`);
@@ -225,11 +249,12 @@ same numbers the CLI footer prints (`Auto · 8.1%`). Only that protobuf field
 is read. Cache still comes from the hooks; `context_usage_percent` wins when
 present, otherwise last `input_tokens` against `context_window_size`,
 Composer 2.x's documented 200k window, or Auto/`default`'s 256k window.
-`configure` writes `herdr-agent-quota-hooks.sh` next to `hooks.json` and
-merges `bash '<script>'` into `afterAgentResponse`, `stop`, and `preCompact`.
-It never replaces Herdr's `sessionStart`. Cursor CLI loads user hooks at
-session start, so an already-running pane must be restarted. Do not install a
-Cursor `statusLine` — that setting replaces the native CLI footer. Cursor publishes no prompt-cache lifetime, so there is
+`configure` writes `herdr-agent-usage-hooks.sh` under plugin state — not
+next to `hooks.json`. `bash ~/.cursor/…` is a Ghostty-attributed open of
+Cursor-provenance files and prompts twice per turn (`afterAgentResponse`
+then `stop`). It never replaces Herdr's `sessionStart`. Cursor CLI loads user
+hooks at session start, so an already-running pane must be restarted. Do not
+install a Cursor `statusLine` — that setting replaces the native CLI footer. Cursor publishes no prompt-cache lifetime, so there is
 no TTL. Cache identity is `sha256("cursor\0" || token)`.
 
 ## Hermes quota comes from inside the Hermes process, or not at all
@@ -349,13 +374,16 @@ logged and never fails the pane pass.
 **The Agent view** (`agent.view.set`, `src/herdr.rs`). Herdr keeps exactly
 one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
 
-1. **Always scope a clear to `plugin:herdr-agent-quota`.** An unscoped
+1. **Always scope a clear to `plugin:herdr-agent-usage`.** An unscoped
    `agent.view.clear` would drop a view another plugin owns. `startup` goes
    further and does not call clear at all when the order is `default` — there
    is nothing of ours to restore, and silence is the only way to be sure a
    foreign view survives.
-2. **Re-apply it from `startup`, never from `refresh`.** `refresh` runs on
-   every event path; the view only needs putting back when the server restarted.
+2. **Re-apply it from `startup` and a forced refresh, never from event.**
+   Herdr drops a plugin-owned view on disable; enable does not run startup.
+   The refresh action (`--force`) is the same repair that respawns the
+   watcher. Event/focus/watch stay off this path so a turn does not spend a
+   socket call.
 3. It is the only thing in the plugin that speaks the raw socket protocol
    (`HERDR_SOCKET_PATH`), because `agent.view.*` has no CLI subcommand in
    Herdr 0.8. One request, one reply, one connection — nothing subscribes, so
@@ -374,8 +402,10 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    cannot see, and agents the plugin does not track are not in the inventory,
    so the tail (like the head) can land above an untracked agent that sorts
    last in its Space;
-   `$quota_icon` / `_working` / `_done` is the vendor mark on every identity
-   row (bundled icon font; Muse uses a text glyph). Colour replaces Herdr's `state_icon`
+   `$quota_icon` is the vendor mark on every identity row (bundled icon font;
+   Muse uses a text glyph). Working/done colour is an invisible suffix matched
+   by sidebar `rules`, not a later twin token — a later `$quota_icon_done`
+   hang-indents one cell under the Space name. Colour replaces Herdr's `state_icon`
    ring: yellow while working, teal for an unseen completion, white after
    focusing that pane or moving focus away from it. Do not trust CLI `agent_status` for the teal
    step — same-tab siblings finish as server `idle` while the TUI ring is
@@ -483,6 +513,49 @@ list will not name the new field. `FieldSet::parse` has to keep reading that
 exact legacy list as `all()`, and `as_list` needs a marker for the one new
 selection that would collide with it.
 
+## Code Review Rules
+
+For pull-request review, prioritize semantic correctness over whether the happy-path
+tests pass. Treat the following as repository-specific invariants and call out
+violations explicitly:
+
+1. **Current means current.** Model, context, quota, cache, topic, and session
+   fields presented as live/current must come from the newest applicable
+   observation. Do not substitute a rollout/file head, an old cache entry, or a
+   historical session value just because it is easier to read.
+2. **Attribution must be provable.** Never merge or reuse quota, cache, model, or
+   session data across accounts, credential scopes, providers, or sessions
+   unless the code has evidence that they are the same billing/serving target.
+   On ambiguity, prefer missing data over confidently wrong data.
+3. **Bounded reads must preserve the requested semantics.** Prefix reads are fine
+   for immutable metadata written at the start of a file; latest/current fields
+   require a bounded tail or reverse scan, an equivalent seekable snapshot, or
+   no value. A performance bound must not silently change "latest" into "first".
+4. **Multiple files can be one logical record.** When upstream storage has plain,
+   compressed, migrated, temporary, or otherwise alternate representations of
+   the same logical object, follow upstream's canonical precedence and make
+   transition behavior deterministic. Do not let directory iteration order or
+   mtime ties decide correctness.
+5. **Pane reads and metadata writes are side effects.** Reject changes that add
+   broad pane scans, duplicate publish passes, or no-op metadata writes to
+   event/watch/focus paths unless the behavior is explicitly required and
+   measured. Preserve the one-pane/event and publish-once invariants above.
+6. **Credential stores stay least-privilege.** New code must not broaden secret
+   reads, copy credential databases, prompt from background processes, or use a
+   less-specific credential scope just to make attribution easier.
+7. **Compatibility lists are append-only contracts.** Changes to harnesses,
+   providers, sidebar fields, token names, or persisted selection formats must
+   preserve ordering/backward-compatibility rules documented in this file and
+   include regression coverage for old saved state.
+8. **Test representation transitions and stale-data traps.** For storage/cache
+   changes, cover both representations when applicable, ambiguous/equal
+   timestamps, corrupt or partial data, reused sessions/worktrees, and cases
+   where an older value exists but must not be reported as current.
+
+A review should distinguish blocking correctness/attribution/privacy regressions
+from non-blocking cleanup or performance suggestions. Green CI is evidence, not
+a substitute for checking these invariants.
+
 ## Verifying
 
 ```
@@ -494,5 +567,5 @@ cargo clippy --release
 Reloading the plugin after a rebuild:
 
 ```
-herdr plugin disable herdr-agent-quota && herdr plugin enable herdr-agent-quota
+herdr plugin disable herdr-agent-usage && herdr plugin enable herdr-agent-usage
 ```

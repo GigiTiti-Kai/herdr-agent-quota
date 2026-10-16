@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restore plugin-owned configuration, then unlink herdr-agent-quota.
+# Restore plugin-owned configuration, then unlink herdr-agent-usage.
 #
 # Usage:
 #   ./uninstall.sh                    # restore config, then unlink
@@ -66,7 +66,7 @@ restore_agents_pref() {
 select_agents() {
   [[ -z "$AGENTS" ]] && return 0
   local directory
-  directory="$(herdr plugin config-dir herdr-agent-quota)" \
+  directory="$(herdr plugin config-dir "$HERDR_ACTION_PLUGIN_ID")" \
     || die "cannot resolve plugin config directory"
   mkdir -p "$directory"
   AGENTS_PREF="$directory/agents"
@@ -78,10 +78,10 @@ select_agents() {
   printf '%s\n' "$(agents_pref_value "$AGENTS")" > "$AGENTS_PREF"
 }
 
-if herdr plugin list 2>/dev/null | grep -q 'herdr-agent-quota'; then
+if select_action_plugin_id; then
   # An earlier interrupted uninstall may have disabled the plugin. Enable it
   # long enough for Herdr to provide the state directory to the restore action.
-  herdr plugin enable herdr-agent-quota >/dev/null 2>&1 || true
+  herdr plugin enable "$HERDR_ACTION_PLUGIN_ID" >/dev/null 2>&1 || true
   select_agents
   printf '%s\n' '→ restoring plugin-owned configuration'
   # Waiting matters twice here: the selection file below must stay in place
@@ -96,9 +96,8 @@ if herdr plugin list 2>/dev/null | grep -q 'herdr-agent-quota'; then
   fi
 
   printf '%s\n' '→ disabling and unlinking the Herdr plugin'
-  herdr plugin disable herdr-agent-quota || true
-  herdr plugin unlink herdr-agent-quota
+  unlink_all_plugin_ids
   printf '%s\n' 'Uninstalled and restored.'
 else
-  printf '%s\n' 'herdr-agent-quota is not linked; no configuration was changed.'
+  printf '%s\n' "$PLUGIN_ID is not linked; no configuration was changed."
 fi

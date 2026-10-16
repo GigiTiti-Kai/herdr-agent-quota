@@ -35,7 +35,7 @@ body:
     id: refresh-output
     attributes:
       label: Refresh output
-      description: "Output of `herdr-agent-quota refresh --provider all --force --json`. Redact anything you consider sensitive."
+      description: "Output of `herdr-agent-usage refresh --provider all --force --json`. Redact anything you consider sensitive."
       render: json
   - type: dropdown
     id: os

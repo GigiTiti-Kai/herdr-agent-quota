@@ -949,12 +949,14 @@ fn read_credentials_uncached(path: &Path) -> std::result::Result<MuseCredentials
                     // with an empty one.
                     if std::io::stderr().is_terminal() {
                         eprintln!(
-                            "muse: macOS Keychain approval needed — run `herdr-agent-quota refresh --provider muse --keychain-approve` and click Always Allow (not Allow) on the prompt."
+                            "muse: macOS Keychain approval needed — run `{}` and click Always Allow (not Allow) on the prompt.",
+                            crate::identity::keychain_approve_command("muse")
                         );
                     }
-                    return Err(ProviderError::Unavailable(
-                        "macOS Keychain approval needed — run `herdr-agent-quota refresh --provider muse --keychain-approve`".to_string(),
-                    ));
+                    return Err(ProviderError::Unavailable(format!(
+                        "macOS Keychain approval needed — run `{}`",
+                        crate::identity::keychain_approve_command("muse")
+                    )));
                 }
                 match read_keychain_access_token(KEYCHAIN_COMMAND_BUDGET) {
                     Some(access_token) => Ok(MuseCredentials { access_token }),

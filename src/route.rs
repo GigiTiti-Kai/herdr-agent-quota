@@ -253,6 +253,8 @@ mod tests {
         AgentPane {
             pane_id: "w1:p9".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness,
             session: session_id.map(|value| crate::herdr::AgentSession {
                 kind: Some("id".to_string()),
@@ -277,6 +279,20 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::write(data.join("auth.json"), auth).unwrap();
         crate::opencode::write_fixture_db(&data.join("opencode.db"), rows).unwrap();
+        OpenCodePaths::from_dir(data)
+    }
+
+    /// OpenCode 2's layout: the session id and the role live in separate
+    /// columns, so a row is `(session id, type, data)`.
+    fn write_opencode_v2(
+        dir: &std::path::Path,
+        auth: &str,
+        rows: &[(&str, &str, &str)],
+    ) -> OpenCodePaths {
+        let data = dir.join("opencode");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("auth.json"), auth).unwrap();
+        crate::opencode::write_v2_fixture_db(&data.join("opencode.db"), rows).unwrap();
         OpenCodePaths::from_dir(data)
     }
 
@@ -730,6 +746,44 @@ mod tests {
         assert_eq!(
             resolve_opencode_with_identity(Some("ses_absent"), Some(paths)).resolution,
             Resolution::Indeterminate
+        );
+    }
+
+    /// A session created after the OpenCode 2 upgrade lives only in
+    /// `session_v2`/`session_message`, so the billing decision has to read that
+    /// layout instead of the migrated v1 tables.
+    #[test]
+    fn opencode_v2_sessions_resolve_go_and_payg_from_the_new_tables() {
+        let directory = tempdir().unwrap();
+        let paths = write_opencode_v2(
+            directory.path(),
+            r#"{"opencode-go":{"type":"api","key":"placeholder"},"anthropic":{"type":"api","key":"placeholder"}}"#,
+            &[
+                (
+                    "ses_go_v2",
+                    "assistant",
+                    r#"{"model":{"id":"kimi-k2.5","providerID":"opencode-go"}}"#,
+                ),
+                (
+                    "ses_payg_v2",
+                    "assistant",
+                    r#"{"model":{"id":"sonnet","providerID":"anthropic"}}"#,
+                ),
+            ],
+        );
+
+        let go = resolve_opencode_with_identity(Some("ses_go_v2"), Some(paths.clone()));
+        assert_eq!(
+            go.resolution,
+            Resolution::Subscription(BillingTarget::opencode_go())
+        );
+        let identity = go.identity.expect("identity");
+        assert_eq!(identity.provider, "OpenCode Go");
+        assert_eq!(identity.model, "kimi-k2.5");
+
+        assert_eq!(
+            resolve_opencode_with_identity(Some("ses_payg_v2"), Some(paths)).resolution,
+            Resolution::NoSubscription
         );
     }
 

@@ -44,7 +44,7 @@ impl Fixture {
     }
 
     fn configure(&self, size_file: &Path, arguments: &[&str]) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
             .arg("configure")
             .args(arguments)
             .env_clear()

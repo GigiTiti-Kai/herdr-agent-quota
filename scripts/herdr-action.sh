@@ -8,7 +8,11 @@
 #
 # Sourced by install.sh and uninstall.sh; not a standalone script.
 
-HERDR_ACTION_PLUGIN_ID="herdr-agent-quota"
+PLUGIN_ID="herdr-agent-usage"
+# Space-separated earlier ids. Append here when the plugin id changes again.
+PLUGIN_ID_ALIASES="herdr-agent-quota"
+
+HERDR_ACTION_PLUGIN_ID="$PLUGIN_ID"
 
 # Preference form of an `--agent` selection.
 #
@@ -22,6 +26,118 @@ agents_pref_value() {
     *) printf 'only,%s\n' "$1" ;;
   esac
 }
+
+xdg_state_home() {
+  printf '%s\n' "${XDG_STATE_HOME:-${HOME}/.local/state}"
+}
+
+plugin_is_listed() {
+  herdr plugin list 2>/dev/null | grep -F -q -- "$1"
+}
+
+plugin_state_dirs() {
+  local id="$1"
+  printf '%s\n' "$(xdg_state_home)/herdr/plugins/${id}"
+  printf '%s\n' "$(xdg_state_home)/herdr/plugins/state/${id}"
+}
+
+# Move names from $1 into $2 when the destination does not already have them.
+# Existing files in $2 win so a current install is never overwritten by an alias.
+adopt_plugin_dir() {
+  local from="$1" to="$2" item base
+  [[ -d "$from" ]] || return 0
+  [[ "$from" == "$to" ]] && return 0
+  mkdir -p "$to"
+  (
+    shopt -s nullglob dotglob
+    for item in "$from"/*; do
+      [[ -e "$item" || -L "$item" ]] || continue
+      base="$(basename "$item")"
+      # Cursor's hooks.json names this script by absolute path. Moving it
+      # before configure rewrites that command would drop cache reports.
+      case "$base" in
+        *-hooks.sh) continue ;;
+      esac
+      if [[ ! -e "$to/$base" && ! -L "$to/$base" ]]; then
+        mv "$item" "$to/$base"
+      fi
+    done
+  )
+  rmdir "$from" 2>/dev/null || true
+}
+
+# Snapshot alias config/state paths while those ids are still linked.
+collect_alias_plugin_dirs() {
+  ALIAS_CONFIG_DIRS=""
+  ALIAS_STATE_DIRS=""
+  local id dir config_home
+  # Herdr can switch a linked checkout to the new manifest id before install.sh
+  # runs. The old id is then absent from `plugin list`, but its directories
+  # are still on disk. Always probe those paths; a listed id may also live
+  # somewhere `plugin config-dir` names.
+  config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+  for id in $PLUGIN_ID_ALIASES; do
+    if plugin_is_listed "$id" \
+      && dir="$(herdr plugin config-dir "$id" 2>/dev/null)" \
+      && [[ -n "$dir" ]]; then
+      ALIAS_CONFIG_DIRS="${ALIAS_CONFIG_DIRS}${dir}"$'\n'
+    fi
+    ALIAS_CONFIG_DIRS="${ALIAS_CONFIG_DIRS}${config_home}/herdr/plugins/config/${id}"$'\n'
+    ALIAS_STATE_DIRS="${ALIAS_STATE_DIRS}$(plugin_state_dirs "$id")"$'\n'
+  done
+}
+
+adopt_alias_plugin_dirs() {
+  local dest_config dest_state dest_state_alt old
+  dest_config="$(herdr plugin config-dir "$PLUGIN_ID")" || return 1
+  dest_state="$(xdg_state_home)/herdr/plugins/${PLUGIN_ID}"
+  dest_state_alt="$(xdg_state_home)/herdr/plugins/state/${PLUGIN_ID}"
+  while IFS= read -r old; do
+    [[ -z "$old" ]] && continue
+    adopt_plugin_dir "$old" "$dest_config"
+  done <<< "$ALIAS_CONFIG_DIRS"
+  while IFS= read -r old; do
+    [[ -z "$old" ]] && continue
+    case "$old" in
+      */plugins/state/*) adopt_plugin_dir "$old" "$dest_state_alt" ;;
+      *) adopt_plugin_dir "$old" "$dest_state" ;;
+    esac
+  done <<< "$ALIAS_STATE_DIRS"
+}
+
+unlink_alias_plugins() {
+  local id
+  for id in $PLUGIN_ID_ALIASES; do
+    plugin_is_listed "$id" || continue
+    herdr plugin disable "$id" >/dev/null 2>&1 || true
+    herdr plugin unlink "$id" || true
+  done
+}
+
+select_action_plugin_id() {
+  if plugin_is_listed "$PLUGIN_ID"; then
+    HERDR_ACTION_PLUGIN_ID="$PLUGIN_ID"
+    return 0
+  fi
+  local id
+  for id in $PLUGIN_ID_ALIASES; do
+    if plugin_is_listed "$id"; then
+      HERDR_ACTION_PLUGIN_ID="$id"
+      return 0
+    fi
+  done
+  return 1
+}
+
+unlink_all_plugin_ids() {
+  local id
+  for id in $PLUGIN_ID $PLUGIN_ID_ALIASES; do
+    plugin_is_listed "$id" || continue
+    herdr plugin disable "$id" >/dev/null 2>&1 || true
+    herdr plugin unlink "$id" || true
+  done
+}
+
 # Configuration writes touch a handful of small files. A minute is far beyond
 # any legitimate run and still bounds a hung action.
 HERDR_ACTION_TIMEOUT_SECONDS="${HERDR_ACTION_TIMEOUT_SECONDS:-60}"

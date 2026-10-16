@@ -1,6 +1,8 @@
 # Documentation
 
 Current usage and upgrade instructions: [English](../README.md) · [简体中文](../README.zh-CN.md).
+Have a coding agent finish install (detect local CLIs, fonts, integrations,
+Keychain): [English](agent-setup.md) · [简体中文](agent-setup.zh-CN.md).
 Development: [Contributing](../CONTRIBUTING.md) · [Agent guide](../AGENTS.md).
 
 Operational diagnosis: [pane repaint](pane-repaint-diagnosis.md).

@@ -5,6 +5,7 @@
 //! `U+E1A0`–`U+E1B6`. Without the map, the cells are tofu — so configure
 //! always tries to install both.
 
+use crate::identity::{self, PLUGIN_ID};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -16,8 +17,6 @@ const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/HerdrAgentIconsMax-
 /// Same ranges herdr-radar maps: vendor logos, then state marks kept so a
 /// shared Ghostty/kitty map stays compatible if both plugins are linked.
 const CODEPOINT_RANGES: [(&str, &str); 2] = [("E1A0", "E1B6"), ("E1C0", "E1C5")];
-const MARKER_START: &str = "# BEGIN herdr-agent-quota font";
-const MARKER_END: &str = "# END herdr-agent-quota font";
 const OWNED_FONT_FILE: &str = "owned-font";
 
 /// Copy the font into the user font directory and write Ghostty / kitty maps
@@ -165,30 +164,37 @@ fn terminal_targets() -> Vec<TerminalTarget> {
 }
 
 fn marked_block(lines: Vec<String>) -> String {
-    std::iter::once(MARKER_START.to_string())
+    std::iter::once(identity::font_marker_start(PLUGIN_ID))
         .chain(lines)
-        .chain(std::iter::once(MARKER_END.to_string()))
+        .chain(std::iter::once(identity::font_marker_end(PLUGIN_ID)))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+fn find_marked_span(text: &str) -> Option<(usize, usize)> {
+    identity::all_plugin_ids().find_map(|id| {
+        let start = identity::font_marker_start(id);
+        let end = identity::font_marker_end(id);
+        let from = text.find(&start)?;
+        let rel_end = text[from..].find(&end)?;
+        Some((from, from + rel_end + end.len()))
+    })
+}
+
 fn upsert_marked(text: &str, body: &str) -> String {
-    if let Some(from) = text.find(MARKER_START) {
-        if let Some(rel_end) = text[from..].find(MARKER_END) {
-            let to = from + rel_end + MARKER_END.len();
-            let mut next = String::new();
-            next.push_str(text[..from].trim_end());
-            next.push_str("\n\n");
-            next.push_str(body);
-            let rest = text[to..].trim_start_matches('\n');
-            if !rest.is_empty() {
-                next.push('\n');
-                next.push_str(rest);
-            } else {
-                next.push('\n');
-            }
-            return next;
+    if let Some((from, to)) = find_marked_span(text) {
+        let mut next = String::new();
+        next.push_str(text[..from].trim_end());
+        next.push_str("\n\n");
+        next.push_str(body);
+        let rest = strip_marked(text[to..].trim_start_matches('\n'));
+        if !rest.is_empty() {
+            next.push('\n');
+            next.push_str(&rest);
+        } else {
+            next.push('\n');
         }
+        return next;
     }
     let mut next = text.trim_end().to_string();
     if !next.is_empty() {
@@ -199,20 +205,26 @@ fn upsert_marked(text: &str, body: &str) -> String {
     next
 }
 
-fn remove_marked(text: &str) -> Option<String> {
-    let from = text.find(MARKER_START)?;
-    let end = text[from..].find(MARKER_END)?;
-    let to = from + end + MARKER_END.len();
-    let before = text[..from].trim_end_matches('\n');
-    let after = text[to..].trim_start_matches('\n');
-    let mut output = before.to_owned();
-    if !output.is_empty() && !after.is_empty() {
-        output.push_str("\n\n");
-    } else if !output.is_empty() {
-        output.push('\n');
+fn strip_marked(text: &str) -> String {
+    let mut next = text.to_string();
+    while let Some((from, to)) = find_marked_span(&next) {
+        let before = next[..from].trim_end_matches('\n');
+        let after = next[to..].trim_start_matches('\n');
+        let mut output = before.to_owned();
+        if !output.is_empty() && !after.is_empty() {
+            output.push_str("\n\n");
+        } else if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(after);
+        next = output;
     }
-    output.push_str(after);
-    Some(output)
+    next
+}
+
+fn remove_marked(text: &str) -> Option<String> {
+    find_marked_span(text)?;
+    Some(strip_marked(text))
 }
 
 fn user_font_dir() -> PathBuf {
@@ -250,8 +262,25 @@ mod tests {
         let again = upsert_marked(&first, &body);
         assert_eq!(first, again);
         assert!(first.contains("font-codepoint-map"));
-        assert_eq!(first.matches(MARKER_START).count(), 1);
+        let start = identity::font_marker_start(PLUGIN_ID);
+        assert_eq!(first.matches(&start).count(), 1);
         assert_eq!(remove_marked(&first), Some("# existing\n".into()));
+    }
+
+    #[test]
+    fn upsert_rewrites_an_alias_font_block() {
+        let alias = concat!(
+            "# existing\n\n",
+            "# BEGIN herdr-agent-quota font\n",
+            "font-codepoint-map = U+E1A0-U+E1B6=\"old\"\n",
+            "# END herdr-agent-quota font\n",
+        );
+        let body = marked_block(vec!["font-codepoint-map = U+E1A0-U+E1B6=\"new\"".into()]);
+        let updated = upsert_marked(alias, &body);
+        assert!(updated.contains(&identity::font_marker_start(PLUGIN_ID)));
+        assert!(updated.contains("font-codepoint-map = U+E1A0-U+E1B6=\"new\""));
+        assert!(!updated.contains("herdr-agent-quota font"));
+        assert_eq!(upsert_marked(&updated, &body), updated);
     }
 
     #[test]

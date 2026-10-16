@@ -1,3 +1,5 @@
+use crate::cache::CacheStore;
+use crate::identity::{self, PLUGIN_ID};
 use crate::model::{ContextUsage, Harness, Provider};
 use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
 use anyhow::{Context, Result};
@@ -23,7 +25,7 @@ const SUMMARY_TITLE: &str = "quota";
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 40] = [
+const METADATA_TOKEN_NAMES: [&str; 58] = [
     "quota_group",
     "quota_group_gap",
     "quota_group_tail",
@@ -61,9 +63,27 @@ const METADATA_TOKEN_NAMES: [&str; 40] = [
     "quota_month_warning",
     "quota_month_danger",
     "quota_month_unknown",
+    "quota_share_5h_normal",
+    "quota_share_5h_warning",
+    "quota_share_5h_danger",
+    "quota_share_5h_unknown",
+    "quota_share_week_normal",
+    "quota_share_week_warning",
+    "quota_share_week_danger",
+    "quota_share_week_unknown",
+    "quota_share_week_inline_normal",
+    "quota_share_week_inline_warning",
+    "quota_share_week_inline_danger",
+    "quota_share_week_inline_unknown",
+    "quota_share_month_normal",
+    "quota_share_month_warning",
+    "quota_share_month_danger",
+    "quota_share_month_unknown",
     "quota_topic",
     "quota_error",
     HEADROOM_TOKEN,
+    STACK_TOKEN,
+    NEST_GAP_TOKEN,
 ];
 /// Sort key for Herdr's Agent view: remaining quota as a zero-padded percent
 /// (`007`), so Herdr's ordering of the token values is also their numeric
@@ -76,6 +96,35 @@ const METADATA_TOKEN_NAMES: [&str; 40] = [
 /// costs no extra writes — the value only moves when a quota token beside it
 /// moves anyway.
 pub(crate) const HEADROOM_TOKEN: &str = "quota_headroom";
+/// Agent-view sort key that keeps same-Space same-vendor panes adjacent:
+/// `{group_headroom:03}{harness:02}{role}{own:03}`. Not rendered.
+pub(crate) const STACK_TOKEN: &str = "quota_stack";
+/// Trailing blank after a pane when the user wants separated agents.
+/// Nested vendor children omit it so they stay flush; Herdr `row_gap` is 0.
+pub(crate) const NEST_GAP_TOKEN: &str = "quota_nest_gap";
+/// Must survive Herdr's token trim: NBSP is whitespace and the row vanishes.
+const NEST_GAP_VALUE: &str = "\u{200b}\u{2800}";
+/// Visible account-quota window names that repeat for every pane of the same
+/// login in one Space. Identity, topic, context, and `$quota_headroom` stay:
+/// extra tabs remain in the Agent panel, they just omit the duplicate 5h/7d/30d.
+const ACCOUNT_QUOTA_TOKEN_NAMES: [&str; 16] = [
+    "quota_5h_normal",
+    "quota_5h_warning",
+    "quota_5h_danger",
+    "quota_5h_unknown",
+    "quota_week_normal",
+    "quota_week_warning",
+    "quota_week_danger",
+    "quota_week_unknown",
+    "quota_week_inline_normal",
+    "quota_week_inline_warning",
+    "quota_week_inline_danger",
+    "quota_week_inline_unknown",
+    "quota_month_normal",
+    "quota_month_warning",
+    "quota_month_danger",
+    "quota_month_unknown",
+];
 /// The subset of [`METADATA_TOKEN_NAMES`] whose value comes from the cached
 /// quota windows and nothing else. [`quota_rows_have_drifted`] compares these,
 /// so a name added here must be one a snapshot alone can render.
@@ -143,7 +192,7 @@ const CONTEXT_TOKEN_NAMES: [&str; 4] = [
 /// Values that must reach the pane in the *same* report that changed them,
 /// even when the budget is tight: the identity, the live diagnostics, and the
 /// inline week variants, whose styling flips as soon as a 5h window appears.
-const ROWS_THAT_MUST_NOT_LAG: [&str; 19] = [
+const ROWS_THAT_MUST_NOT_LAG: [&str; 21] = [
     "quota_group",
     "quota_group_gap",
     "quota_group_tail",
@@ -163,6 +212,8 @@ const ROWS_THAT_MUST_NOT_LAG: [&str; 19] = [
     "quota_week_inline_warning",
     "quota_week_inline_danger",
     "quota_week_inline_unknown",
+    STACK_TOKEN,
+    NEST_GAP_TOKEN,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,21 +270,14 @@ impl AgentStatus {
     pub fn is_working(self) -> bool {
         matches!(self, Self::Working)
     }
-
-    /// Metadata token that carries the brand glyph for this status.
-    fn icon_token(self) -> &'static str {
-        match self {
-            Self::Working => "quota_icon_working",
-            Self::Done => "quota_icon_done",
-            Self::Idle | Self::Blocked | Self::Unknown => "quota_icon",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPane {
     pub pane_id: String,
     pub workspace_id: String,
+    pub cwd: String,
+    pub title: String,
     pub harness: Harness,
     pub session: Option<AgentSession>,
     pub session_summary: String,
@@ -269,10 +313,25 @@ impl AgentPane {
     }
 
     pub fn icon_needs_update(&self) -> bool {
-        let active = self.icon_status().icon_token();
-        ICON_TOKEN_NAMES
-            .into_iter()
-            .any(|name| self.tokens.contains_key(name) != (name == active))
+        // Old installs published colour twins; a leftover name must be
+        // cleared even after the layout moved colour onto `$quota_icon`.
+        if self.tokens.contains_key("quota_icon_working")
+            || self.tokens.contains_key("quota_icon_done")
+        {
+            return true;
+        }
+        let value = self
+            .tokens
+            .get("quota_icon")
+            .map(String::as_str)
+            .unwrap_or("");
+        let working = value.contains(crate::icons::WORKING_TAG);
+        let done = value.contains(crate::icons::DONE_TAG);
+        match self.icon_status() {
+            AgentStatus::Working => !working || done,
+            AgentStatus::Done => !done,
+            _ => working || done || value.is_empty(),
+        }
     }
 }
 
@@ -302,6 +361,10 @@ pub struct PaneTokens {
     pub quota: PaneQuotaUpdate,
     pub identity: Option<PaneIdentity>,
     pub context: Option<ContextUsage>,
+    /// Account-level 5h/7d/30d is shared across panes of one vendor in a Space.
+    /// Only one pane in that group publishes those window rows; the others keep
+    /// identity, topic, and context and stay visible in the Agent panel.
+    pub show_account_quota: bool,
 }
 
 /// Show one Herdr notification.
@@ -322,9 +385,6 @@ pub fn notify(title: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-/// Source that owns this plugin's Herdr Agent view. Herdr requires the
-/// `plugin:<id>` form and rejects a set whose plugin is missing or disabled.
-const AGENT_VIEW_SOURCE: &str = "plugin:herdr-agent-quota";
 /// A socket request must not outlive the event hook that sent it. Herdr
 /// answers these in microseconds; anything near this is a hung server, and a
 /// sidebar sort is never worth blocking a turn for.
@@ -346,10 +406,11 @@ pub fn set_quota_agent_view() -> Result<()> {
         "id": "agent-quota:view-set",
         "method": "agent.view.set",
         "params": {
-            "source": AGENT_VIEW_SOURCE,
+            "source": identity::agent_view_source(),
             "label": crate::cli::AgentOrder::LABEL,
             "sort": [
                 {"field": "workspace_order", "order": "asc"},
+                {"field": {"token": STACK_TOKEN}, "order": "asc"},
                 {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
             ],
         },
@@ -364,7 +425,7 @@ pub fn clear_quota_agent_view() -> Result<()> {
     socket_request(&serde_json::json!({
         "id": "agent-quota:view-clear",
         "method": "agent.view.clear",
-        "params": {"source": AGENT_VIEW_SOURCE},
+        "params": {"source": identity::agent_view_source()},
     }))
     .map(|_| ())
 }
@@ -415,24 +476,33 @@ pub fn list_agent_panes() -> Result<Vec<AgentPane>> {
 /// combined view so one poll does not fan out into one `agent list` call per
 /// provider.
 pub fn list_agent_state() -> Result<AgentState> {
-    let value = list_agent_value()?;
+    Ok(agent_state_from(
+        &list_agent_value()?,
+        attach_missing_sessions,
+    ))
+}
+
+/// Every inventory consumer (watch, focus, sibling publish) sees the same
+/// recovered sessions. A pane left without one renders the account-level
+/// model, which belongs to whichever rollout Codex wrote last.
+fn agent_state_from(value: &Value, attach: impl FnOnce(&mut [AgentPane])) -> AgentState {
     let mut panes = Vec::new();
-    collect_agent_panes(&value, &mut panes);
-    // Keep Herdr's order: it is the Agent panel's draw order, and group head
-    // election depends on it. A `pane_id` sort would put `w1:p10` before
-    // `w1:p7`.
+    collect_agent_panes(value, &mut panes);
+    // Preserve Herdr's inventory order: under the default grouped view this is
+    // the Agent panel's draw order. Lexical pane ids are not layout order
+    // (for example, p10 sorts before p7).
     let mut seen = BTreeSet::new();
     panes.retain(|pane| seen.insert(pane.pane_id.clone()));
-    attach_muse_sessions(&mut panes);
+    attach(&mut panes);
     let mut working_pane_ids = Vec::new();
-    collect_working_providers(&value, &mut Vec::new(), &mut working_pane_ids);
+    collect_working_providers(value, &mut Vec::new(), &mut working_pane_ids);
     working_pane_ids.sort();
     working_pane_ids.dedup();
-    Ok(AgentState {
+    AgentState {
         panes,
-        working_providers: working_providers_from(&value),
+        working_providers: working_providers_from(value),
         working_pane_ids,
-    })
+    }
 }
 
 /// One pane from a single inventory read, for the event and focus paths.
@@ -446,7 +516,7 @@ pub fn find_agent_pane(pane_id: &str) -> Result<Option<AgentPane>> {
         return Ok(None);
     };
     let mut panes = [pane];
-    attach_muse_sessions(&mut panes);
+    attach_missing_sessions(&mut panes);
     let [pane] = panes;
     Ok(Some(pane))
 }
@@ -463,11 +533,111 @@ pub fn find_agent_icon_panes(pane_ids: &[&str]) -> Result<Vec<AgentPane>> {
     Ok(panes)
 }
 
+fn attach_missing_sessions(panes: &mut [AgentPane]) {
+    attach_muse_sessions(panes);
+    attach_codex_sessions(panes);
+}
+
 /// Herdr has no Muse session integration, so a Muse pane arrives without a
 /// session. Resolve it from Muse's own session lock; a session Herdr does
 /// report is always kept as-is.
 fn attach_muse_sessions(panes: &mut [AgentPane]) {
     attach_muse_sessions_with(panes, crate::providers::muse::session_ids_for_panes);
+}
+
+/// Codex hooks normally report a session id. A wrapper can disable those
+/// hooks while leaving Herdr's foreground cwd intact, so use the rollout's
+/// exact session_meta cwd only when one missing pane and one rollout agree.
+fn attach_codex_sessions(panes: &mut [AgentPane]) {
+    attach_codex_sessions_with(
+        panes,
+        codex_process_started_at,
+        crate::providers::codex::session_ids_for_panes,
+    );
+}
+
+fn attach_codex_sessions_with(
+    panes: &mut [AgentPane],
+    started_at: impl Fn(&str) -> Option<u64>,
+    resolve: impl FnOnce(&[(String, String, u64)]) -> BTreeMap<String, String>,
+) {
+    let missing = panes
+        .iter()
+        .filter(|pane| pane.harness == Harness::Codex && pane.session.is_none())
+        .collect::<Vec<_>>();
+    // Callers drop unselected harnesses after the inventory read; a partial
+    // install must not inspect the processes of an agent it does not track.
+    if missing.is_empty()
+        || !crate::cli::AgentSelection::from_args_or_env(&[]).contains(&Harness::Codex)
+    {
+        return;
+    }
+    let candidates = missing
+        .into_iter()
+        .filter_map(|pane| {
+            started_at(&pane.pane_id)
+                .map(|started_at| (pane.pane_id.clone(), pane.cwd.clone(), started_at))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    let resolved = resolve(&candidates);
+    for pane in panes {
+        if pane.harness != Harness::Codex || pane.session.is_some() {
+            continue;
+        }
+        if let Some(session_id) = resolved.get(&pane.pane_id) {
+            pane.session = Some(AgentSession {
+                kind: Some("id".to_string()),
+                value: session_id.clone(),
+            });
+        }
+    }
+}
+
+fn codex_process_started_at(pane_id: &str) -> Option<u64> {
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let output = Command::new(executable)
+        .args(["pane", "process-info", "--pane", pane_id])
+        .output()
+        .ok()?;
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let process = value
+        .pointer("/result/process_info/foreground_processes")?
+        .as_array()?
+        .iter()
+        .find(|process| {
+            process
+                .get("argv")
+                .and_then(Value::as_array)
+                .and_then(|argv| argv.first())
+                .and_then(Value::as_str)
+                .is_some_and(|argv0| argv0 == "codex" || argv0.ends_with("/codex"))
+        })?;
+    let pid = process.get("pid")?.as_u64()?.to_string();
+    let elapsed = Command::new("ps")
+        .args(["-p", &pid, "-o", "etime="])
+        .output()
+        .ok()?;
+    let seconds = parse_ps_elapsed(&String::from_utf8_lossy(&elapsed.stdout))?;
+    Some(CacheStore::now_unix().saturating_sub(seconds))
+}
+
+fn parse_ps_elapsed(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (days, clock) = if let Some((days, clock)) = value.split_once('-') {
+        (days.parse::<u64>().ok()?, clock)
+    } else {
+        (0, value)
+    };
+    let mut seconds = 0_u64;
+    for part in clock.split(':') {
+        seconds = seconds
+            .checked_mul(60)?
+            .checked_add(part.parse::<u64>().ok()?)?;
+    }
+    (clock.split(':').count() >= 2).then_some(days * 86_400 + seconds)
 }
 
 fn attach_muse_sessions_with(
@@ -664,9 +834,28 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         .map(AgentStatus::parse)
                         .unwrap_or_default();
                     let focused = map.get("focused").and_then(Value::as_bool).unwrap_or(false);
+                    // Codex rollouts record the native foreground process's
+                    // cwd. Other collectors keep the pane cwd contract they
+                    // already use.
+                    let cwd = (harness == Harness::Codex)
+                        .then(|| map.get("foreground_cwd"))
+                        .flatten()
+                        .or_else(|| map.get("cwd"))
+                        .or_else(|| map.get("foreground_cwd"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let title = map
+                        .get("terminal_title_stripped")
+                        .or_else(|| map.get("terminal_title"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     panes.push(AgentPane {
                         pane_id: pane_id.to_string(),
                         workspace_id,
+                        cwd,
+                        title,
                         harness,
                         session,
                         session_summary,
@@ -807,12 +996,16 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
     let mut failed = Vec::new();
     for pane in panes {
         let mut desired = pane.tokens.clone();
+        // Fork: vendor nesting is off (`shares_login_quota`), so every pane is
+        // `Flat` and its own status colours its icon.
         apply_group_and_icon(
             &mut desired,
             pane,
             &group_heads,
             &group_heads,
             &BTreeMap::new(),
+            VendorRow::Flat,
+            None,
         );
         if icon_tokens_match(&pane.tokens, &desired) {
             continue;
@@ -863,6 +1056,8 @@ fn publish_pane_tokens_inner(
     let rank_by_headroom = group_head_ranks_by_headroom();
     let group_heads = group_head_pane_ids(&inventory, panes, tokens, rank_by_headroom);
     let group_tails = group_tail_pane_ids(&inventory, panes, tokens, rank_by_headroom);
+    let nesting = vendor_nesting(&inventory, panes, tokens);
+    let wide = !identity_is_narrow(row.shape.content_width);
     let mut reported = 0usize;
     let mut failed = Vec::new();
     for pane in panes {
@@ -875,20 +1070,59 @@ fn publish_pane_tokens_inner(
             PaneQuotaUpdate::Clear => desired_cleared_quota(pane),
             PaneQuotaUpdate::Preserve => pane.tokens.clone(),
         };
+        let role = vendor_row_for(wide, &nesting, &pane.pane_id);
         if let Some(identity) = &pane_tokens.identity {
-            apply_identity(&mut desired, identity, row.shape.content_width);
+            apply_identity(&mut desired, identity, row.shape.content_width, role);
+        } else if role == VendorRow::Child {
+            apply_nested_child_from_tokens(&mut desired);
+        } else if role == VendorRow::Head {
+            apply_nested_head_from_tokens(&mut desired);
         }
         if let Some(context) = &pane_tokens.context {
             apply_context(&mut desired, context, sequence / 1_000, row);
         }
         fold_cache_row(&mut desired, row);
+        match role {
+            VendorRow::Head => {
+                // Share-window rows exist only in Gauges. Packed/Stacked would
+                // promote 5h/7d/30d onto names those layouts never render.
+                if row.shape.layout == crate::cli::SidebarLayout::Gauges {
+                    promote_shared_quota(&mut desired);
+                }
+                strip_vendor_head_session(&mut desired);
+            }
+            VendorRow::Child => {
+                strip_account_quota_tokens(&mut desired);
+                strip_vendor_child_extras(&mut desired);
+            }
+            VendorRow::Flat => {
+                if !pane_tokens.show_account_quota {
+                    strip_account_quota_tokens(&mut desired);
+                }
+            }
+        }
+        if row.shape.layout == crate::cli::SidebarLayout::Gauges && role == VendorRow::Flat {
+            desired.remove("quota_model");
+        }
         apply_group_and_icon(
             &mut desired,
             pane,
             &group_heads,
             &group_tails,
             &workspace_labels,
+            role,
+            Some(vendor_icon_status(&nesting, pane, role)),
         );
+        apply_pack_gap(
+            &mut desired,
+            role,
+            &nesting,
+            &pane.pane_id,
+            pack_gap_enabled(),
+        );
+        if let Some(key) = nesting.stack.get(&pane.pane_id) {
+            desired.insert(STACK_TOKEN.to_string(), key.clone());
+        }
         // Summary rows: their own source and comparison. Preserve leaves them.
         let desired_summary = match &pane_tokens.quota {
             PaneQuotaUpdate::Replace(values) => Some(desired_summary_tokens(values)),
@@ -923,7 +1157,7 @@ fn publish_pane_tokens_inner(
                 &executable,
                 "pane",
                 &pane.pane_id,
-                "herdr-agent-quota",
+                PLUGIN_ID,
                 names,
                 &desired,
                 sequence,
@@ -998,7 +1232,7 @@ fn report_icon_metadata(
             "report-metadata",
             &pane.pane_id,
             "--source",
-            "herdr-agent-quota",
+            PLUGIN_ID,
         ])
         .args(["--seq", &sequence.to_string(), "--ttl-ms", METADATA_TTL_MS]);
     for name in ICON_TOKEN_NAMES {
@@ -1073,7 +1307,7 @@ fn sync_sibling_group_headers(
                 "report-metadata",
                 &sibling.pane_id,
                 "--source",
-                "herdr-agent-quota",
+                PLUGIN_ID,
             ])
             .args(["--seq", &sequence.to_string()])
             .args(["--ttl-ms", METADATA_TTL_MS]);
@@ -1392,6 +1626,172 @@ fn published_headroom(pane: &AgentPane, tokens: &[PaneTokens]) -> u8 {
         .unwrap_or(u8::MAX)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VendorRow {
+    Flat,
+    Head,
+    Child,
+}
+
+struct VendorNesting {
+    heads: BTreeSet<String>,
+    children: BTreeSet<String>,
+    last_children: BTreeSet<String>,
+    stack: BTreeMap<String, String>,
+    header_icon: BTreeMap<String, AgentStatus>,
+}
+
+fn vendor_row_for(wide: bool, nesting: &VendorNesting, pane_id: &str) -> VendorRow {
+    if !wide {
+        VendorRow::Flat
+    } else if nesting.children.contains(pane_id) {
+        VendorRow::Child
+    } else if nesting.heads.contains(pane_id) {
+        VendorRow::Head
+    } else {
+        VendorRow::Flat
+    }
+}
+
+fn vendor_icon_status(nesting: &VendorNesting, pane: &AgentPane, role: VendorRow) -> AgentStatus {
+    if role == VendorRow::Head {
+        nesting
+            .header_icon
+            .get(&pane.pane_id)
+            .copied()
+            .unwrap_or(AgentStatus::Idle)
+    } else {
+        pane.icon_status()
+    }
+}
+
+fn vendor_nesting(
+    inventory: &[AgentPane],
+    overlay: &[AgentPane],
+    tokens: &[PaneTokens],
+) -> VendorNesting {
+    let overlay_ids = overlay
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let panes: Vec<&AgentPane> = overlay
+        .iter()
+        .chain(
+            inventory
+                .iter()
+                .filter(|pane| !overlay_ids.contains(pane.pane_id.as_str())),
+        )
+        .collect();
+    let mut groups: BTreeMap<(String, u8), Vec<&AgentPane>> = BTreeMap::new();
+    for pane in &panes {
+        if pane.workspace_id.is_empty() || !shares_login_quota(pane.harness) {
+            continue;
+        }
+        groups.entry(nest_group_key(pane)).or_default().push(*pane);
+    }
+    let mut heads = BTreeSet::new();
+    let mut children = BTreeSet::new();
+    let mut last_children = BTreeSet::new();
+    let mut stack = BTreeMap::new();
+    let mut header_icon = BTreeMap::new();
+    for ((_, index), members) in &groups {
+        let min_head = members
+            .iter()
+            .map(|pane| published_headroom(pane, tokens))
+            .min()
+            .unwrap_or(u8::MAX);
+        let nested = members.len() >= 2;
+        let head_id = vendor_group_head(members);
+        if nested {
+            heads.insert(head_id.clone());
+            header_icon.insert(
+                head_id.clone(),
+                if members.iter().any(|pane| pane.working()) {
+                    AgentStatus::Working
+                } else {
+                    AgentStatus::Idle
+                },
+            );
+        }
+        for pane in members {
+            let own = published_headroom(pane, tokens);
+            let role = if nested && pane.pane_id != head_id {
+                children.insert(pane.pane_id.clone());
+                '1'
+            } else {
+                '0'
+            };
+            stack.insert(
+                pane.pane_id.clone(),
+                format!("{min_head:03}{index:02}{role}{own:03}"),
+            );
+        }
+        if nested {
+            if let Some(last) = members
+                .iter()
+                .filter(|pane| pane.pane_id != head_id)
+                .max_by_key(|pane| {
+                    (
+                        stack.get(&pane.pane_id).cloned().unwrap_or_default(),
+                        pane.pane_id.as_str(),
+                    )
+                })
+            {
+                last_children.insert(last.pane_id.clone());
+            }
+        }
+    }
+    for pane in panes {
+        stack.entry(pane.pane_id.clone()).or_insert_with(|| {
+            let own = published_headroom(pane, tokens);
+            format!("{own:03}990{own:03}")
+        });
+    }
+    VendorNesting {
+        heads,
+        children,
+        last_children,
+        stack,
+        header_icon,
+    }
+}
+
+/// Fork: off (`fork/README.md`, Upstream policy). Upstream folds a second
+/// same-vendor pane in a Space into a nested child that loses cache, TTL and
+/// its own 5h/7d/30d rows. `false` empties `vendor_nesting`, so every pane is
+/// `VendorRow::Flat` and `mark_one_quota_row_per_vendor` returns early.
+pub(crate) fn shares_login_quota(harness: Harness) -> bool {
+    FORK_VENDOR_NESTING
+        && matches!(
+            harness,
+            Harness::Grok | Harness::Codex | Harness::Devin | Harness::OpenCode | Harness::Cursor
+        )
+}
+
+const FORK_VENDOR_NESTING: bool = false;
+
+/// Same-Space same-vendor group. Grok is one login-scoped vendor: the
+/// collector reads one `auth.json`, so two Grok tabs in a Space share 5h/7d.
+pub(crate) fn nest_group_key(pane: &AgentPane) -> (String, u8) {
+    (pane.workspace_id.clone(), harness_stack_index(pane.harness))
+}
+
+fn vendor_group_head(members: &[&AgentPane]) -> String {
+    members
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .min()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn harness_stack_index(harness: Harness) -> u8 {
+    crate::cli::AgentSelection::SUPPORTED
+        .iter()
+        .position(|item| *item == harness)
+        .unwrap_or(99) as u8
+}
+
 fn group_label_for(
     pane: &AgentPane,
     group_heads: &BTreeMap<String, String>,
@@ -1422,33 +1822,45 @@ const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_
 
 /// Vendor mark always; group header only on the Space head pane.
 ///
-/// Exactly one of `$quota_icon` / `_working` / `_done` is published so the
-/// brand glyph itself carries Herdr's status colour (no `state_icon` ring).
-/// Every pane publishes the bare glyph. Stale `$quota_pad` and the member
-/// indent older builds baked into the logo are cleared.
+/// `$quota_icon` always carries the glyph so it stays the first identity
+/// token. Working/done colour is an invisible suffix matched by Herdr
+/// `rules`; publishing a later twin on a Space head hang-indents the mark
+/// one cell to the right. Stale `$quota_pad` from older builds is cleared,
+/// as are leftover `_working` / `_done` twins.
 ///
-/// No member indent: Herdr indents by row *index* (row 0 by 1 column, every
-/// later row by 3), not by group membership. A member collapses its empty
-/// `$quota_group`, which pulls its whole row list up by one — so the logo row
-/// is a continuation row on heads and members alike and already shares the
-/// 3-column offset. Padding it moved members' logos 2 columns right of
-/// everyone else's, and only on the logo row, whenever a user row sat between
-/// the group header and the logo (`build_managed_rows` preserves those).
+/// Fork: no member indent. Upstream prefixes a Space member's logo (and a
+/// nested child's `quota_model`) with `GROUP_MEMBER_INDENT`. Here every
+/// member carries `$quota_group_gap`, so its icon row is already a
+/// continuation row like the head's, and the prefix drew a two-column step
+/// (`fork/README.md`, Upstream policy).
 fn apply_group_and_icon(
     desired: &mut BTreeMap<String, String>,
     pane: &AgentPane,
     group_heads: &BTreeMap<String, String>,
     group_tails: &BTreeMap<String, String>,
     workspace_labels: &BTreeMap<String, String>,
+    role: VendorRow,
+    icon_status: Option<AgentStatus>,
 ) {
-    let mark = crate::icons::sidebar_mark(pane.harness);
-    let active = pane.icon_status().icon_token();
-    for token in ICON_TOKEN_NAMES {
-        if token == active {
-            desired.insert(token.to_string(), mark.clone());
-        } else {
+    if role == VendorRow::Child {
+        for token in ICON_TOKEN_NAMES {
             desired.remove(token);
         }
+        desired.remove("quota_provider");
+        desired.remove("quota_provider_model");
+        desired.remove(NEST_GAP_TOKEN);
+    } else {
+        let tag = match icon_status.unwrap_or_else(|| pane.icon_status()) {
+            AgentStatus::Working => crate::icons::WORKING_TAG,
+            AgentStatus::Done => crate::icons::DONE_TAG,
+            _ => "",
+        };
+        let glyph = crate::icons::for_harness(pane.harness);
+        let reserve = crate::icons::SIDEBAR_RESERVE;
+        desired.insert("quota_icon".to_string(), format!("{glyph}{tag}{reserve}"));
+        desired.remove("quota_icon_working");
+        desired.remove("quota_icon_done");
+        desired.remove(NEST_GAP_TOKEN);
     }
     desired.remove("quota_pad");
     // Never preserve a previous header or tail: panes that are not the head
@@ -1521,7 +1933,7 @@ fn desired_tokens(
     insert_optional_token(&mut tokens, "quota_cache", &values.quota_cache);
     insert_optional_token(&mut tokens, "quota_cache_ttl", &values.quota_cache_ttl);
     insert_optional_token(&mut tokens, "quota_cache_state", &values.quota_cache_state);
-    let week_base = week_style_base(&values.quota_5h);
+    let week_base = week_style_base(&values.quota_5h, &values.quota_context);
     insert_severity_token(
         &mut tokens,
         "quota_5h",
@@ -1628,7 +2040,7 @@ fn summary_report_names(
 
 fn display_topic(pane: &AgentPane) -> String {
     let topic = pane.topic.trim();
-    if topic.is_empty() || is_status_line(topic) {
+    if topic.is_empty() || is_status_line(topic) || is_help_command_row(topic) {
         return truncate_topic(&pane.session_summary);
     }
     truncate_topic(topic)
@@ -1661,12 +2073,25 @@ fn desired_cleared_quota(pane: &AgentPane) -> BTreeMap<String, String> {
     tokens
 }
 
+fn identity_is_narrow(content_width: usize) -> bool {
+    content_width > 0 && content_width < 22
+}
+
 fn apply_identity(
     tokens: &mut BTreeMap<String, String>,
     identity: &PaneIdentity,
     content_width: usize,
+    role: VendorRow,
 ) {
-    let narrow = content_width > 0 && content_width < 22;
+    let narrow = identity_is_narrow(content_width);
+    if !narrow && role == VendorRow::Head {
+        apply_nested_head_identity(tokens, identity);
+        return;
+    }
+    if !narrow && role == VendorRow::Child {
+        apply_nested_child_identity(tokens, identity);
+        return;
+    }
     if identity.model.is_empty() {
         tokens.remove("quota_model");
         tokens.insert("quota_provider".to_string(), identity.provider.clone());
@@ -1688,6 +2113,153 @@ fn apply_identity(
             "quota_provider_model".to_string(),
             format!("{}/{}", identity.provider, identity.model),
         );
+    }
+}
+
+fn apply_nested_head_identity(tokens: &mut BTreeMap<String, String>, identity: &PaneIdentity) {
+    if identity.model.is_empty() {
+        tokens.remove("quota_model");
+    } else {
+        tokens.insert("quota_model".to_string(), identity.model.clone());
+    }
+    tokens.insert("quota_provider".to_string(), identity.provider.clone());
+    tokens.insert(
+        "quota_provider_model".to_string(),
+        identity.provider.clone(),
+    );
+}
+
+fn apply_nested_head_from_tokens(tokens: &mut BTreeMap<String, String>) {
+    let provider = tokens
+        .get("quota_provider")
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            tokens.get("quota_provider_model").and_then(|label| {
+                label
+                    .split_once('/')
+                    .map(|(provider, _)| provider.to_string())
+            })
+        })
+        .unwrap_or_default();
+    let model = tokens
+        .get("quota_model")
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            tokens.get("quota_provider_model").and_then(|label| {
+                label
+                    .split_once('/')
+                    .map(|(_, model)| model.to_string())
+                    .filter(|model| !model.is_empty())
+            })
+        });
+    if let Some(model) = model {
+        tokens.insert("quota_model".to_string(), model);
+    }
+    if provider.is_empty() {
+        return;
+    }
+    tokens.insert("quota_provider".to_string(), provider.clone());
+    tokens.insert("quota_provider_model".to_string(), provider);
+}
+
+fn pack_gap_enabled() -> bool {
+    crate::cache::CacheStore::from_env()
+        .ok()
+        .and_then(|cache| cache.row_gap())
+        .unwrap_or_default()
+        == crate::cli::SidebarRowGap::SEPARATED
+}
+
+fn apply_pack_gap(
+    desired: &mut BTreeMap<String, String>,
+    role: VendorRow,
+    nesting: &VendorNesting,
+    pane_id: &str,
+    separated: bool,
+) {
+    if separated && pane_takes_pack_gap(role, nesting, pane_id) {
+        desired.insert(NEST_GAP_TOKEN.to_string(), NEST_GAP_VALUE.to_string());
+    } else {
+        desired.remove(NEST_GAP_TOKEN);
+    }
+}
+
+fn pane_takes_pack_gap(role: VendorRow, nesting: &VendorNesting, pane_id: &str) -> bool {
+    match role {
+        VendorRow::Head => false,
+        VendorRow::Child => nesting.last_children.contains(pane_id),
+        VendorRow::Flat => true,
+    }
+}
+
+fn strip_vendor_head_session(tokens: &mut BTreeMap<String, String>) {
+    tokens.remove("quota_cache");
+    tokens.remove("quota_cache_ttl");
+    tokens.remove("quota_cache_state");
+    for name in ACCOUNT_QUOTA_TOKEN_NAMES {
+        unindent_token(tokens, name);
+    }
+    unindent_token(tokens, "quota_model");
+}
+
+fn strip_vendor_child_extras(tokens: &mut BTreeMap<String, String>) {
+    tokens.remove("quota_cache");
+    tokens.remove("quota_cache_ttl");
+    tokens.remove("quota_cache_state");
+    unindent_token(tokens, "quota_topic");
+    for name in CONTEXT_TOKEN_NAMES {
+        unindent_token(tokens, name);
+    }
+}
+
+fn unindent_token(tokens: &mut BTreeMap<String, String>, name: &str) {
+    let Some(value) = tokens.get(name) else {
+        return;
+    };
+    if !value.starts_with('\u{200b}') {
+        return;
+    }
+    let cleaned = value.trim_start_matches(['\u{200b}', ' ']).to_string();
+    if cleaned.is_empty() {
+        tokens.remove(name);
+    } else {
+        tokens.insert(name.to_string(), cleaned);
+    }
+}
+
+fn apply_nested_child_identity(tokens: &mut BTreeMap<String, String>, identity: &PaneIdentity) {
+    tokens.remove("quota_provider");
+    tokens.remove("quota_provider_model");
+    if identity.model.is_empty() {
+        tokens.remove("quota_model");
+        return;
+    }
+    tokens.insert("quota_model".to_string(), identity.model.clone());
+}
+
+fn apply_nested_child_from_tokens(tokens: &mut BTreeMap<String, String>) {
+    let model = tokens
+        .get("quota_model")
+        .cloned()
+        .filter(|model| !model.is_empty())
+        .or_else(|| {
+            let label = tokens.get("quota_provider_model")?;
+            if let Some((_, model)) = label.split_once('/') {
+                let model = model.trim();
+                (!model.is_empty()).then(|| model.to_string())
+            } else {
+                let label = label.trim();
+                (!label.is_empty()).then(|| label.to_string())
+            }
+        });
+    tokens.remove("quota_provider");
+    tokens.remove("quota_provider_model");
+    if let Some(model) = model {
+        tokens.insert("quota_model".to_string(), model);
+    } else {
+        tokens.remove("quota_model");
     }
 }
 
@@ -1733,6 +2305,37 @@ fn apply_context(
 ///
 /// `no cached` is not folded here: it keeps `$quota_cache_state` so the amber
 /// warning colour survives. Gauges puts that token on the cache row.
+pub(crate) fn strip_account_quota_tokens(tokens: &mut BTreeMap<String, String>) {
+    for name in ACCOUNT_QUOTA_TOKEN_NAMES {
+        tokens.remove(name);
+    }
+    tokens.retain(|name, _| !name.starts_with("quota_share_"));
+}
+
+fn share_token_name(name: &str) -> String {
+    format!(
+        "quota_share_{}",
+        name.strip_prefix("quota_").unwrap_or(name)
+    )
+}
+
+fn current_quota_window<'a>(
+    tokens: &'a BTreeMap<String, String>,
+    name: &'static str,
+) -> Option<&'a String> {
+    tokens
+        .get(name)
+        .or_else(|| tokens.get(&share_token_name(name)))
+}
+
+fn promote_shared_quota(tokens: &mut BTreeMap<String, String>) {
+    for name in ACCOUNT_QUOTA_TOKEN_NAMES {
+        if let Some(value) = tokens.remove(name) {
+            tokens.insert(share_token_name(name), value);
+        }
+    }
+}
+
 fn fold_cache_row(tokens: &mut BTreeMap<String, String>, row: RowStyle) {
     use crate::cli::{SidebarField, SidebarLayout};
     if row.shape.layout != SidebarLayout::Gauges
@@ -1774,7 +2377,8 @@ pub(crate) fn quota_rows_have_drifted(
     let desired = desired_tokens(values, "", shape);
     let current_has_window = QUOTA_WINDOW_TOKEN_NAMES
         .into_iter()
-        .any(|name| current.contains_key(name));
+        .any(|name| current.contains_key(name))
+        || current.keys().any(|name| name.starts_with("quota_share_"));
     let desired_has_window = QUOTA_WINDOW_TOKEN_NAMES
         .into_iter()
         .any(|name| desired.contains_key(name));
@@ -1786,7 +2390,7 @@ pub(crate) fn quota_rows_have_drifted(
     summary_drifted
         || QUOTA_WINDOW_TOKEN_NAMES
             .into_iter()
-            .any(|name| current.get(name) != desired.get(name))
+            .any(|name| current_quota_window(current, name) != desired.get(name))
 }
 
 fn metadata_matches(
@@ -1844,7 +2448,12 @@ fn metadata_report_names(
         // than a briefly lagged quota digit.
         let must_clear = pane.tokens.contains_key(*name) && !desired.contains_key(*name);
         let is_icon = ICON_TOKEN_NAMES.contains(name);
-        !must_clear && !is_icon && !ROWS_THAT_MUST_NOT_LAG.contains(name)
+        // Nested-head 5h/7d/30d live on quota_share_*; dropping them to
+        // squeeze the 16-token budget hides the only visible windows.
+        !must_clear
+            && !is_icon
+            && !ROWS_THAT_MUST_NOT_LAG.contains(name)
+            && !name.starts_with("quota_share_")
     };
     // Unchanged values go first: dropping a changed one by position would
     // never deliver it, so the pane would never match and every pass would
@@ -1865,10 +2474,11 @@ fn metadata_report_names(
     names
 }
 
-fn week_style_base(quota_5h: &str) -> &'static str {
-    // Empty 5h publishes week beside context (`context · 7d`). A present 5h
-    // keeps week on the limits row so 5h never shares a line with context.
-    if quota_5h.trim().is_empty() {
+fn week_style_base(quota_5h: &str, quota_context: &str) -> &'static str {
+    // Empty 5h publishes week beside context (`context · 7d`) when that row
+    // exists. Without context the inline token has nothing to hang on, so week
+    // stays on the limits row.
+    if quota_5h.trim().is_empty() && !quota_context.trim().is_empty() {
         "quota_week_inline"
     } else {
         "quota_week"
@@ -1972,7 +2582,7 @@ fn extract_topic(text: &str, harness: Harness) -> Option<String> {
         let cleaned_line = strip_control_chars(line);
         let line = cleaned_line.trim();
         let candidate = prompt_candidate(line, harness)?;
-        if candidate.is_empty() || is_status_line(candidate) {
+        if candidate.is_empty() || is_status_line(candidate) || is_help_command_row(candidate) {
             return None;
         }
         Some(truncate_topic(candidate))
@@ -2017,8 +2627,27 @@ fn is_status_line(value: &str) -> bool {
         || lower == "ask codex to do anything"
         || matches!(
             lower.as_str(),
-            "/clear" | "/compact" | "/help" | "/status" | "/usage" | "/model" | "/config"
+            "/clear"
+                | "/compact"
+                | "/help"
+                | "/status"
+                | "/usage"
+                | "/model"
+                | "/config"
+                | "/login"
         )
+}
+
+/// Grok Build help rows look like `/login     Log in or re-authenticate…`.
+/// A real prompt after a slash command has a single space then the text
+/// (`/goal 你在 ti…`).
+fn is_help_command_row(value: &str) -> bool {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let rest = trimmed.trim_start_matches(|character: char| !character.is_whitespace());
+    rest.is_empty() || rest.starts_with("  ")
 }
 
 #[cfg(test)]
@@ -2029,6 +2658,15 @@ mod tests {
         CacheUsage, ContextUsage, ProviderSnapshot, ResetAt, UsageWindow, WindowKind,
     };
     use serde_json::json;
+
+    /// Fork: two same-vendor panes in one Space stay two flat panes, each
+    /// with its own cache, TTL and 5h/7d/30d (`fork/README.md`).
+    #[test]
+    fn fork_never_nests_a_vendor() {
+        for harness in crate::cli::AgentSelection::SUPPORTED {
+            assert!(!shares_login_quota(harness), "{harness:?}");
+        }
+    }
 
     fn lines_claude() -> MetadataTokens {
         let snapshot = ProviderSnapshot::new(
@@ -2515,6 +3153,8 @@ mod tests {
         let pane = |id: &str, harness: Harness, session: Option<&str>| AgentPane {
             pane_id: id.to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness,
             session: session.map(|value| AgentSession {
                 kind: Some("id".to_string()),
@@ -2584,6 +3224,312 @@ mod tests {
     fn the_headroom_token_is_listed_among_the_names_that_are_compared() {
         assert!(METADATA_TOKEN_NAMES.contains(&HEADROOM_TOKEN));
         assert!(!OBSOLETE_METADATA_TOKEN_NAMES.contains(&HEADROOM_TOKEN));
+        assert!(METADATA_TOKEN_NAMES.contains(&STACK_TOKEN));
+        assert!(METADATA_TOKEN_NAMES.contains(&NEST_GAP_TOKEN));
+        assert!(ROWS_THAT_MUST_NOT_LAG.contains(&STACK_TOKEN));
+        assert!(ROWS_THAT_MUST_NOT_LAG.contains(&NEST_GAP_TOKEN));
+        assert!(
+            !NEST_GAP_VALUE.trim().is_empty(),
+            "Herdr trims whitespace-only tokens; NBSP would collapse the blank row"
+        );
+    }
+
+    #[test]
+    fn a_nested_head_does_not_insert_a_blank_after_quota() {
+        let pane = AgentPane {
+            pane_id: "w5:pA".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        let mut desired = BTreeMap::new();
+        apply_group_and_icon(
+            &mut desired,
+            &pane,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            VendorRow::Head,
+            None,
+        );
+        assert!(!desired.contains_key(NEST_GAP_TOKEN));
+    }
+
+    #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
+    fn same_space_vendor_children_stack_after_the_head() {
+        let focused = AgentPane {
+            pane_id: "w5:pA".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::from([(HEADROOM_TOKEN.to_string(), "046".to_string())]),
+            status: AgentStatus::Idle,
+            focused: true,
+        };
+        let mut extra = AgentPane {
+            pane_id: "w5:pD".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::from([(HEADROOM_TOKEN.to_string(), "046".to_string())]),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        extra.focused = true;
+        extra.status = AgentStatus::Working;
+        let inventory = vec![focused.clone(), extra.clone()];
+        let nesting = vendor_nesting(&inventory, &inventory, &[]);
+        assert!(nesting.children.contains("w5:pD"));
+        assert!(nesting.heads.contains("w5:pA"));
+        assert!(
+            !nesting.heads.contains("w5:pD"),
+            "focus must not steal the shared vendor header"
+        );
+        assert!(!nesting.children.contains("w5:pA"));
+        let head = nesting.stack.get("w5:pA").expect("head");
+        let child = nesting.stack.get("w5:pD").expect("child");
+        assert!(head < child, "{head} should sort before {child}");
+        assert_eq!(&head[..5], &child[..5], "same vendor group prefix");
+        assert_eq!(
+            nesting.header_icon.get("w5:pA").copied(),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(
+            nesting.last_children.iter().collect::<Vec<_>>(),
+            vec!["w5:pD"]
+        );
+        let mut head_tokens = BTreeMap::new();
+        apply_pack_gap(&mut head_tokens, VendorRow::Head, &nesting, "w5:pA", true);
+        assert!(!head_tokens.contains_key(NEST_GAP_TOKEN));
+        let mut child_tokens = BTreeMap::new();
+        apply_pack_gap(&mut child_tokens, VendorRow::Child, &nesting, "w5:pD", true);
+        assert_eq!(
+            child_tokens.get(NEST_GAP_TOKEN).map(String::as_str),
+            Some(NEST_GAP_VALUE)
+        );
+        let mut flushed = BTreeMap::new();
+        apply_pack_gap(&mut flushed, VendorRow::Child, &nesting, "w5:pD", false);
+        assert!(!flushed.contains_key(NEST_GAP_TOKEN));
+    }
+
+    #[test]
+    fn claude_panes_in_one_space_do_not_nest() {
+        let panes = vec![
+            AgentPane {
+                pane_id: "w1:p1".to_string(),
+                workspace_id: "w1".to_string(),
+                cwd: String::new(),
+                title: String::new(),
+                harness: Harness::Claude,
+                session: None,
+                session_summary: String::new(),
+                topic: String::new(),
+                tokens: BTreeMap::new(),
+                status: AgentStatus::Idle,
+                focused: false,
+            },
+            AgentPane {
+                pane_id: "w1:p2".to_string(),
+                workspace_id: "w1".to_string(),
+                cwd: String::new(),
+                title: String::new(),
+                harness: Harness::Claude,
+                session: None,
+                session_summary: String::new(),
+                topic: String::new(),
+                tokens: BTreeMap::new(),
+                status: AgentStatus::Idle,
+                focused: false,
+            },
+        ];
+        let nesting = vendor_nesting(&panes, &panes, &[]);
+        assert!(nesting.heads.is_empty(), "{:?}", nesting.heads);
+        assert!(nesting.children.is_empty(), "{:?}", nesting.children);
+    }
+
+    #[test]
+    #[ignore = "fork: vendor nesting is off (shares_login_quota)"]
+    fn a_shared_vendor_header_stays_idle_when_a_session_completes() {
+        let head = AgentPane {
+            pane_id: "w5:pA".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Done,
+            focused: false,
+        };
+        let extra = AgentPane {
+            pane_id: "w5:pD".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        let inventory = vec![head.clone(), extra];
+        let nesting = vendor_nesting(&inventory, &inventory, &[]);
+        assert_eq!(
+            nesting.header_icon.get("w5:pA").copied(),
+            Some(AgentStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn wide_vendor_child_omits_provider_and_indents_model() {
+        let mut tokens = BTreeMap::new();
+        apply_identity(
+            &mut tokens,
+            &PaneIdentity {
+                provider: "Grok".to_string(),
+                model: "grok-4.6".to_string(),
+            },
+            30,
+            VendorRow::Child,
+        );
+        assert!(!tokens.contains_key("quota_provider"));
+        assert!(!tokens.contains_key("quota_provider_model"));
+        assert_eq!(
+            tokens.get("quota_model").map(String::as_str),
+            Some("grok-4.6")
+        );
+        let pane = AgentPane {
+            pane_id: "w5:pD".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        let heads = BTreeMap::from([("w5".to_string(), "w5:p1".to_string())]);
+        let mut desired = tokens.clone();
+        apply_group_and_icon(
+            &mut desired,
+            &pane,
+            &heads,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            VendorRow::Child,
+            None,
+        );
+        assert!(
+            !desired.contains_key("quota_icon")
+                && !desired.contains_key("quota_icon_working")
+                && !desired.contains_key("quota_icon_done"),
+            "child rows have no brand icon: {desired:?}"
+        );
+        assert_eq!(
+            desired.get("quota_model").map(String::as_str),
+            Some("grok-4.6"),
+            "fork: no member indent on a child model: {desired:?}"
+        );
+        assert!(!desired.contains_key("quota_provider_model"));
+    }
+
+    #[test]
+    fn wide_vendor_head_keeps_provider_and_quota_only() {
+        let mut tokens = BTreeMap::from([
+            ("quota_provider".to_string(), "Grok".to_string()),
+            (
+                "quota_provider_model".to_string(),
+                "Grok/grok-4.6".to_string(),
+            ),
+            ("quota_model".to_string(), "grok-4.6".to_string()),
+            ("quota_topic".to_string(), "hello".to_string()),
+            ("quota_context_normal".to_string(), "cx 10%".to_string()),
+            ("quota_week_normal".to_string(), "7d 46%".to_string()),
+        ]);
+        apply_identity(
+            &mut tokens,
+            &PaneIdentity {
+                provider: "Grok".to_string(),
+                model: "grok-4.6".to_string(),
+            },
+            30,
+            VendorRow::Head,
+        );
+        strip_vendor_head_session(&mut tokens);
+        assert_eq!(
+            tokens.get("quota_provider_model").map(String::as_str),
+            Some("Grok")
+        );
+        assert_eq!(
+            tokens.get("quota_model").map(String::as_str),
+            Some("grok-4.6")
+        );
+        assert_eq!(tokens.get("quota_topic").map(String::as_str), Some("hello"));
+        assert_eq!(
+            tokens.get("quota_context_normal").map(String::as_str),
+            Some("cx 10%")
+        );
+        assert_eq!(
+            tokens.get("quota_week_normal").map(String::as_str),
+            Some("7d 46%")
+        );
+    }
+
+    #[test]
+    fn narrow_vendor_child_does_not_add_a_second_indent() {
+        let pane = AgentPane {
+            pane_id: "w5:pD".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Grok,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        let heads = BTreeMap::from([("w5".to_string(), "w5:p1".to_string())]);
+        let mut desired = BTreeMap::new();
+        apply_group_and_icon(
+            &mut desired,
+            &pane,
+            &heads,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            VendorRow::Flat,
+            None,
+        );
+        // Fork: no member indent at all; `$quota_group_gap` keeps the row aligned.
+        assert_eq!(
+            desired.get("quota_icon").map(String::as_str),
+            Some(crate::icons::sidebar_mark(pane.harness).as_str()),
+            "{desired:?}"
+        );
     }
 
     /// A one-pane publish still knows the Space head from inventory, and the
@@ -2593,6 +3539,8 @@ mod tests {
         let head = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Codex,
             session: None,
             session_summary: String::new(),
@@ -2607,6 +3555,8 @@ mod tests {
         let sibling = AgentPane {
             pane_id: "w1:p2".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Grok,
             session: None,
             session_summary: String::new(),
@@ -2625,7 +3575,15 @@ mod tests {
         let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
         let tails = BTreeMap::new();
         let mut head_desired = BTreeMap::new();
-        apply_group_and_icon(&mut head_desired, &head, &heads, &tails, &labels);
+        apply_group_and_icon(
+            &mut head_desired,
+            &head,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
         assert_eq!(
             head_desired.get("quota_group").map(String::as_str),
             Some("ifs")
@@ -2636,7 +3594,15 @@ mod tests {
         );
 
         let mut sibling_desired = sibling.tokens.clone();
-        apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &tails, &labels);
+        apply_group_and_icon(
+            &mut sibling_desired,
+            &sibling,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
         assert!(!sibling_desired.contains_key("quota_group"));
         assert_eq!(
             sibling_desired.get(GROUP_GAP_TOKEN).map(String::as_str),
@@ -2681,43 +3647,99 @@ mod tests {
             "no head indent baked into the mark; Herdr hang-indents the row"
         );
 
-        // Brand icon colour follows agent_status: working publishes the
-        // yellow twin and clears idle/done so only one glyph shows.
+        // Brand icon colour follows agent_status on `$quota_icon` so a Space
+        // head does not hang-indent a later twin one cell to the right.
         let mut working = sibling.clone();
         working.status = AgentStatus::Working;
         let mut working_desired = BTreeMap::from([
             ("quota_icon".to_string(), "stale".to_string()),
             ("quota_icon_done".to_string(), "stale".to_string()),
         ]);
-        apply_group_and_icon(&mut working_desired, &working, &heads, &tails, &labels);
-        assert_eq!(
-            working_desired
-                .get("quota_icon_working")
-                .map(String::as_str),
-            Some(crate::icons::sidebar_mark(working.harness).as_str()),
-            "working panes publish the yellow brand icon"
+        apply_group_and_icon(
+            &mut working_desired,
+            &working,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
         );
-        assert!(!working_desired.contains_key("quota_icon"));
+        assert!(
+            working_desired.get("quota_icon").is_some_and(|icon| {
+                icon.starts_with(crate::icons::for_harness(working.harness))
+                    && icon.contains(crate::icons::WORKING_TAG)
+            }),
+            "working panes tag the brand icon: {:?}",
+            working_desired.get("quota_icon")
+        );
+        assert!(!working_desired.contains_key("quota_icon_working"));
         assert!(!working_desired.contains_key("quota_icon_done"));
 
         let mut done = sibling.clone();
         done.status = AgentStatus::Done;
         let mut done_desired = BTreeMap::new();
-        apply_group_and_icon(&mut done_desired, &done, &heads, &tails, &labels);
-        assert!(done_desired.contains_key("quota_icon_done"));
-        assert!(!done_desired.contains_key("quota_icon"));
+        apply_group_and_icon(
+            &mut done_desired,
+            &done,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
+        assert!(
+            done_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.contains(crate::icons::DONE_TAG)),
+            "done panes tag the brand icon: {:?}",
+            done_desired.get("quota_icon")
+        );
+        assert!(!done_desired.contains_key("quota_icon_done"));
         assert!(!done_desired.contains_key("quota_icon_working"));
+
+        let mut head_done = head.clone();
+        head_done.status = AgentStatus::Done;
+        let mut head_done_desired = BTreeMap::new();
+        apply_group_and_icon(
+            &mut head_done_desired,
+            &head_done,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
+        let want_head_done = format!(
+            "{}{}{}",
+            crate::icons::for_harness(Harness::Codex),
+            crate::icons::DONE_TAG,
+            crate::icons::SIDEBAR_RESERVE
+        );
+        assert_eq!(
+            head_done_desired.get("quota_icon").map(String::as_str),
+            Some(want_head_done.as_str()),
+            "Space-head done icon stays on the first identity token"
+        );
 
         // Merely being focused when a turn finishes does not acknowledge it.
         let mut seen = done.clone();
         seen.focused = true;
         let mut seen_desired = BTreeMap::new();
-        apply_group_and_icon(&mut seen_desired, &seen, &heads, &tails, &labels);
+        apply_group_and_icon(
+            &mut seen_desired,
+            &seen,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
         assert!(
-            seen_desired.contains_key("quota_icon_done"),
+            seen_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.contains(crate::icons::DONE_TAG)),
             "focused completion stays teal until the focus hook acknowledges it"
         );
-        assert!(!seen_desired.contains_key("quota_icon"));
 
         // Unfocused sibling finishing must keep teal — not follow the focused
         // pane's yellow→white shortcut.
@@ -2726,12 +3748,21 @@ mod tests {
         other.status = AgentStatus::Done;
         other.focused = false;
         let mut other_desired = BTreeMap::new();
-        apply_group_and_icon(&mut other_desired, &other, &heads, &tails, &labels);
+        apply_group_and_icon(
+            &mut other_desired,
+            &other,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
         assert!(
-            other_desired.contains_key("quota_icon_done"),
+            other_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.contains(crate::icons::DONE_TAG)),
             "unfocused completion keeps teal until that pane is focused"
         );
-        assert!(!other_desired.contains_key("quota_icon"));
 
         // Same-tab: refresh folds unseen into status=Done before publish.
         // A leftover done token on idle must not paint teal by itself —
@@ -2742,9 +3773,19 @@ mod tests {
             .tokens
             .insert("quota_icon_done".to_string(), "teal".to_string());
         let mut stale_desired = BTreeMap::new();
-        apply_group_and_icon(&mut stale_desired, &stale_token, &heads, &tails, &labels);
+        apply_group_and_icon(
+            &mut stale_desired,
+            &stale_token,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
         assert!(
-            stale_desired.contains_key("quota_icon"),
+            stale_desired.get("quota_icon").is_some_and(|icon| {
+                !icon.contains(crate::icons::DONE_TAG) && !icon.contains(crate::icons::WORKING_TAG)
+            }),
             "idle + leftover done token must not restore teal"
         );
         assert!(!stale_desired.contains_key("quota_icon_done"));
@@ -2758,6 +3799,8 @@ mod tests {
         let pane = |id: &str, status: AgentStatus, focused: bool| AgentPane {
             pane_id: id.to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Hermes,
             session: None,
             session_summary: String::new(),
@@ -2769,13 +3812,30 @@ mod tests {
         let heads = BTreeMap::from([("w1".to_string(), "w1:p1".to_string())]);
         let tails = BTreeMap::from([("w1".to_string(), "w1:p2".to_string())]);
         let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
-        let mark = crate::icons::sidebar_mark(Harness::Hermes);
         for id in ["w1:p1", "w1:p2"] {
             for status in [AgentStatus::Idle, AgentStatus::Working, AgentStatus::Done] {
+                let tag = match status {
+                    AgentStatus::Working => crate::icons::WORKING_TAG,
+                    AgentStatus::Done => crate::icons::DONE_TAG,
+                    _ => "",
+                };
+                let mark = format!(
+                    "{}{tag}{}",
+                    crate::icons::for_harness(Harness::Hermes),
+                    crate::icons::SIDEBAR_RESERVE
+                );
                 for focused in [false, true] {
                     let mut current = pane(id, status, focused);
                     let mut desired = BTreeMap::new();
-                    apply_group_and_icon(&mut desired, &current, &heads, &tails, &labels);
+                    apply_group_and_icon(
+                        &mut desired,
+                        &current,
+                        &heads,
+                        &tails,
+                        &labels,
+                        VendorRow::Flat,
+                        None,
+                    );
                     let icons = ICON_TOKEN_NAMES
                         .into_iter()
                         .filter_map(|name| desired.get(name))
@@ -2795,7 +3855,15 @@ mod tests {
                     // trim), so the next pass writes nothing.
                     current.tokens = desired.clone();
                     let mut again = current.tokens.clone();
-                    apply_group_and_icon(&mut again, &current, &heads, &tails, &labels);
+                    apply_group_and_icon(
+                        &mut again,
+                        &current,
+                        &heads,
+                        &tails,
+                        &labels,
+                        VendorRow::Flat,
+                        None,
+                    );
                     assert!(metadata_matches(&current.tokens, &again));
                     assert!(icon_tokens_match(&current.tokens, &again));
                 }
@@ -2809,7 +3877,15 @@ mod tests {
             crate::icons::for_harness(Harness::Hermes).to_string(),
         )]);
         let mut desired = old.tokens.clone();
-        apply_group_and_icon(&mut desired, &old, &heads, &tails, &labels);
+        apply_group_and_icon(
+            &mut desired,
+            &old,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
         assert!(!metadata_matches(&old.tokens, &desired));
         assert!(!icon_tokens_match(&old.tokens, &desired));
         let names = metadata_report_names(&old, &desired);
@@ -2824,6 +3900,8 @@ mod tests {
         AgentPane {
             pane_id: id.to_string(),
             workspace_id: workspace_id_from_pane_id(id).unwrap(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Codex,
             session: None,
             session_summary: String::new(),
@@ -2855,7 +3933,15 @@ mod tests {
         let labels = BTreeMap::new();
         let desired = |pane: &AgentPane, tails: &BTreeMap<String, String>| {
             let mut desired = pane.tokens.clone();
-            apply_group_and_icon(&mut desired, pane, &heads, tails, &labels);
+            apply_group_and_icon(
+                &mut desired,
+                pane,
+                &heads,
+                tails,
+                &labels,
+                VendorRow::Flat,
+                None,
+            );
             desired
         };
         let only = desired(&inventory[3], &tails);
@@ -2911,12 +3997,28 @@ mod tests {
         let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
         for pane in &mut inventory {
             let mut desired = pane.tokens.clone();
-            apply_group_and_icon(&mut desired, pane, &heads, &tails, &labels);
+            apply_group_and_icon(
+                &mut desired,
+                pane,
+                &heads,
+                &tails,
+                &labels,
+                VendorRow::Flat,
+                None,
+            );
             pane.tokens = desired;
         }
         for pane in &inventory {
             let mut again = pane.tokens.clone();
-            apply_group_and_icon(&mut again, pane, &heads, &tails, &labels);
+            apply_group_and_icon(
+                &mut again,
+                pane,
+                &heads,
+                &tails,
+                &labels,
+                VendorRow::Flat,
+                None,
+            );
             assert!(metadata_matches(&pane.tokens, &again), "{}", pane.pane_id);
         }
         assert!(
@@ -2954,7 +4056,15 @@ mod tests {
         .map(|name| (name.to_string(), "x".to_string()))
         .collect::<BTreeMap<_, _>>();
         let heads = BTreeMap::from([("w1".to_string(), "w1:p1".to_string())]);
-        apply_group_and_icon(&mut desired, &pane, &heads, &heads, &BTreeMap::new());
+        apply_group_and_icon(
+            &mut desired,
+            &pane,
+            &heads,
+            &heads,
+            &BTreeMap::new(),
+            VendorRow::Flat,
+            None,
+        );
         // Everything else already applied; only the 5h window moved.
         for (name, value) in &desired {
             pane.tokens.insert(name.clone(), value.clone());
@@ -3017,7 +4127,15 @@ mod tests {
         .into_iter()
         .map(|name| (name.to_string(), "x".to_string()))
         .collect::<BTreeMap<_, _>>();
-        apply_group_and_icon(&mut desired, &pane, &heads, &tails, &BTreeMap::new());
+        apply_group_and_icon(
+            &mut desired,
+            &pane,
+            &heads,
+            &tails,
+            &BTreeMap::new(),
+            VendorRow::Flat,
+            None,
+        );
         pane.tokens = desired.clone();
         pane.tokens
             .insert("quota_5h_normal".to_string(), "5h 41%".to_string());
@@ -3060,6 +4178,8 @@ mod tests {
                 AgentPane {
                     pane_id: "w1:p1".to_string(),
                     workspace_id: "w1".to_string(),
+                    cwd: String::new(),
+                    title: String::new(),
                     harness: Harness::Codex,
                     session: None,
                     session_summary: String::new(),
@@ -3071,6 +4191,8 @@ mod tests {
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
                     workspace_id: "w1".to_string(),
+                    cwd: String::new(),
+                    title: String::new(),
                     harness: Harness::Claude,
                     session: None,
                     session_summary: String::new(),
@@ -3082,6 +4204,8 @@ mod tests {
                 AgentPane {
                     pane_id: "w1:p4".to_string(),
                     workspace_id: "w1".to_string(),
+                    cwd: String::new(),
+                    title: String::new(),
                     harness: Harness::OpenCode,
                     session: None,
                     session_summary: String::new(),
@@ -3092,6 +4216,96 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The watcher republishes working panes from `list_agent_state`. Two
+    /// Firstmate Codex workers (hooks disabled, so Herdr reports no session)
+    /// kept the account-level model — the rollout Codex wrote last — because
+    /// only the refresh pass recovered their sessions. The inventory itself
+    /// must carry the recovered session so every publisher agrees.
+    #[test]
+    fn the_watch_inventory_renders_each_wrapped_codex_pane_with_its_own_model() {
+        let value = json!({"result": {"agents": [
+            {"pane_id": "w28:p2", "agent": "codex", "agent_status": "working",
+             "cwd": "/firstmate/projects/ralph-hermes",
+             "foreground_cwd": "/treehouse/ralph-hermes-86f4b1/1/ralph-hermes"},
+            {"pane_id": "w29:p2", "agent": "codex", "agent_status": "working",
+             "cwd": "/firstmate/projects/eaves-and-ember",
+             "foreground_cwd": "/treehouse/eaves-and-ember-717502/1/eaves-and-ember"},
+            {"pane_id": "w1:p1", "agent": "codex", "agent_status": "idle",
+             "cwd": "/project", "agent_session": {"kind": "id", "value": "hooked"}}
+        ]}});
+        let mut asked = Vec::new();
+        let state = agent_state_from(&value, |panes| {
+            attach_codex_sessions_with(
+                panes,
+                |pane_id| match pane_id {
+                    "w28:p2" => Some(1_790_098_615),
+                    "w29:p2" => Some(1_790_098_627),
+                    _ => panic!("a pane Herdr already identified is never inspected"),
+                },
+                |candidates| {
+                    asked = candidates.to_vec();
+                    BTreeMap::from([
+                        ("w28:p2".to_string(), "hermes-live".to_string()),
+                        ("w29:p2".to_string(), "ember-live".to_string()),
+                    ])
+                },
+            )
+        });
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    "w28:p2".to_string(),
+                    "/treehouse/ralph-hermes-86f4b1/1/ralph-hermes".to_string(),
+                    1_790_098_615
+                ),
+                (
+                    "w29:p2".to_string(),
+                    "/treehouse/eaves-and-ember-717502/1/eaves-and-ember".to_string(),
+                    1_790_098_627
+                ),
+            ]
+        );
+        assert_eq!(state.working_pane_ids, vec!["w28:p2", "w29:p2"]);
+
+        let mut snapshot = ProviderSnapshot::new(Provider::Codex, Vec::new(), 0);
+        // The newest rollout on the account belongs to another session.
+        snapshot.model = Some("gpt-5.6-terra".to_string());
+        for id in ["hermes-live", "ember-live", "hooked"] {
+            snapshot
+                .session_models
+                .insert(id.to_string(), "gpt-6-astra".to_string());
+        }
+        for pane in &state.panes {
+            let session = pane.session.as_ref().and_then(AgentSession::id);
+            let values = MetadataTokens::from_snapshot_for_pane(
+                &snapshot,
+                0,
+                session,
+                PercentStyle::default(),
+                SidebarShape::default(),
+            );
+            assert_eq!(
+                values.quota_provider_model, "Codex/gpt-6-astra",
+                "{}",
+                pane.pane_id
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_cwd_is_preferred_for_a_wrapped_agent_process() {
+        let value = json!({"result": {"agents": [{
+            "pane_id": "w1:p1",
+            "agent": "codex",
+            "cwd": "/project",
+            "foreground_cwd": "/treehouse/project"
+        }]}});
+        let mut panes = Vec::new();
+        collect_agent_panes(&value, &mut panes);
+        assert_eq!(panes[0].cwd, "/treehouse/project");
     }
 
     /// Herdr reports at most 16 metadata tokens per pane. A snapshot that
@@ -3289,6 +4503,8 @@ mod tests {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
@@ -3338,6 +4554,8 @@ mod tests {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Grok,
             session: None,
             session_summary: String::new(),
@@ -3387,6 +4605,8 @@ mod tests {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
@@ -3667,6 +4887,8 @@ mod tests {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
@@ -3739,6 +4961,8 @@ mod tests {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Claude,
             session: None,
             session_summary: String::new(),
@@ -3810,7 +5034,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_five_hour_window_folds_week_onto_context() {
+    fn a_missing_five_hour_window_without_context_keeps_week_on_the_limits_row() {
         let snapshot = crate::model::ProviderSnapshot::new(
             Provider::Claude,
             vec![crate::model::UsageWindow::new(
@@ -3829,8 +5053,8 @@ mod tests {
         assert!(!desired.contains_key("quota_5h_unknown"));
         assert!(!desired.contains_key("quota_5h_normal"));
         assert!(!desired.contains_key("quota_5h_label"));
-        assert!(desired.contains_key("quota_week_inline_normal"));
-        assert!(!desired.contains_key("quota_week_normal"));
+        assert!(desired.contains_key("quota_week_normal"));
+        assert!(!desired.contains_key("quota_week_inline_normal"));
     }
 
     /// A scoped weekly cap is legitimately absent most of the time — not
@@ -3901,7 +5125,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_five_hour_publishes_week_beside_context() {
+    fn empty_five_hour_without_context_keeps_week_on_the_limits_row() {
         let snapshot = crate::model::ProviderSnapshot::new(
             Provider::Codex,
             vec![crate::model::UsageWindow::new(
@@ -3919,9 +5143,8 @@ mod tests {
         );
         assert!(!desired.contains_key("quota_5h_normal"));
         assert!(!desired.contains_key("quota_5h_label"));
-        assert!(desired.contains_key("quota_week_inline_normal"));
-        assert!(!desired.contains_key("quota_week_inline_label"));
-        assert!(!desired.contains_key("quota_week_normal"));
+        assert!(desired.contains_key("quota_week_normal"));
+        assert!(!desired.contains_key("quota_week_inline_normal"));
     }
 
     #[test]
@@ -3977,7 +5200,8 @@ mod tests {
             )
             .unwrap()],
             0,
-        );
+        )
+        .with_context(Some(crate::model::ContextUsage::new(42.0).unwrap()));
         let desired = desired_tokens(
             &MetadataTokens::from_snapshot(&snapshot, 0),
             "prompt",
@@ -3989,6 +5213,8 @@ mod tests {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Grok,
             session: None,
             session_summary: String::new(),
@@ -4035,6 +5261,8 @@ mod tests {
         let pane = AgentPane {
             pane_id: "w1:p1".to_string(),
             workspace_id: "w1".to_string(),
+            cwd: String::new(),
+            title: String::new(),
             harness: Harness::Codex,
             session: None,
             session_summary: String::new(),
@@ -4048,6 +5276,87 @@ mod tests {
         assert!(names.contains(&"quota_week_inline_normal"));
         assert!(names.contains(&"quota_week_normal"));
         assert!(names.len() <= MAX_METADATA_TOKENS);
+    }
+
+    #[test]
+    fn a_narrow_sidebar_with_a_known_model_keeps_headroom() {
+        let mut tokens = BTreeMap::from([
+            ("quota_provider".to_string(), "Grok".to_string()),
+            (HEADROOM_TOKEN.to_string(), "086".to_string()),
+        ]);
+        apply_identity(
+            &mut tokens,
+            &PaneIdentity {
+                provider: "Grok".to_string(),
+                model: "grok-4.6".to_string(),
+            },
+            18,
+            VendorRow::Flat,
+        );
+        assert!(!tokens.contains_key("quota_provider"));
+        assert_eq!(tokens.get(HEADROOM_TOKEN).map(String::as_str), Some("086"));
+    }
+
+    #[test]
+    fn stripping_account_quota_keeps_session_fields() {
+        let mut tokens = BTreeMap::from([
+            ("quota_provider".to_string(), "Grok".to_string()),
+            (
+                "quota_provider_model".to_string(),
+                "Grok/grok-4.6".to_string(),
+            ),
+            ("quota_model".to_string(), "grok-4.6".to_string()),
+            ("quota_week_inline_normal".to_string(), "7d 87%".to_string()),
+            (
+                "quota_share_week_inline_normal".to_string(),
+                "7d 87%".to_string(),
+            ),
+            ("quota_context".to_string(), "cx 79%".to_string()),
+            (HEADROOM_TOKEN.to_string(), "087".to_string()),
+        ]);
+        strip_account_quota_tokens(&mut tokens);
+        assert!(!tokens.contains_key("quota_week_inline_normal"));
+        assert!(!tokens.contains_key("quota_share_week_inline_normal"));
+        assert_eq!(
+            tokens.get("quota_provider").map(String::as_str),
+            Some("Grok")
+        );
+        assert_eq!(tokens.get(HEADROOM_TOKEN).map(String::as_str), Some("087"));
+        assert_eq!(
+            tokens.get("quota_model").map(String::as_str),
+            Some("grok-4.6")
+        );
+        assert_eq!(
+            tokens.get("quota_provider_model").map(String::as_str),
+            Some("Grok/grok-4.6")
+        );
+    }
+
+    #[test]
+    fn nested_share_windows_match_the_snapshot_without_drift() {
+        let snapshot = crate::model::ProviderSnapshot::new(
+            Provider::Grok,
+            vec![crate::model::UsageWindow::new(
+                crate::model::WindowKind::Weekly,
+                25.0,
+                Some(crate::model::ResetAt::from_unix_seconds(183_600)),
+            )
+            .unwrap()],
+            0,
+        )
+        .with_context(Some(crate::model::ContextUsage::new(42.0).unwrap()));
+        let values = MetadataTokens::from_snapshot(&snapshot, 0);
+        let shape = SidebarShape::default();
+        let mut current = desired_tokens(&values, "", shape);
+        promote_shared_quota(&mut current);
+        assert!(
+            current.keys().any(|name| name.starts_with("quota_share_")),
+            "{current:?}"
+        );
+        assert!(
+            !quota_rows_have_drifted(&current, &values, shape),
+            "share tokens must compare equal to the snapshot's quota_* windows"
+        );
     }
 
     #[test]
@@ -4074,6 +5383,18 @@ mod tests {
         assert_eq!(
             extract_topic(text, Harness::Grok).as_deref(),
             Some("/goal 你在 ti 工作区接手 L7")
+        );
+    }
+
+    #[test]
+    fn grok_build_help_rows_are_not_topics() {
+        assert_eq!(extract_topic("❯ /login\n", Harness::Grok), None);
+        assert_eq!(
+            extract_topic(
+                "❯ /login                         Log in or re-authenticate with your account\n",
+                Harness::Grok
+            ),
+            None
         );
     }
 

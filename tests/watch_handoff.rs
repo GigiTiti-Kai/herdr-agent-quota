@@ -41,7 +41,7 @@ printf '%s\n' '{"result":{"agents":[]}}'
     let log = dir.path().join("calls");
     let socket = dir.path().join("current.sock");
     let command = || {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"));
         cmd.env("HERDR_PLUGIN_STATE_DIR", dir.path())
             .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
             .env("HERDR_AGENT_QUOTA_AGENT_ORDER", "default")
@@ -104,7 +104,7 @@ fn every_supported_working_harness_keeps_the_watcher_alive() {
         let herdr = dir.path().join("herdr");
         fs::write(&herdr, format!("#!/bin/sh\ntouch \"$TEST_INVENTORY\"\nprintf '%s\\n' '{{\"result\":{{\"agents\":[{{\"pane_id\":\"w1:p1\",\"agent\":\"{harness}\",\"agent_status\":\"working\"}}]}}}}'\n")).unwrap();
         fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
             .args(["watch", "--provider", "all"])
             .env("HERDR_PLUGIN_STATE_DIR", dir.path())
             .env("HERDR_BIN_PATH", herdr)
@@ -154,7 +154,7 @@ printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","agent":"codex","agent_st
     .unwrap();
     fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
     let command = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"));
         command
             .env("HERDR_PLUGIN_STATE_DIR", dir.path())
             .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())

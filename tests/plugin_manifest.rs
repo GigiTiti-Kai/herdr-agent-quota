@@ -105,13 +105,9 @@ fn the_agent_view_source_matches_the_manifest_id() {
         .expect("the manifest declares an id")
         .trim()
         .trim_matches('"');
-    assert_eq!(id, "herdr-agent-quota");
-    let source = include_str!("../src/herdr.rs")
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("const AGENT_VIEW_SOURCE: &str = "))
-        .expect("the plugin declares an agent view source")
-        .trim()
-        .trim_end_matches(';')
-        .trim_matches('"');
-    assert_eq!(source, format!("plugin:{id}"));
+    assert_eq!(id, herdr_agent_quota::identity::PLUGIN_ID);
+    assert_eq!(
+        herdr_agent_quota::identity::agent_view_source(),
+        format!("plugin:{id}")
+    );
 }
