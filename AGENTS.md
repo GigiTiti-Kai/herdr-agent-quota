@@ -265,6 +265,17 @@ identity evidence is the session's row in `<hermes home>/state.db`
 `billing_provider`, `model_config`, `title`. Never read `messages`, and never
 open `auth.json`. `billing_mode` is not a key — one provider carries several.
 
+The cache row reads the same database's `session_model_usage`, and only the
+numeric `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, and
+`last_seen` of the newest main-loop row (`task = ''`) for the session's
+current model and provider. Auxiliary tasks (compression, titles, approval)
+are other rows. The ratio is that route's cumulative total, so it barely moves
+per turn; per-request counts live only in `messages`. `ttl≈` is Codex's
+30-minute estimate from `last_seen`, for `openai-codex` only, and none when
+`last_seen` is in the future. It is session evidence, not account quota: it
+shows with or without a bridge reading, and a Hermes without the table shows
+no cache. There is no context row.
+
 That row names a provider, not an account. Hermes keeps the serving credential
 in memory and can rotate between pooled credentials mid-session; nothing on
 disk identifies it, and `hermes usage` reports the credential a *new* session

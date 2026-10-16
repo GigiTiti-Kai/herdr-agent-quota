@@ -192,7 +192,7 @@ Installer options are also available through `./install.sh --help`.
 | OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
 | Pi | Canonical Codex quota | Only when the recorded account matches |
 | OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
-| Hermes Agent | A bridge plugin inside Hermes | ChatGPT/Codex sessions of the default profile only: the running session reports the limits of the key it holds. Other providers show provider, model, and topic without quota |
+| Hermes Agent | A bridge plugin inside Hermes | ChatGPT/Codex sessions of the default profile only: the running session reports the limits of the key it holds. Other providers show provider, model, and topic without quota. Every session also shows its cache ratio from `state.db`, with Codex's `ttl≈` estimate on ChatGPT/Codex |
 
 The Claude Code status line keeps the user's own statusLine output and appends
 a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
