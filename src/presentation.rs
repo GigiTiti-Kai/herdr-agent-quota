@@ -1,4 +1,4 @@
-use crate::cli::{FieldSet, PercentStyle, SidebarField, SidebarLayout, SummaryFormat};
+use crate::cli::{FieldSet, IconSize, PercentStyle, SidebarField, SidebarLayout, SummaryFormat};
 use crate::model::{
     format_percent, live_windows, printed_percent, window_in, Harness, Provider, ProviderSnapshot,
     ResetAt, Severity, UsageWindow, WindowKind,
@@ -75,6 +75,9 @@ pub struct RowStyle {
     pub shape: SidebarShape,
     pub fields: FieldSet,
     pub summary: SummaryFormat,
+    /// How large the terminal draws the vendor marks: a lines footer keeps
+    /// [`IconSize::mark_clearance_rows`] blank rows around the Hermes badge.
+    pub icon_size: IconSize,
 }
 
 impl RowStyle {
@@ -84,6 +87,7 @@ impl RowStyle {
             shape,
             fields: FieldSet::all(),
             summary: SummaryFormat::Off,
+            icon_size: IconSize::default(),
         }
     }
 }
@@ -106,7 +110,8 @@ impl AccountFamily {
     ];
 
     /// Footer rows that can carry the Hermes badge
-    /// (`quota_acct_<id>_hermes`, `_hermes_gap` in lines mode): rows whose login a live Hermes session
+    /// (`quota_acct_<id>_hermes`, `_hermes_l<line>` in lines mode, see
+    /// [`hermes_badge_tokens`]): rows whose login a live Hermes session
     /// can be proven to share. Claude: the row's windows come from the token
     /// in Claude Code's credentials file, and the bridge stamps that file's
     /// path once it saw the Hermes session's key equal that token. Codex: its
@@ -151,10 +156,14 @@ pub struct AccountSummary {
     pub reset: String,
     /// Lines mode: a blank line closes the provider block.
     pub gap: bool,
-    /// The Hermes badge (published under [`hermes_badge_token`]): live Hermes
+    /// The Hermes badge (published by [`hermes_badge_tokens`]): live Hermes
     /// sessions are proven to bill this row's account as the same user. Only
     /// a workspace row carries it; a one-row format only when it fits.
     pub hermes_badge: Option<String>,
+    /// Lines mode: blank rows kept between the badge and the marks above and
+    /// below it ([`IconSize::mark_clearance_rows`]), which also fixes the
+    /// badge's line ([`hermes_badge_lines`]).
+    pub hermes_clearance: usize,
     /// For a Hermes pane's own row: the family whose row shows this same
     /// billing account. When that row carries the Hermes badge on the
     /// workspace, this row is a duplicate and the pane does not publish it.
@@ -484,12 +493,13 @@ fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
 /// the most-used live window's, shortened to fit [`SUMMARY_ROW_WIDTH`].
 ///
 /// A Hermes badge for `badge` live sessions goes where the format has room
-/// for it. Lines mode: the icon column under the provider mark, on line 2
-/// (which then drops the pad the badge stands in for) or on the blank line
-/// closing a one-window block, so nothing on the right moves. The one-row
-/// formats: last on the row, after Herdr's join space; their ETA is shortened
-/// to make room, and a badge that would not fit even then is left off rather
-/// than pushing the row past the footer width.
+/// for it. Lines mode: the icon column under the provider mark, with blank
+/// rows above and below it for the terminal's enlarged marks
+/// ([`hermes_badge_lines`]); a window on the badge's line drops the pad the
+/// badge stands in for, so nothing on the right moves. The one-row formats:
+/// last on the row, after Herdr's join space; their ETA is shortened to make
+/// room, and a badge that would not fit even then is left off rather than
+/// pushing the row past the footer width.
 fn account_summary(
     family: AccountFamily,
     windows: &[UsageWindow],
@@ -518,13 +528,16 @@ fn account_summary(
     let badge = badge
         .filter(|_| !shown.is_empty())
         .map(|sessions| hermes_badge(sessions, lines_icon(family.icon).chars().count()));
+    let clearance = row.icon_size.mark_clearance_rows();
+    let (badge_line, _) = hermes_badge_lines(clearance);
     let segments: Vec<AccountSegment> = shown
         .iter()
         .enumerate()
         .map(|(index, window)| {
             if lines {
-                // Line 2's pad is the icon column the badge fills.
-                let padded = index > 0 && !(index == 1 && badge.is_some());
+                // Lines 2 and 3 start under line 1's text, unless the badge
+                // fills that line's icon column instead of the pad.
+                let padded = index > 0 && !(badge.is_some() && index + 1 == badge_line);
                 line_segment(window, family.icon, now_unix, row, padded)
             } else {
                 summary_segment(window, now_unix, row.percent, cells)
@@ -569,6 +582,7 @@ fn account_summary(
         reset,
         gap: lines,
         hermes_badge,
+        hermes_clearance: clearance,
         same_account_as: None,
     }
 }
@@ -598,18 +612,54 @@ pub(crate) fn hermes_badge(sessions: usize, width: usize) -> String {
     badge
 }
 
-/// Where the Hermes badge of `account` is published: lines mode puts it in
-/// the icon column under the provider mark, on line 2 (`quota_acct_<id>_hermes`)
-/// or, for a one-window block, on the blank line that closes it
-/// (`quota_acct_<id>_hermes_gap`); the one-row formats end the row with
-/// `quota_acct_<id>_hermes`.
-pub(crate) fn hermes_badge_token(account: &AccountSummary) -> String {
+/// Lines mode: where a Hermes badge goes in an account block whose marks
+/// need `clearance` blank rows between them. Line 1 carries the provider
+/// mark; the badge sits `clearance` lines below it, and `clearance` blank
+/// rows part it from the next account's mark: the gap row closing the block
+/// is one, the rest are lines of the block. Returns the badge's line and the
+/// block's last line before its gap row.
+pub(crate) fn hermes_badge_lines(clearance: usize) -> (usize, usize) {
+    let badge = clearance + 2;
+    (badge, badge + clearance.saturating_sub(1))
+}
+
+/// Lines a badged block can use before its gap row, over every icon size:
+/// the footer `configure` writes has a `quota_acct_<id>_hermes_l<line>`
+/// slot on each of lines 2 to this one (never fewer than the three window
+/// lines), so changing the icon size moves the badge without a new footer.
+pub(crate) fn hermes_block_lines() -> usize {
+    IconSize::CHOICES
+        .into_iter()
+        .map(|size| hermes_badge_lines(size.mark_clearance_rows()).1)
+        .fold(3, usize::max)
+}
+
+/// The tokens that draw the Hermes badge of `account`, or none without one.
+/// The one-row formats end the row with `quota_acct_<id>_hermes`. Lines mode
+/// puts the badge in the icon column, on `quota_acct_<id>_hermes_l<line>`
+/// ([`hermes_badge_lines`]), and a U+2800 on each other line of the badged
+/// block that has no window, so those lines are drawn blank instead of being
+/// dropped by Herdr (a footer row whose tokens all are absent is not drawn).
+/// A line with a window is already blank in the icon column: its pad.
+pub(crate) fn hermes_badge_tokens(account: &AccountSummary) -> Vec<(String, String)> {
     let id = account.family.id;
-    if account.gap && account.segments.len() < 2 {
-        format!("quota_acct_{id}_hermes_gap")
-    } else {
-        format!("quota_acct_{id}_hermes")
+    let Some(badge) = &account.hermes_badge else {
+        return Vec::new();
+    };
+    if !account.gap {
+        return vec![(format!("quota_acct_{id}_hermes"), badge.clone())];
     }
+    let (badge_line, last_line) = hermes_badge_lines(account.hermes_clearance);
+    (2..=last_line)
+        .filter_map(|line| {
+            let name = format!("quota_acct_{id}_hermes_l{line}");
+            if line == badge_line {
+                Some((name, badge.clone()))
+            } else {
+                (line > account.segments.len()).then(|| (name, "\u{2800}".to_string()))
+            }
+        })
+        .collect()
 }
 
 /// The footer row of `snapshot`'s account as a workspace publishes it,
@@ -653,7 +703,7 @@ pub(crate) fn lines_pad(icon: &str) -> String {
 
 /// One lines-mode footer row: the gauge text with its own reset, `padded`
 /// to start under line 1's text (lines 2 and 3, unless a Hermes badge fills
-/// line 2's icon column). The ETA is shortened so the row never passes the
+/// that line's icon column). The ETA is shortened so the row never passes the
 /// footer width.
 fn line_segment(
     window: &UsageWindow,
@@ -1385,68 +1435,180 @@ mod tests {
         assert_eq!(hermes_badge(42, 5), format!("{mark} 9+\u{2800}"));
     }
 
-    /// Lines mode: the badge takes line 2's icon column (the pad it replaces
-    /// is exactly as wide as the badge plus Herdr's join space), or the blank
-    /// line of a one-window block. Line 1 and every line's text keep their
-    /// cells, and the block keeps its number of lines.
+    /// What a lines footer draws for one account block, line by line, the way
+    /// `configure` lays it out: line 1 is the mark and window 1; every later
+    /// line starts with its `_hermes_l<line>` slot, then window `<line>` (up
+    /// to 3); the gap row closes the block. Herdr joins a row's tokens with
+    /// one space and draws no row whose tokens all are absent.
+    fn drawn_lines_block(account: &AccountSummary) -> Vec<String> {
+        let id = account.family.id;
+        let hermes: std::collections::BTreeMap<String, String> =
+            hermes_badge_tokens(account).into_iter().collect();
+        let mut drawn: Vec<String> = (1..=hermes_block_lines())
+            .map(|line| {
+                let mut row = Vec::new();
+                if line == 1 {
+                    row.push(lines_icon(account.family.icon));
+                } else if let Some(value) = hermes.get(&format!("quota_acct_{id}_hermes_l{line}")) {
+                    row.push(value.clone());
+                }
+                if let Some(segment) = account.segments.get(line - 1) {
+                    row.push(segment.text.clone());
+                }
+                row.join(" ")
+            })
+            .filter(|row| !row.is_empty())
+            .collect();
+        drawn.push("\u{2800}".to_string());
+        drawn
+    }
+
+    /// Lines mode keeps `clearance` rows with a blank icon column between the
+    /// provider mark and the badge, and as many between the badge and the
+    /// next account's mark (the gap row is one of them). A window on the
+    /// badge's line gives up its pad (exactly as wide as the badge plus
+    /// Herdr's join space); a block with fewer windows gets blank lines that
+    /// only a badged block draws. Every window's text keeps its cells, and
+    /// without a badge the block is drawn exactly as before.
     #[test]
-    fn lines_mode_puts_the_badge_under_the_mark_and_moves_nothing() {
+    fn lines_mode_parts_the_badge_from_both_marks_at_every_icon_size() {
+        let hermes = crate::icons::for_harness(Harness::Hermes);
         let one_window = ProviderSnapshot::new(
             Provider::Codex,
             vec![window(WindowKind::Weekly, 8.0, 5 * 86_400 + 23 * 3_600)],
             0,
         );
-        for snapshot in [codex_two_windows(), spec_claude(), one_window] {
-            for width in [26, 42, 80] {
-                let row = RowStyle {
-                    shape: SidebarShape::new(SidebarLayout::Gauges, width),
-                    ..summary_style(SummaryFormat::Lines)
-                };
-                let plain =
-                    MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, 0, None, row)
-                        .account
-                        .unwrap();
-                assert_eq!(plain.hermes_badge, None);
-                let icon = plain.family.icon;
-                let id = plain.family.id;
-                for sessions in [1, 2, 12] {
-                    let badged = hermes_badged_account(&snapshot, 0, row, sessions).unwrap();
-                    let badge = badged.hermes_badge.clone().expect("always room");
-                    assert_eq!(
-                        badge,
-                        hermes_badge(sessions, lines_icon(icon).chars().count())
-                    );
-                    assert_eq!(badge.chars().count() + 1, lines_pad(icon).chars().count());
-                    assert_eq!(badged.segments.len(), plain.segments.len());
-                    assert_eq!(badged.segments[0], plain.segments[0], "line 1 unchanged");
-                    assert!(badged.reset.is_empty() && badged.gap);
-                    if plain.segments.len() >= 2 {
+        let blank_column = |line: &str| line.starts_with('\u{2800}');
+        for size in IconSize::CHOICES {
+            let clearance = size.mark_clearance_rows();
+            let (badge_line, last_line) = hermes_badge_lines(clearance);
+            assert!(last_line <= hermes_block_lines(), "{size:?}");
+            for snapshot in [spec_claude(), codex_two_windows(), one_window.clone()] {
+                for width in [26, 42, 80] {
+                    let row = RowStyle {
+                        shape: SidebarShape::new(SidebarLayout::Gauges, width),
+                        icon_size: size,
+                        ..summary_style(SummaryFormat::Lines)
+                    };
+                    let plain =
+                        MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, 0, None, row)
+                            .account
+                            .unwrap();
+                    assert_eq!(plain.hermes_badge, None);
+                    assert!(hermes_badge_tokens(&plain).is_empty());
+                    let icon = plain.family.icon;
+                    let id = plain.family.id;
+                    // Without a badge: the mark, one line per window, the gap.
+                    let unbadged = drawn_lines_block(&plain);
+                    assert_eq!(unbadged.len(), plain.segments.len() + 1, "{id}");
+                    for sessions in [1, 2, 12] {
+                        let badged = hermes_badged_account(&snapshot, 0, row, sessions).unwrap();
+                        let badge = badged.hermes_badge.clone().expect("always room");
                         assert_eq!(
-                            hermes_badge_token(&badged),
-                            format!("quota_acct_{id}_hermes")
+                            badge,
+                            hermes_badge(sessions, lines_icon(icon).chars().count())
                         );
-                        let drawn = format!("{badge} {}", badged.segments[1].text);
-                        assert_eq!(
-                            drawn.chars().count(),
-                            plain.segments[1].text.chars().count()
+                        assert_eq!(badge.chars().count() + 1, lines_pad(icon).chars().count());
+                        assert!(badged.reset.is_empty() && badged.gap);
+                        assert_eq!(badged.segments.len(), plain.segments.len());
+                        let drawn = drawn_lines_block(&badged);
+                        let at = drawn
+                            .iter()
+                            .position(|line| line.starts_with(hermes))
+                            .unwrap_or_else(|| panic!("{size:?} {id}: {drawn:?}"));
+                        assert_eq!(at + 1, badge_line, "{size:?} {id}: {drawn:?}");
+                        assert!(drawn[0].starts_with(icon));
+                        // Above: only blank icon columns between the marks.
+                        assert!(drawn[1..at].iter().all(|line| blank_column(line)));
+                        assert_eq!(at - 1, clearance, "{size:?} {id}: {drawn:?}");
+                        // Below: at least as many before the next account.
+                        assert!(drawn[at + 1..].iter().all(|line| blank_column(line)));
+                        assert!(
+                            drawn[at + 1..].len() >= clearance,
+                            "{size:?} {id}: {drawn:?}"
                         );
-                        assert_eq!(
-                            plain.segments[1].text.strip_prefix(&lines_pad(icon)),
-                            Some(badged.segments[1].text.as_str()),
-                            "{width} {sessions}"
-                        );
-                        assert_eq!(badged.segments[1].severity, plain.segments[1].severity);
-                        assert_eq!(badged.segments[2..], plain.segments[2..]);
-                    } else {
-                        assert_eq!(
-                            hermes_badge_token(&badged),
-                            format!("quota_acct_{id}_hermes_gap")
-                        );
-                        assert_eq!(badged.segments, plain.segments);
+                        // Every window line keeps its cells; only the one
+                        // the badge sits on trades its pad for the badge.
+                        for (index, (badged, plain)) in
+                            badged.segments.iter().zip(&plain.segments).enumerate()
+                        {
+                            assert_eq!(badged.severity, plain.severity);
+                            if index + 1 == badge_line {
+                                assert_eq!(
+                                    plain.text.strip_prefix(&lines_pad(icon)),
+                                    Some(badged.text.as_str()),
+                                    "{width} {sessions}"
+                                );
+                                assert_eq!(
+                                    drawn[index].chars().count(),
+                                    unbadged[index].chars().count()
+                                );
+                            } else {
+                                assert_eq!(badged, plain, "{size:?} {id} line {}", index + 1);
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// The badge's line and the blank lines around it follow the clearance:
+    /// one row (every preset today) puts it on line 3, and a block with one
+    /// window draws line 2 blank; a larger clearance pushes it further down
+    /// and adds blank lines below it too, ahead of the gap row.
+    #[test]
+    fn the_badge_lines_follow_the_clearance() {
+        assert_eq!(hermes_badge_lines(0), (2, 2));
+        assert_eq!(hermes_badge_lines(1), (3, 3));
+        assert_eq!(hermes_badge_lines(2), (4, 5));
+        assert_eq!(hermes_block_lines(), 3);
+        let mark = crate::icons::for_harness(Harness::Hermes);
+        let one_window = ProviderSnapshot::new(
+            Provider::Codex,
+            vec![window(WindowKind::Weekly, 8.0, 5 * 86_400 + 23 * 3_600)],
+            0,
+        );
+        let mut account =
+            hermes_badged_account(&one_window, 0, summary_style(SummaryFormat::Lines), 1).unwrap();
+        let badge = format!("{mark}  \u{2800}");
+        let named = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            hermes_badge_tokens(&account),
+            named(&[
+                ("quota_acct_cx_hermes_l2", "\u{2800}"),
+                ("quota_acct_cx_hermes_l3", &badge),
+            ])
+        );
+        account.hermes_clearance = 2;
+        assert_eq!(
+            hermes_badge_tokens(&account),
+            named(&[
+                ("quota_acct_cx_hermes_l2", "\u{2800}"),
+                ("quota_acct_cx_hermes_l3", "\u{2800}"),
+                ("quota_acct_cx_hermes_l4", &badge),
+                ("quota_acct_cx_hermes_l5", "\u{2800}"),
+            ])
+        );
+        let claude =
+            hermes_badged_account(&spec_claude(), 0, summary_style(SummaryFormat::Lines), 3)
+                .unwrap();
+        assert_eq!(
+            hermes_badge_tokens(&claude),
+            named(&[("quota_acct_cl_hermes_l3", &hermes_badge(3, 4))])
+        );
+        let compact =
+            hermes_badged_account(&spec_claude(), 0, summary_style(SummaryFormat::Compact), 3)
+                .unwrap();
+        assert_eq!(
+            hermes_badge_tokens(&compact),
+            named(&[("quota_acct_cl_hermes", &hermes_badge(3, 4))])
+        );
     }
 
     /// The one-row formats end the row with the badge, after Herdr's join
@@ -1474,7 +1636,10 @@ mod tests {
                     let badged = hermes_badged_account(&snapshot, 0, row, sessions).unwrap();
                     let badge = badged.hermes_badge.clone().expect("room for the badge");
                     assert_eq!(badge, hermes_badge(sessions, 4));
-                    assert_eq!(hermes_badge_token(&badged), "quota_acct_cx_hermes");
+                    assert_eq!(
+                        hermes_badge_tokens(&badged),
+                        [("quota_acct_cx_hermes".to_string(), badge.clone())]
+                    );
                     let cells = badge.chars().count() + 1;
                     let line = footer_line(&badged);
                     assert!(

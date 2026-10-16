@@ -1,6 +1,6 @@
 use crate::cli::{
-    AgentOrder, BrandColors, FieldSet, LowQuotaAlert, PercentStyle, SidebarLayout, SidebarRowGap,
-    SummaryFormat,
+    AgentOrder, BrandColors, FieldSet, IconSize, LowQuotaAlert, PercentStyle, SidebarLayout,
+    SidebarRowGap, SummaryFormat,
 };
 use crate::model::{
     merge_omitted_window_list, window_in, BillingTarget, ContextUsage, Provider, ProviderSnapshot,
@@ -28,6 +28,7 @@ const BRAND_COLORS_FILE: &str = "brand-colors";
 const AGENT_ORDER_FILE: &str = "agent-order";
 const LOW_QUOTA_ALERT_FILE: &str = "low-quota-alert";
 const ACCOUNT_SUMMARY_FILE: &str = "account-summary";
+const ICON_SIZE_FILE: &str = "icon-size";
 /// One line per provider that is currently below the alert threshold, so a
 /// crossing notifies once instead of on every refresh.
 const LOW_QUOTA_ALERTED_FILE: &str = "low-quota-alerted";
@@ -682,6 +683,32 @@ impl CacheStore {
         }
     }
 
+    /// The icon size a lines footer spaces its marks for
+    /// ([`IconSize::mark_clearance_rows`]). The `icon-size` preference stays
+    /// the choice itself; this copy exists for the same reason as
+    /// [`Self::percent_style`]: the statusLine hooks and `hermes-notify` see
+    /// only `HERDR_PLUGIN_STATE_DIR`, and every publish path must space the
+    /// footer alike or the tokens would flip between passes.
+    pub fn icon_size(&self) -> Option<IconSize> {
+        fs::read_to_string(self.icon_size_path())
+            .ok()
+            .as_deref()
+            .and_then(IconSize::parse)
+    }
+
+    pub fn set_icon_size(&self, size: IconSize) -> Result<()> {
+        self.ensure()?;
+        fs::write(self.icon_size_path(), size.as_str()).context("write icon size")
+    }
+
+    pub fn clear_icon_size(&self) -> Result<()> {
+        match fs::remove_file(self.icon_size_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove icon size"),
+        }
+    }
+
     pub fn brand_colors(&self) -> Option<BrandColors> {
         fs::read_to_string(self.brand_colors_path())
             .ok()
@@ -965,6 +992,10 @@ impl CacheStore {
 
     fn account_summary_path(&self) -> PathBuf {
         self.root.join(ACCOUNT_SUMMARY_FILE)
+    }
+
+    fn icon_size_path(&self) -> PathBuf {
+        self.root.join(ICON_SIZE_FILE)
     }
 
     fn brand_colors_path(&self) -> PathBuf {
