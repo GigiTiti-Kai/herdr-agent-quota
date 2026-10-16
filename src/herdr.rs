@@ -1590,7 +1590,10 @@ pub(crate) fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String
         &account.reset,
     );
     if let Some(badge) = &account.hermes_badge {
-        tokens.insert(format!("quota_acct_{id}_hermes"), badge.clone());
+        tokens.insert(
+            crate::presentation::hermes_badge_token(account),
+            badge.clone(),
+        );
     }
     if account.gap {
         tokens.insert(format!("quota_acct_{id}_gap"), "\u{2800}".to_string());
@@ -2251,6 +2254,89 @@ mod tests {
             );
         }
         assert!(!desired_summary_tokens(&claude_summary(0.0)).contains_key("quota_acct_cl_gap"));
+    }
+
+    /// A lines block publishes the Hermes badge in the icon column under the
+    /// mark: as `_hermes` before line 2 (whose pad it replaces, so line 2's
+    /// text keeps its cells), or as `_hermes_gap` on the blank line of a
+    /// one-window block, beside the unchanged gap. A one-row format ends its
+    /// row with `_hermes`. One session is the bare mark.
+    #[test]
+    fn the_hermes_badge_is_published_under_the_mark_in_lines_mode() {
+        let hermes = crate::icons::for_harness(Harness::Hermes);
+        let style = |summary| RowStyle {
+            percent: PercentStyle::Used,
+            fields: FieldSet::all(),
+            summary,
+            ..RowStyle::default()
+        };
+        let weekly = UsageWindow::new(
+            WindowKind::Weekly,
+            8.0,
+            Some(ResetAt::from_unix_seconds(500_000)),
+        )
+        .unwrap();
+        let five = UsageWindow::new(
+            WindowKind::FiveHour,
+            4.0,
+            Some(ResetAt::from_unix_seconds(60)),
+        )
+        .unwrap();
+        let tokens = |windows: Vec<UsageWindow>, summary, sessions| {
+            let snapshot = ProviderSnapshot::new(Provider::Codex, windows, 0);
+            let plain =
+                desired_summary_tokens(&MetadataTokens::from_snapshot_for_pane_with_fields(
+                    &snapshot,
+                    0,
+                    None,
+                    style(summary),
+                ));
+            let account =
+                crate::presentation::hermes_badged_account(&snapshot, 0, style(summary), sessions);
+            let badged = desired_summary_tokens(&MetadataTokens {
+                account,
+                ..MetadataTokens::from_snapshot(&snapshot, 0)
+            });
+            (plain, badged)
+        };
+
+        let (plain, badged) = tokens(vec![five.clone(), weekly.clone()], SummaryFormat::Lines, 1);
+        assert_eq!(
+            badged["quota_acct_cx_hermes"],
+            format!("{hermes}  \u{2800}")
+        );
+        assert!(!badged.contains_key("quota_acct_cx_hermes_gap"));
+        assert_eq!(
+            badged["quota_acct_cx_w1_normal"],
+            plain["quota_acct_cx_w1_normal"]
+        );
+        assert_eq!(
+            plain["quota_acct_cx_w2_normal"].strip_prefix("\u{2800}    "),
+            Some(badged["quota_acct_cx_w2_normal"].as_str())
+        );
+        assert_eq!(badged["quota_acct_cx_gap"], "\u{2800}");
+
+        let (plain, badged) = tokens(vec![weekly.clone()], SummaryFormat::Lines, 3);
+        assert_eq!(
+            badged["quota_acct_cx_hermes_gap"],
+            format!("{hermes} 3\u{2800}")
+        );
+        assert!(!badged.contains_key("quota_acct_cx_hermes"));
+        assert_eq!(badged["quota_acct_cx_gap"], "\u{2800}");
+        let without: BTreeMap<_, _> = badged
+            .iter()
+            .filter(|(name, _)| !name.contains("_hermes"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        assert_eq!(without, plain);
+
+        let (plain, badged) = tokens(vec![five, weekly], SummaryFormat::Compact, 12);
+        assert_eq!(badged["quota_acct_cx_hermes"], format!("{hermes} 9+"));
+        assert!(!badged.contains_key("quota_acct_cx_hermes_gap"));
+        assert_eq!(
+            badged["quota_acct_cx_w2_normal"],
+            plain["quota_acct_cx_w2_normal"]
+        );
     }
 
     #[test]

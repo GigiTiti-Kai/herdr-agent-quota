@@ -1371,20 +1371,24 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
             Some(false),
         ));
         if summary == SummaryFormat::Lines {
-            // The blank row keeps tall provider marks from overlapping.
+            // The blank row keeps tall provider marks from overlapping. The
+            // Hermes badge sits in the icon column under the mark: first on
+            // line 2, or on that blank row when the block has one line.
             for slot in 1..=3 {
-                append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
-                if slot == 1 {
-                    append_hermes_badge(&mut row, id);
+                if slot == 2 {
+                    append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes"), id);
                 }
+                append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
                 rows.push(Value::Array(std::mem::take(&mut row)));
             }
-            rows.push(Value::Array(styled_row(
+            append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes_gap"), id);
+            row.push(styled_token(
                 &format!("$quota_acct_{id}_gap"),
                 None,
                 None,
                 None,
-            )));
+            ));
+            rows.push(Value::Array(std::mem::take(&mut row)));
             continue;
         }
         for slot in 1..=3 {
@@ -1396,19 +1400,20 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
             Some(false),
             Some(true),
         ));
-        append_hermes_badge(&mut row, id);
+        append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes"), id);
         rows.push(Value::Array(row));
     }
     rows
 }
 
-/// The Hermes badge goes last on an account's first footer line, inked like
-/// the footer marks. Only rows that can be proven to share a live Hermes
-/// session's account carry the token (`AccountFamily::HERMES_BADGED`).
-fn append_hermes_badge(row: &mut Array, id: &str) {
+/// The Hermes badge token `name`, inked like the footer marks: last on a
+/// one-row format's line, in the icon column of a lines block. Only rows
+/// that can be proven to share a live Hermes session's account carry it
+/// (`AccountFamily::HERMES_BADGED`).
+fn append_hermes_badge(row: &mut Array, name: &str, id: &str) {
     if AccountFamily::HERMES_BADGED.contains(&id) {
         row.push(styled_token(
-            &format!("$quota_acct_{id}_hermes"),
+            &format!("${name}"),
             Some(IDLE_ICON_COLOR),
             Some(false),
             Some(false),
@@ -3532,19 +3537,27 @@ mod field_tests {
             let at = 2 + 4 * index;
             let mut first = vec![format!("$quota_acct_{id}_icon")];
             first.extend(windows(id, 1));
-            // The Hermes badge ends the first line of an account that can carry it.
-            if AccountFamily::HERMES_BADGED.contains(&id) {
-                first.push(format!("$quota_acct_{id}_hermes"));
-            }
             assert_eq!(rows[at], first, "{id}");
-            assert_eq!(rows[at + 1], windows(id, 2), "{id}");
+            // The Hermes badge sits in the icon column under the mark: first
+            // on line 2, or on the blank row closing a one-line block.
+            let badged = AccountFamily::HERMES_BADGED.contains(&id);
+            let mut second = Vec::new();
+            let mut gap = Vec::new();
+            if badged {
+                second.push(format!("$quota_acct_{id}_hermes"));
+                gap.push(format!("$quota_acct_{id}_hermes_gap"));
+            }
+            second.extend(windows(id, 2));
+            gap.push(format!("$quota_acct_{id}_gap"));
+            assert_eq!(rows[at + 1], second, "{id}");
             assert_eq!(rows[at + 2], windows(id, 3), "{id}");
-            assert_eq!(rows[at + 3], [format!("$quota_acct_{id}_gap")], "{id}");
+            assert_eq!(rows[at + 3], gap, "{id}");
         }
     }
 
-    /// Only the Claude and Codex rows can carry the Hermes badge, each last on
-    /// its own row in every format, inked like the footer marks; the Hermes
+    /// Only the Claude and Codex rows can carry the Hermes badge, inked like
+    /// the footer marks: last on the one-row formats' row, in the icon column
+    /// of a lines block (line 2 and its blank row, one name each). The Hermes
     /// row itself stays for a Hermes session whose account no other row shows.
     #[test]
     fn only_the_claude_and_codex_footer_rows_carry_the_hermes_badge() {
@@ -3552,30 +3565,51 @@ mod field_tests {
             let (updated, rows) = written_footer(summary);
             let carriers: Vec<&Vec<String>> = rows
                 .iter()
-                .filter(|row| row.iter().any(|token| token.ends_with("_hermes")))
+                .filter(|row| row.iter().any(|token| token.contains("_hermes")))
                 .collect();
-            assert_eq!(carriers.len(), 2, "{summary:?}: {carriers:?}");
-            for (carrier, id) in carriers.iter().zip(["cl", "cx"]) {
-                assert_eq!(
-                    carrier.last().map(String::as_str),
-                    Some(format!("$quota_acct_{id}_hermes").as_str()),
-                    "{summary:?}"
-                );
-                assert!(
-                    carrier.contains(&format!("$quota_acct_{id}_icon")),
-                    "{summary:?}"
-                );
-                assert_eq!(
-                    carrier.iter().filter(|t| t.ends_with("_hermes")).count(),
-                    1,
-                    "{summary:?}"
-                );
-                let badge = updated
-                    .split(&format!("{{ token = \"$quota_acct_{id}_hermes\""))
-                    .nth(1)
-                    .and_then(|rest| rest.split('}').next())
-                    .unwrap_or_else(|| panic!("{summary:?}: {updated}"));
-                assert!(badge.contains(IDLE_ICON_COLOR), "{badge}");
+            let lines = summary == SummaryFormat::Lines;
+            assert_eq!(
+                carriers.len(),
+                if lines { 4 } else { 2 },
+                "{summary:?}: {carriers:?}"
+            );
+            for id in ["cl", "cx"] {
+                let names: &[String] = if lines {
+                    &[
+                        format!("$quota_acct_{id}_hermes"),
+                        format!("$quota_acct_{id}_hermes_gap"),
+                    ]
+                } else {
+                    &[format!("$quota_acct_{id}_hermes")]
+                };
+                for name in names {
+                    let carrier: Vec<&&Vec<String>> =
+                        carriers.iter().filter(|row| row.contains(name)).collect();
+                    assert_eq!(carrier.len(), 1, "{summary:?} {name}");
+                    let carrier = carrier[0];
+                    assert_eq!(
+                        carrier.iter().filter(|t| t.contains("_hermes")).count(),
+                        1,
+                        "{summary:?}"
+                    );
+                    if lines {
+                        // First on its row, under the icon.
+                        assert_eq!(carrier.first(), Some(name), "{summary:?}");
+                        assert!(!carrier.contains(&format!("$quota_acct_{id}_icon")));
+                    } else {
+                        assert_eq!(carrier.last(), Some(name), "{summary:?}");
+                        assert!(
+                            carrier.contains(&format!("$quota_acct_{id}_icon")),
+                            "{summary:?}"
+                        );
+                    }
+                    let badge = updated
+                        .split(&format!("{{ token = \"{name}\""))
+                        .nth(1)
+                        .and_then(|rest| rest.split('}').next())
+                        .unwrap_or_else(|| panic!("{summary:?}: {updated}"));
+                    assert!(badge.contains(IDLE_ICON_COLOR), "{badge}");
+                }
             }
             assert!(updated.contains("$quota_acct_hm_icon"), "{summary:?}");
         }
