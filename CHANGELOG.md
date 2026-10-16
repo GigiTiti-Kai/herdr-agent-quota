@@ -56,6 +56,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Hermes Agent panes show the session's prompt-cache ratio (`cache 96.7%`)
+  from the main-loop row of `session_model_usage` in `state.db` for the
+  current model and provider, with or without a bridge reading. It is the
+  route's cumulative total, so it barely moves per turn. `openai-codex`
+  sessions also get Codex's 30-minute estimate from the last call
+  (`ttl≈28m`); other providers show the ratio alone. No context row.
 - Hermes Agent panes: vendor icon, Space grouping, topic, and the session's
   current provider and model from Hermes's `state.db`, followed across
   `/model` switches.

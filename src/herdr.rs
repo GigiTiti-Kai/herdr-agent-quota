@@ -1,6 +1,6 @@
 use crate::cache::CacheStore;
 use crate::identity::{self, PLUGIN_ID};
-use crate::model::{ContextUsage, Harness, Provider};
+use crate::model::{CacheUsage, ContextUsage, Harness, Provider};
 use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -361,6 +361,9 @@ pub struct PaneTokens {
     pub quota: PaneQuotaUpdate,
     pub identity: Option<PaneIdentity>,
     pub context: Option<ContextUsage>,
+    /// Cache evidence with no context percentage behind it (Hermes). A pane
+    /// with `context` carries its cache there instead.
+    pub cache: Option<CacheUsage>,
     /// Account-level 5h/7d/30d is shared across panes of one vendor in a Space.
     /// Only one pane in that group publishes those window rows; the others keep
     /// identity, topic, and context and stay visible in the Agent panel.
@@ -1080,6 +1083,10 @@ fn publish_pane_tokens_inner(
         }
         if let Some(context) = &pane_tokens.context {
             apply_context(&mut desired, context, sequence / 1_000, row);
+        }
+        // Only when present: other panes' cache rows come from `desired_tokens`.
+        if let Some(cache) = &pane_tokens.cache {
+            apply_cache(&mut desired, Some(cache), sequence / 1_000);
         }
         fold_cache_row(&mut desired, row);
         match role {
@@ -2275,20 +2282,19 @@ fn apply_context(
         Some(crate::presentation::context_severity(context, row.percent)),
         row.shape,
     );
-    let cache = crate::presentation::sidebar_cache(Some(context));
-    if cache.is_empty() {
-        tokens.remove("quota_cache");
-    } else {
-        tokens.insert("quota_cache".to_string(), cache);
-    }
+    apply_cache(tokens, context.cache.as_ref(), now_unix);
+}
+
+fn apply_cache(tokens: &mut BTreeMap<String, String>, cache: Option<&CacheUsage>, now_unix: u64) {
     for (name, value) in [
+        ("quota_cache", crate::presentation::sidebar_cache(cache)),
         (
             "quota_cache_ttl",
-            crate::presentation::sidebar_cache_ttl(Some(context), now_unix),
+            crate::presentation::sidebar_cache_ttl(cache, now_unix),
         ),
         (
             "quota_cache_state",
-            crate::presentation::sidebar_cache_state(Some(context), now_unix),
+            crate::presentation::sidebar_cache_state(cache, now_unix),
         ),
     ] {
         if value.is_empty() {
@@ -4920,6 +4926,31 @@ mod tests {
         );
         assert!(!tokens.contains_key("quota_cache"));
         assert!(!tokens.contains_key("quota_cache_ttl"));
+    }
+
+    /// Hermes has a cache ratio and no context percentage: the cache rows are
+    /// written on their own and no context row appears.
+    #[test]
+    fn cache_without_context_writes_only_the_cache_rows() {
+        let cache = CacheUsage::from_token_counts(10, 290, 0)
+            .unwrap()
+            .with_ttl_estimate(1_800, 1_000);
+        let mut tokens = BTreeMap::new();
+        apply_cache(&mut tokens, Some(&cache), 1_120);
+        assert_eq!(
+            (
+                tokens.get("quota_cache").map(String::as_str),
+                tokens.get("quota_cache_ttl").map(String::as_str),
+            ),
+            (Some("cache 96.7%"), Some("ttl≈28m"))
+        );
+        assert!(!tokens.contains_key("quota_context"));
+        apply_cache(&mut tokens, Some(&cache), 2_800);
+        assert!(!tokens.contains_key("quota_cache_ttl"));
+        assert_eq!(
+            tokens.get("quota_cache_state").map(String::as_str),
+            Some("no cached")
+        );
     }
 
     #[test]

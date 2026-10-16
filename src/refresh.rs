@@ -895,6 +895,7 @@ fn publish_named_pane(
         quota: PaneQuotaUpdate::Preserve,
         identity: None,
         context: None,
+        cache: None,
         show_account_quota: true,
     });
     let mut tokens = vec![tokens];
@@ -1044,7 +1045,8 @@ fn resolved_pane_tokens(
         }
         Resolution::Indeterminate => None,
     };
-    if quota.is_none() && (identity.is_some() || context.is_some()) {
+    let cache = hermes.and_then(|session| session.cache);
+    if quota.is_none() && (identity.is_some() || context.is_some() || cache.is_some()) {
         quota = Some(PaneQuotaUpdate::Preserve);
     }
     Ok(quota.map(|quota| PaneTokens {
@@ -1052,6 +1054,7 @@ fn resolved_pane_tokens(
         quota,
         identity,
         context,
+        cache,
         show_account_quota: true,
     }))
 }
@@ -1827,6 +1830,7 @@ fn publish_resolved(
                     quota: PaneQuotaUpdate::Preserve,
                     identity: None,
                     context: None,
+                    cache: None,
                     show_account_quota: true,
                 },
             ),
@@ -1916,6 +1920,7 @@ fn vendor_row_sync_extras(tokens: &[PaneTokens], inventory: &[AgentPane]) -> Vec
                 quota: PaneQuotaUpdate::Preserve,
                 identity: None,
                 context: None,
+                cache: None,
                 show_account_quota: should_show,
             })
         })
@@ -2671,6 +2676,7 @@ mod tests {
             quota: PaneQuotaUpdate::Replace(Box::new(values.clone())),
             identity: None,
             context: None,
+            cache: None,
             show_account_quota: true,
         }];
         drop_workspace_accounts(&mut tokens, workspace);
@@ -3745,6 +3751,7 @@ mod tests {
                 quota: PaneQuotaUpdate::Replace(Box::new(values)),
                 identity: None,
                 context: None,
+                cache: None,
                 show_account_quota: true,
             }
         };
@@ -3768,6 +3775,7 @@ mod tests {
             quota: PaneQuotaUpdate::Replace(Box::new(values)),
             identity: None,
             context: None,
+            cache: None,
             show_account_quota: true,
         }
     }
@@ -5105,6 +5113,29 @@ mod tests {
             drop(producer);
             let mut pane = pane_with_bars();
             assert_eq!(week_row(&published(&cache, &mut pane, home.path())), None);
+        }
+
+        /// The cache ratio is the session's own usage row, not the bridge's:
+        /// it is published with or without a live reading.
+        #[test]
+        fn a_hermes_pane_carries_its_session_cache_with_or_without_a_bridge() {
+            let state = tempdir().unwrap();
+            let cache = CacheStore::new(state.path());
+            let home = hermes_home("openai-codex", "model-a");
+            crate::hermes::write_usage_fixture(
+                home.path(),
+                &[("model-a", "openai-codex", "", 10, 290, Some(1_900.0))],
+            );
+            let read_tokens = |tokens: &PaneTokens| tokens.cache.as_ref().map(|c| c.read_tokens);
+
+            let tokens = published(&cache, &mut pane_with_bars(), home.path());
+            assert_eq!(week_row(&tokens), None);
+            assert_eq!(read_tokens(&tokens), Some(290));
+
+            let _producer = write(state.path(), "s1", &record("w1:p1", "s1", 40.0));
+            let tokens = published(&cache, &mut pane_with_bars(), home.path());
+            assert!(week_row(&tokens).is_some());
+            assert_eq!(read_tokens(&tokens), Some(290));
         }
 
         /// The watcher must clear bars nothing vouches for, publish a reading

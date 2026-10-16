@@ -367,6 +367,7 @@ impl MetadataTokens {
             .and_then(|_| stale_quota_age(snapshot, session_id, WindowKind::Weekly, now_unix));
         let monthly_stale = monthly
             .and_then(|_| stale_quota_age(snapshot, session_id, WindowKind::Monthly, now_unix));
+        let cache = context.and_then(|context| context.cache.as_ref());
         let has_stale_quota = (fields.contains(SidebarField::FiveHour)
             && five_hour_stale.is_some())
             || (fields.contains(SidebarField::Week) && weekly_stale.is_some())
@@ -435,9 +436,9 @@ impl MetadataTokens {
             }),
             quota_context: sidebar_context(context, style, shape),
             quota_context_severity: context.map(|context| context_severity(context, style)),
-            quota_cache: sidebar_cache(context),
-            quota_cache_ttl: sidebar_cache_ttl(context, now_unix),
-            quota_cache_state: sidebar_cache_state(context, now_unix),
+            quota_cache: sidebar_cache(cache),
+            quota_cache_ttl: sidebar_cache_ttl(cache, now_unix),
+            quota_cache_state: sidebar_cache_state(cache, now_unix),
             quota_error: None,
             // Once any displayed Claude window is stale, there is no current
             // provider headroom to sort or use for alert recovery. Returning
@@ -990,8 +991,8 @@ pub(crate) fn sidebar_context(
     }
 }
 
-pub(crate) fn sidebar_cache(context: Option<&crate::model::ContextUsage>) -> String {
-    let Some(cache) = context.and_then(|context| context.cache.as_ref()) else {
+pub(crate) fn sidebar_cache(cache: Option<&crate::model::CacheUsage>) -> String {
+    let Some(cache) = cache else {
         return String::new();
     };
     let hit_percent = cache
@@ -1002,15 +1003,9 @@ pub(crate) fn sidebar_cache(context: Option<&crate::model::ContextUsage>) -> Str
     format!("cache {:.1}%", hit_percent)
 }
 
-pub(crate) fn sidebar_cache_ttl(
-    context: Option<&crate::model::ContextUsage>,
-    now_unix: u64,
-) -> String {
-    let Some(cache) = context.and_then(|context| context.cache.as_ref()) else {
-        return String::new();
-    };
+pub(crate) fn sidebar_cache_ttl(cache: Option<&crate::model::CacheUsage>, now_unix: u64) -> String {
     cache
-        .remaining_ttl_seconds(now_unix)
+        .and_then(|cache| cache.remaining_ttl_seconds(now_unix))
         .filter(|remaining| *remaining > 0)
         .map(|remaining| format!("ttl≈{}", format_ttl(remaining)))
         .unwrap_or_default()
@@ -1023,11 +1018,10 @@ pub(crate) fn sidebar_cache_ttl(
 /// speak for this pane at all. Both are amber, so sharing one token made
 /// "your prefix went cold" indistinguishable from "quota is broken".
 pub(crate) fn sidebar_cache_state(
-    context: Option<&crate::model::ContextUsage>,
+    cache: Option<&crate::model::CacheUsage>,
     now_unix: u64,
 ) -> String {
-    context
-        .and_then(|context| context.cache.as_ref())
+    cache
         .and_then(|cache| cache.remaining_ttl_seconds(now_unix))
         .filter(|remaining| *remaining == 0)
         .map(|_| "no cached".to_string())

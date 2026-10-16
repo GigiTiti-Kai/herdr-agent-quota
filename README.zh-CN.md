@@ -178,7 +178,7 @@ herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
 | Pi | 规范 Codex collector 的额度 | 仅在记录的账号一致时复用 |
 | OMP | `omp usage --json --provider <id>` | usage 账号与会话 credential pin 一致 |
-| Hermes Agent | Hermes 进程内的 bridge 插件 | 仅限默认 profile 的 ChatGPT/Codex 会话：由运行中的会话报告它所持密钥的额度。其他 provider 只显示 provider、模型和主题，不显示额度 |
+| Hermes Agent | Hermes 进程内的 bridge 插件 | 仅限默认 profile 的 ChatGPT/Codex 会话：由运行中的会话报告它所持密钥的额度。其他 provider 只显示 provider、模型和主题，不显示额度。所有会话都会显示来自 `state.db` 的缓存命中率，ChatGPT/Codex 会话另有 Codex 的 `ttl≈` 估算 |
 
 Claude Code 状态栏保留用户自己的 statusLine 输出，并在末尾追加当前生效额度窗口的
 消耗节奏，例如 `⏱ 5h ↓12%`：已用额度减去窗口已过去的时间比例，单位为百分点。
