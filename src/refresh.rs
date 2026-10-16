@@ -1831,9 +1831,11 @@ fn always_on_providers(enabled: &[Harness]) -> Vec<Provider> {
 fn on_workspace(values: &MetadataTokens, workspace: &BTreeMap<String, String>) -> bool {
     values.account.as_ref().is_some_and(|account| {
         workspace.contains_key(&format!("quota_acct_{}_icon", account.family.id))
-            || account
-                .same_account_as
-                .is_some_and(|id| workspace.contains_key(&format!("quota_acct_{id}_hermes")))
+            || account.same_account_as.is_some_and(|id| {
+                ["hermes", "hermes_gap"]
+                    .iter()
+                    .any(|slot| workspace.contains_key(&format!("quota_acct_{id}_{slot}")))
+            })
     })
 }
 
@@ -2606,7 +2608,7 @@ mod tests {
             let badged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[(Provider::Codex, 2)]);
             assert_eq!(
                 badged.get("quota_acct_cx_hermes"),
-                Some(&format!("{hermes_mark} 2")),
+                Some(&format!("{hermes_mark} 2\u{2800}")),
                 "{format:?}"
             );
             assert!(!badged.contains_key("quota_acct_cl_hermes"), "{format:?}");
@@ -2687,6 +2689,19 @@ mod tests {
         assert!(hm(&pane_summary(&same, &unbadged)));
         assert!(hm(&pane_summary(&unproven, &badged)));
         assert!(hm(&pane_summary(&unproven, &unbadged)));
+        // A one-window Codex block carries the badge on its blank line.
+        let mut weekly = stamped_codex("acc-1");
+        weekly
+            .windows
+            .retain(|window| window.kind == WindowKind::Weekly);
+        let on_gap = workspace_summary(&[weekly], SUMMARY_NOW, row, &[(Provider::Codex, 1)]);
+        assert!(
+            on_gap.contains_key("quota_acct_cx_hermes_gap"),
+            "{on_gap:?}"
+        );
+        assert!(!on_gap.contains_key("quota_acct_cx_hermes"), "{on_gap:?}");
+        assert!(pane_summary(&same, &on_gap).is_empty());
+        assert!(hm(&pane_summary(&unproven, &on_gap)));
         // `same_account_as` never leaks into what Herdr is sent.
         assert_eq!(
             crate::herdr::desired_summary_tokens(&same),
@@ -2779,7 +2794,7 @@ mod tests {
             let badged = workspace_summary(&snapshots, SUMMARY_NOW, row, &[(Provider::Claude, 3)]);
             assert_eq!(
                 badged.get("quota_acct_cl_hermes"),
-                Some(&format!("{hermes_mark} 3")),
+                Some(&format!("{hermes_mark} 3\u{2800}")),
                 "{format:?}"
             );
             assert!(!badged.contains_key("quota_acct_cx_hermes"), "{format:?}");
@@ -2801,17 +2816,19 @@ mod tests {
             );
             assert_eq!(
                 both.get("quota_acct_cl_hermes"),
-                Some(&format!("{hermes_mark} 2"))
+                Some(&format!("{hermes_mark} 2\u{2800}"))
             );
+            // One session: the mark alone, as wide as the provider mark.
             assert_eq!(
                 both.get("quota_acct_cx_hermes"),
-                Some(&format!("{hermes_mark} 1"))
+                Some(&crate::icons::sidebar_mark(Harness::Hermes))
             );
         }
     }
 
     /// Claude's real reading has a third, model-scoped weekly window. In the
-    /// lines footer the badge still fits on the 5h line.
+    /// lines footer the badge goes under the mark on line 2, and the 5h line
+    /// is drawn exactly as without it.
     #[test]
     fn the_claude_badge_fits_the_lines_footer_with_a_scoped_window() {
         let mut windows = claude_windows();
@@ -2833,6 +2850,14 @@ mod tests {
                 .any(|name| name.starts_with("quota_acct_cl_w3_")),
             "{badged:?}"
         );
+        let plain = workspace_summary(&[claude_account(claude_windows())], SUMMARY_NOW, row, &[]);
+        let first = |summary: &BTreeMap<String, String>| {
+            summary
+                .iter()
+                .find(|(name, _)| name.starts_with("quota_acct_cl_w1_"))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(first(&badged), first(&plain));
     }
 
     fn low(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {

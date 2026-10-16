@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Account summary: the Hermes badge moved into the icon column of the `lines`
+  footer, directly under the provider mark: first on the account's second
+  line (`$quota_acct_<id>_hermes`, which takes the place of that line's pad),
+  or on the blank line below a one-line account (`$quota_acct_<id>_hermes_gap`).
+  The meters, percentages, and resets no longer shift when a reset gets
+  shorter or longer, and the first line keeps its full reset. One session
+  shows the Hermes mark alone; more show the count after it, capped at `9+`,
+  so the badge always fits the four-cell column. `compact`, `bars`, and
+  `numbers` keep the badge last on the row with the same count rule. Run
+  `configure` to move the badge tokens in the footer.
 - Account summary: the Claude row now carries the Hermes badge too, for
   Hermes sessions on the native Anthropic route that run on Claude Code's own
   login. The bridge (version 3) compares the session's live key with the

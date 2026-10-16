@@ -109,8 +109,10 @@ usage 获取逻辑查询当前会话所持的密钥，每个会话最多每分�
 也一样；只有 ChatGPT/Codex 路由才会重新显示。
 
 开启账号汇总时，与 Codex 行使用同一 ChatGPT 账号且同一用户的 Hermes 会话不再有自己的
-footer 行，而是在 Codex 行第一行末尾显示 Hermes 徽标：Hermes 标志加上该登录上存活的 Hermes
-会话数。只有当会话当前 access token 所指的账号和用户（`sub`）就是 Codex 读数所属登录的账号和
+footer 行，而是在 Codex 行显示 Hermes 徽标：该登录上只有一个存活的 Hermes 会话时只显示 Hermes
+标志，更多时在标志后加上会话数（超过 9 个显示 `9+`）。`lines` 中徽标位于 provider 标志正下方的
+图标列：账号的第二行，或只有一行的账号下方的空行，因此额度条、百分比和重置时间的位置不变，块的
+行数也不变。`compact`、`bars`、`numbers` 中徽标位于该账号行末尾，行内放不下时省略。只有当会话当前 access token 所指的账号和用户（`sub`）就是 Codex 读数所属登录的账号和
 用户时才显示；双方只比较这一对值的域分离 sha256，从不比较 ID 本身。同一 ChatGPT workspace 的
 成员共享账号 ID 但额度各自独立，因此用户也参与比较。使用其他账号或其他席位的 Hermes 会话保留
 自己的 Hermes 行，其他 provider 的会话不显示徽标。bridge 更新前启动的 Hermes 进程在重启前不会报告。

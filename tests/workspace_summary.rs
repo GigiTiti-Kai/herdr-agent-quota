@@ -305,7 +305,12 @@ fn the_codex_row_carries_the_hermes_badge_only_for_live_sessions_on_its_login() 
     codex_login(root, "acc-test-1", "user-test-1");
     fs::write(root.join("herdr"), FAKE_HERDR).unwrap();
     fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
-    let badge = |count: usize| format!("\u{e1aa} {count}");
+    // One session is the mark alone; more add the count. Both are as wide
+    // as the provider mark the badge sits under.
+    let badge = |count: usize| match count {
+        1 => "\u{e1aa}  \u{2800}".to_string(),
+        _ => format!("\u{e1aa} {count}\u{2800}"),
+    };
 
     // No Hermes session: the Codex row, no badge.
     let published = refresh_codex(root);
@@ -454,7 +459,12 @@ fn the_claude_row_carries_the_hermes_badge_only_for_live_sessions_on_its_credent
     let elsewhere = claude_credentials_stamp(Path::new("/srv/other/.credentials.json")).unwrap();
     fs::write(root.join("herdr"), FAKE_HERDR).unwrap();
     fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
-    let badge = |count: usize| format!("\u{e1aa} {count}");
+    // One session is the mark alone; more add the count. Both are as wide
+    // as the provider mark the badge sits under.
+    let badge = |count: usize| match count {
+        1 => "\u{e1aa}  \u{2800}".to_string(),
+        _ => format!("\u{e1aa} {count}\u{2800}"),
+    };
 
     // No Hermes session: the Claude row, no badge.
     let published = refresh_claude(root, &credentials);
