@@ -710,6 +710,11 @@ pub struct ProviderSnapshot {
     /// this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Set on load when Agy's statusLine is toggled off: its pane-keyed model
+    /// and context stop updating and may belong to an earlier conversation.
+    /// Never persisted, so a save merging this snapshot keeps the raw maps.
+    #[serde(skip)]
+    pub collector_disabled: bool,
 }
 
 impl ProviderSnapshot {
@@ -732,6 +737,7 @@ impl ProviderSnapshot {
             session_seen_unix: BTreeMap::new(),
             quota_scope_windows: BTreeMap::new(),
             account_id: None,
+            collector_disabled: false,
         }
     }
 
@@ -812,6 +818,9 @@ impl ProviderSnapshot {
     /// points at this same conversation. An exact hit in `session_windows`
     /// is not permission to borrow another pane's label.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
+        if self.collector_disabled {
+            return None;
+        }
         let Some(session_id) = session_id else {
             return self.model.as_deref();
         };
@@ -836,6 +845,9 @@ impl ProviderSnapshot {
     /// has no session id at all. Agy may use the latest context only when
     /// every retained observation points at this same conversation.
     pub fn context_for_session(&self, session_id: Option<&str>) -> Option<&ContextUsage> {
+        if self.collector_disabled {
+            return None;
+        }
         let Some(session_id) = session_id else {
             return self.context.as_ref();
         };
@@ -1891,6 +1903,34 @@ mod tests {
                 .map(|context| context.used_percent),
             Some(3.427886962890625)
         );
+    }
+
+    #[test]
+    fn agy_disabled_collector_hides_the_stale_pane_model_and_context() {
+        // Live failure: `/statusline` toggled off left a two-day-old
+        // conversation's model on the same pane id while Agy ran another one.
+        let mut snapshot = ProviderSnapshot::new(Provider::Agy, Vec::new(), 1)
+            .session_local()
+            .with_model(Some("Gemini 3.8 Flash (High)".to_string()))
+            .with_context(Some(ContextUsage::new(12.0).unwrap()));
+        snapshot
+            .session_models
+            .insert("w35:p3".to_string(), "Gemini 3.8 Flash (High)".to_string());
+        snapshot
+            .session_contexts
+            .insert("w35:p3".to_string(), ContextUsage::new(12.0).unwrap());
+
+        assert_eq!(
+            snapshot.model_for_session(Some("w35:p3")),
+            Some("Gemini 3.8 Flash (High)")
+        );
+        assert!(snapshot.context_for_session(Some("w35:p3")).is_some());
+
+        snapshot.collector_disabled = true;
+        assert_eq!(snapshot.model_for_session(Some("w35:p3")), None);
+        assert_eq!(snapshot.model_for_session(None), None);
+        assert!(snapshot.context_for_session(Some("w35:p3")).is_none());
+        assert!(snapshot.context_for_session(None).is_none());
     }
 
     #[test]

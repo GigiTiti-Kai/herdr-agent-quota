@@ -30,6 +30,15 @@ impl Adapter {
                 );
                 return Ok(());
             }
+            if statusline_disabled(path) {
+                println!(
+                    "{} statusLine collector is installed but disabled: {}; run `/statusline on` in {}, or `configure --apply`",
+                    self.label,
+                    path.display(),
+                    self.label
+                );
+                return Ok(());
+            }
             println!(
                 "{} statusLine collector is installed: {}",
                 self.label,
@@ -86,6 +95,11 @@ impl Adapter {
                     "command".to_string(),
                     Value::String(wrapper_command.clone()),
                 );
+                // An explicit install re-enables a toggled-off collector; a
+                // statusLine without the key (Claude's) never gains it.
+                if object.get("enabled") == Some(&Value::Bool(false)) {
+                    object.insert("enabled".to_string(), Value::Bool(true));
+                }
                 if let Some(seconds) = refresh_interval_seconds {
                     if installed || !object.contains_key("refreshInterval") {
                         object.insert("refreshInterval".to_string(), Value::from(seconds));
@@ -218,6 +232,16 @@ pub(crate) fn settings_path(environment: &str, relative: &str) -> Result<PathBuf
     Ok(PathBuf::from(home).join(relative))
 }
 
+/// True only for an explicit `statusLine.enabled: false`, which stops the CLI
+/// from calling the collector at all. Unreadable settings keep the old behavior.
+pub(crate) fn statusline_disabled(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|settings| settings.get("statusLine")?.get("enabled").cloned())
+        == Some(Value::Bool(false))
+}
+
 fn read_settings(path: &Path, label: &str) -> Result<Value> {
     if !path.exists() {
         return Ok(json!({}));
@@ -242,4 +266,36 @@ fn write_settings(path: &Path, settings: &Value, label: &str) -> Result<()> {
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn only_an_explicit_enabled_false_disables_the_collector() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let disabled = |contents: Option<&str>| {
+            if let Some(contents) = contents {
+                fs::write(&path, contents).unwrap();
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+            statusline_disabled(&path)
+        };
+        assert!(disabled(Some(
+            r#"{"statusLine":{"type":"command","command":"x","enabled":false}}"#
+        )));
+        assert!(!disabled(Some(
+            r#"{"statusLine":{"type":"command","command":"x","enabled":true}}"#
+        )));
+        assert!(!disabled(Some(
+            r#"{"statusLine":{"type":"command","command":"x"}}"#
+        )));
+        assert!(!disabled(Some(r#"{"statusLine":{"enabled":"false"}}"#)));
+        assert!(!disabled(Some("not json")));
+        assert!(!disabled(None));
+    }
 }

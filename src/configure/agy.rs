@@ -1,4 +1,4 @@
-use super::statusline::{settings_path, Adapter};
+use super::statusline::{settings_path, statusline_disabled, Adapter};
 use crate::cache::CacheStore;
 use crate::model::Provider;
 use crate::providers::agy::parse_statusline;
@@ -39,6 +39,13 @@ pub fn uninstall() -> Result<()> {
         &settings_path("AGY_SETTINGS_FILE", ".gemini/antigravity-cli/settings.json")?,
         cache.root(),
     )
+}
+
+/// Agy's `/statusline` toggle writes `enabled:false`; its pane-keyed
+/// observations then stop updating and would outlive the conversation.
+pub fn collector_disabled() -> bool {
+    settings_path("AGY_SETTINGS_FILE", ".gemini/antigravity-cli/settings.json")
+        .is_ok_and(|path| statusline_disabled(&path))
 }
 
 pub fn apply_at(settings: &Path, state: &Path, executable: &Path) -> Result<()> {
