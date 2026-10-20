@@ -318,10 +318,7 @@ impl MetadataTokens {
         session_id: Option<&str>,
         row: RowStyle,
     ) -> Self {
-        let quota_model = match session_id {
-            Some(session_id) => snapshot.model_for_session(Some(session_id)),
-            None => snapshot.model.as_deref(),
-        };
+        let quota_model = snapshot.model_for_session(session_id);
         let context =
             session_id.and_then(|session_id| snapshot.context_for_session(Some(session_id)));
         let windows = snapshot.windows_for_session(session_id);

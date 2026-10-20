@@ -270,3 +270,72 @@ fn check_reports_a_statusline_that_feeds_the_pre_rename_install_as_stale() {
     assert!(report.contains("Claude statusLine collector is installed"));
     assert!(!report.contains("stale"));
 }
+
+/// Agy's `/statusline` is a toggle; `enabled:false` stops every call to the
+/// collector. An explicit install turns it back on, but never adds the key to
+/// a statusLine (Claude's) that did not have it.
+#[test]
+fn agy_apply_reenables_a_disabled_collector_without_adding_the_key() {
+    let directory = tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let state = directory.path().join("state");
+    let executable = directory.path().join("herdr-agent-usage");
+    fs::write(
+        &settings,
+        r#"{"statusLine":{"type":"command","command":"echo old","enabled":false}}"#,
+    )
+    .unwrap();
+    agy::apply_at(&settings, &state, &executable).unwrap();
+    let installed: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(installed["statusLine"]["enabled"], true);
+
+    fs::write(
+        &settings,
+        r#"{"statusLine":{"type":"command","command":"echo old"}}"#,
+    )
+    .unwrap();
+    agy::apply_at(&settings, &state, &executable).unwrap();
+    let installed: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert!(installed["statusLine"].get("enabled").is_none());
+}
+
+#[test]
+fn agy_check_reports_an_installed_but_disabled_collector() {
+    let directory = tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let state = directory.path().join("herdr-agent-usage");
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_herdr-agent-usage"));
+    let check = || {
+        let output = Command::new(executable)
+            .args(["configure", "--check", "--agent", "agy"])
+            .env("AGY_SETTINGS_FILE", &settings)
+            .env("HERDR_PLUGIN_STATE_DIR", &state)
+            .env("HERDR_PLUGIN_CONFIG_DIR", directory.path())
+            .env("HERDR_CONFIG_FILE", directory.path().join("config.toml"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    agy::apply_at(&settings, &state, executable).unwrap();
+    let report = check();
+    assert!(
+        report.contains("Agy statusLine collector is installed"),
+        "{report}"
+    );
+    assert!(!report.contains("disabled"), "{report}");
+
+    let mut value: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    value["statusLine"]["enabled"] = Value::Bool(false);
+    fs::write(&settings, serde_json::to_vec(&value).unwrap()).unwrap();
+    let report = check();
+    assert!(
+        report.contains("Agy statusLine collector is installed but disabled"),
+        "{report}"
+    );
+    assert!(report.contains("/statusline on"), "{report}");
+}
