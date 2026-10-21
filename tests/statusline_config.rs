@@ -271,8 +271,8 @@ fn check_reports_a_statusline_that_feeds_the_pre_rename_install_as_stale() {
     assert!(!report.contains("stale"));
 }
 
-/// Agy's `/statusline` is a toggle; `enabled:false` stops every call to the
-/// collector. An explicit install turns it back on, but never adds the key to
+/// Agy's `/statusline` is a toggle; `enabled:false` stops the collector, though
+/// an Agy already running may keep calling it. An explicit install turns it back on, but never adds the key to
 /// a statusLine (Claude's) that did not have it.
 #[test]
 fn agy_apply_reenables_a_disabled_collector_without_adding_the_key() {
