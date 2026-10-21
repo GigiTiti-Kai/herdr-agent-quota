@@ -1077,7 +1077,9 @@ impl CacheStore {
 /// collector never saves.
 fn mark_collector_state(mut snapshot: ProviderSnapshot, observation: &Path) -> ProviderSnapshot {
     if snapshot.provider == Provider::Agy {
-        snapshot.collector_disabled = crate::configure::agy::collector_disabled(observation);
+        let state = crate::configure::agy::collector_state(observation);
+        snapshot.collector_disabled = state.disabled;
+        snapshot.settings_model = state.settings_model;
     }
     snapshot
 }
