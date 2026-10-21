@@ -41,26 +41,57 @@ pub fn uninstall() -> Result<()> {
     )
 }
 
+/// What the pane-keyed Agy cache may still claim as current.
+#[derive(Debug, Default, PartialEq)]
+pub struct CollectorState {
+    /// `/statusline` wrote `enabled:false` and nothing was observed since:
+    /// the cached context belongs to an earlier conversation.
+    pub disabled: bool,
+    /// Root `model` of `settings.json`, which `/model` rewrites, when that
+    /// write is newer than the last observation. It is then the newest
+    /// evidence of the active model, whether or not the hook still runs.
+    pub settings_model: Option<String>,
+}
+
 /// Agy's `/statusline` toggle writes `enabled:false`; its pane-keyed
 /// observations then stop updating and would outlive the conversation.
 /// An Agy started before that write keeps calling the collector, so an
 /// observation saved after the settings changed proves it is still live.
-pub fn collector_disabled(observation: &Path) -> bool {
+pub fn collector_state(observation: &Path) -> CollectorState {
     settings_path("AGY_SETTINGS_FILE", ".gemini/antigravity-cli/settings.json")
-        .is_ok_and(|settings| disabled_at(&settings, observation))
+        .map(|settings| state_at(&settings, observation))
+        .unwrap_or_default()
 }
 
-fn disabled_at(settings: &Path, observation: &Path) -> bool {
+fn state_at(settings: &Path, observation: &Path) -> CollectorState {
     let modified = |path: &Path| {
         std::fs::metadata(path)
             .and_then(|meta| meta.modified())
             .ok()
     };
-    statusline_disabled(settings)
-        && match (modified(observation), modified(settings)) {
-            (Some(observed), Some(written)) => observed < written,
-            _ => true,
-        }
+    let settings_newer = match (modified(observation), modified(settings)) {
+        (Some(observed), Some(written)) => observed < written,
+        _ => true,
+    };
+    // shortcut: `model` is one value for every Agy pane, so with several
+    // panes it is right only for the one that ran `/model`; gate on the Agy
+    // pane count from the inventory if that mismatch ever shows up.
+    let settings_model = settings_newer
+        .then(|| std::fs::read(settings).ok())
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("model")?
+                .as_str()
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .filter(|model| !model.is_empty());
+    CollectorState {
+        disabled: settings_newer && statusline_disabled(settings),
+        settings_model,
+    }
 }
 
 pub fn apply_at(settings: &Path, state: &Path, executable: &Path) -> Result<()> {
@@ -161,13 +192,79 @@ mod tests {
         };
         let disabled = r#"{"statusLine":{"command":"x","enabled":false}}"#;
         touch(&settings, disabled, 1_000);
-        assert!(disabled_at(&settings, &observation), "no observation");
+        assert!(state_at(&settings, &observation).disabled, "no observation");
         touch(&observation, "{}", 999);
-        assert!(disabled_at(&settings, &observation), "observed before");
+        assert!(
+            state_at(&settings, &observation).disabled,
+            "observed before"
+        );
         touch(&observation, "{}", 1_001);
-        assert!(!disabled_at(&settings, &observation), "observed after");
+        assert!(
+            !state_at(&settings, &observation).disabled,
+            "observed after"
+        );
         touch(&settings, r#"{"statusLine":{"command":"x"}}"#, 2_000);
-        assert!(!disabled_at(&settings, &observation), "enabled");
+        assert!(!state_at(&settings, &observation).disabled, "enabled");
+    }
+
+    /// Live failure: `/statusline` off, then `/model` Flash→Opus→Argon→Flash.
+    /// Every `/model` rewrites `settings.json`, so the pane-keyed cache can
+    /// never catch up; the root `model` there is the only current evidence.
+    #[test]
+    fn a_settings_write_newer_than_the_observation_supplies_the_model() {
+        use std::time::{Duration, SystemTime};
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let observation = directory.path().join("agy-statusline.observation.json");
+        let touch = |path: &Path, contents: &str, at: u64| {
+            std::fs::write(path, contents).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(at))
+                .unwrap();
+        };
+        let flash =
+            r#"{"model":" Gemini 3.8 Flash (High) ","statusLine":{"command":"x","enabled":false}}"#;
+        touch(&settings, flash, 1_000);
+        touch(&observation, "{}", 999);
+        assert_eq!(
+            state_at(&settings, &observation),
+            CollectorState {
+                disabled: true,
+                settings_model: Some("Gemini 3.8 Flash (High)".to_string()),
+            }
+        );
+        // Re-enabled but no observation yet: the model is still the newest.
+        touch(
+            &settings,
+            r#"{"model":"Gemini 3.8 Flash (High)","statusLine":{"command":"x"}}"#,
+            1_002,
+        );
+        assert_eq!(
+            state_at(&settings, &observation),
+            CollectorState {
+                disabled: false,
+                settings_model: Some("Gemini 3.8 Flash (High)".to_string()),
+            }
+        );
+        // A later observation outranks the settings file.
+        touch(&observation, "{}", 1_003);
+        assert_eq!(state_at(&settings, &observation), CollectorState::default());
+        // No model key gives nothing to fall back on.
+        touch(
+            &settings,
+            r#"{"model":"","statusLine":{"command":"x","enabled":false}}"#,
+            1_004,
+        );
+        assert_eq!(
+            state_at(&settings, &observation),
+            CollectorState {
+                disabled: true,
+                settings_model: None,
+            }
+        );
     }
 
     #[test]

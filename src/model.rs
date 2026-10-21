@@ -715,6 +715,11 @@ pub struct ProviderSnapshot {
     /// Never persisted, so a save merging this snapshot keeps the raw maps.
     #[serde(skip)]
     pub collector_disabled: bool,
+    /// Set on load when Agy's `settings.json` (rewritten by `/model`) is newer
+    /// than the last statusLine observation: its root `model` outranks every
+    /// pane-keyed model. Never persisted.
+    #[serde(skip)]
+    pub settings_model: Option<String>,
 }
 
 impl ProviderSnapshot {
@@ -738,6 +743,7 @@ impl ProviderSnapshot {
             quota_scope_windows: BTreeMap::new(),
             account_id: None,
             collector_disabled: false,
+            settings_model: None,
         }
     }
 
@@ -818,6 +824,9 @@ impl ProviderSnapshot {
     /// points at this same conversation. An exact hit in `session_windows`
     /// is not permission to borrow another pane's label.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
+        if let Some(model) = self.settings_model.as_deref() {
+            return Some(model);
+        }
         if self.collector_disabled {
             return None;
         }
@@ -1931,6 +1940,28 @@ mod tests {
         assert_eq!(snapshot.model_for_session(None), None);
         assert!(snapshot.context_for_session(Some("w35:p3")).is_none());
         assert!(snapshot.context_for_session(None).is_none());
+
+        // `/model` after the toggle: settings.json names the model, the
+        // context still has no current source.
+        snapshot.settings_model = Some("Gemini 4 Argon (High)".to_string());
+        assert_eq!(
+            snapshot.model_for_session(Some("w35:p3")),
+            Some("Gemini 4 Argon (High)")
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some("other-pane")),
+            Some("Gemini 4 Argon (High)")
+        );
+        assert!(snapshot.context_for_session(Some("w35:p3")).is_none());
+
+        // Re-enabled with no observation since: settings still outranks the
+        // stale pane-keyed cache.
+        snapshot.collector_disabled = false;
+        assert_eq!(
+            snapshot.model_for_session(Some("w35:p3")),
+            Some("Gemini 4 Argon (High)")
+        );
+        assert!(snapshot.context_for_session(Some("w35:p3")).is_some());
     }
 
     #[test]
