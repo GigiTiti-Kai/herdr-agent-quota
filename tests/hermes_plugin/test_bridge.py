@@ -26,13 +26,14 @@ bridge_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge_module)
 
 
-def fake_jwt(account_id, subject=None, signature="fake-signature"):
-    """A made-up access token shaped like a ChatGPT one: only its account and user claims matter."""
+def fake_jwt(account_id, subject=None, signature="fake-signature", sub="auth0|fake"):
+    """A made-up access token shaped like a ChatGPT one: only its account and seat claims matter."""
     def segment(value):
         return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
 
-    claims = {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
-    claims["sub"] = SUBJECT_1 if subject is None else subject
+    claims = {"sub": sub, "https://api.openai.com/auth": {
+        "chatgpt_account_id": account_id,
+        "chatgpt_account_user_id": SUBJECT_1 if subject is None else subject}}
     return ".".join((segment({"alg": "none"}), segment(claims), signature))
 
 
@@ -276,6 +277,9 @@ class RouteTests(unittest.TestCase):
         refreshed = bridge_module.read_route(FakeAgent(key=JWT_X2), HMAC_KEY)[0]
         self.assertNotEqual(refreshed.identity, signature.identity)
         self.assertEqual(refreshed.principal, signature.principal)
+        # The same seat signed in another way: `sub` names the sign-in method, not the seat.
+        google = bridge_module.read_route(FakeAgent(key=fake_jwt(ACCOUNT_X, sub="google-oauth2|fake")), HMAC_KEY)[0]
+        self.assertEqual(google.principal, signature.principal)
         # Another seat of the same workspace (same account id, own quota), and another account.
         seat = bridge_module.read_route(FakeAgent(key=JWT_X_SEAT2), HMAC_KEY)[0]
         self.assertNotEqual(seat.principal, signature.principal)

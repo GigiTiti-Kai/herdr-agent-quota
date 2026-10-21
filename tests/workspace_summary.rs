@@ -252,7 +252,7 @@ fn bridge_session(root: &Path, session: &str, route: serde_json::Value) -> fs::F
 }
 
 /// A Codex `auth.json` for `account_id` whose made-up access token names
-/// `account_id` and `subject` in its claims.
+/// `account_id` and the seat `subject` in its claims.
 fn codex_login(root: &Path, account_id: &str, subject: &str) {
     use base64::Engine as _;
     let encode = |value: serde_json::Value| {
@@ -261,8 +261,9 @@ fn codex_login(root: &Path, account_id: &str, subject: &str) {
     let token = format!(
         "{}.{}.fake-signature",
         encode(json!({"alg": "none"})),
-        encode(json!({"sub": subject,
-                      "https://api.openai.com/auth": {"chatgpt_account_id": account_id}}))
+        encode(json!({"sub": "auth0|fake",
+                      "https://api.openai.com/auth": {"chatgpt_account_id": account_id,
+                                                      "chatgpt_account_user_id": subject}}))
     );
     fs::write(
         root.join("codex-auth.json"),

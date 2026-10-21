@@ -169,8 +169,9 @@ def token_principal_stamp(api_key):
 
     The account is the token's own `chatgpt_account_id` claim: the value Hermes sends as the
     `ChatGPT-Account-ID` header of every Codex request made with this token. Members of one
-    workspace share it but each has their own quota, so the user (`sub`) is part of the stamp,
-    the same (account, sub) pair Hermes uses to tell two Codex credentials apart. The signature
+    workspace share it but each has their own quota, so the seat (`chatgpt_account_user_id`) is
+    part of the stamp. Not `sub`: it names the sign-in method too, so the same seat signed in to
+    Codex with email and to Hermes with Google would never match. The signature
     is not checked; the claims only name the principal, and the token is what the backend
     authenticates. A value that is not such a token names nothing.
     """
@@ -189,7 +190,7 @@ def token_principal_stamp(api_key):
         return None
     auth = claims.get(OPENAI_AUTH_CLAIM)
     account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
-    subject = claims.get("sub")
+    subject = auth.get("chatgpt_account_user_id") if isinstance(auth, dict) else None
     if not isinstance(account, str) or not account or not isinstance(subject, str) or not subject:
         return None
     return chatgpt_principal_stamp(account, subject)
