@@ -43,9 +43,24 @@ pub fn uninstall() -> Result<()> {
 
 /// Agy's `/statusline` toggle writes `enabled:false`; its pane-keyed
 /// observations then stop updating and would outlive the conversation.
-pub fn collector_disabled() -> bool {
+/// An Agy started before that write keeps calling the collector, so an
+/// observation saved after the settings changed proves it is still live.
+pub fn collector_disabled(observation: &Path) -> bool {
     settings_path("AGY_SETTINGS_FILE", ".gemini/antigravity-cli/settings.json")
-        .is_ok_and(|path| statusline_disabled(&path))
+        .is_ok_and(|settings| disabled_at(&settings, observation))
+}
+
+fn disabled_at(settings: &Path, observation: &Path) -> bool {
+    let modified = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    };
+    statusline_disabled(settings)
+        && match (modified(observation), modified(settings)) {
+            (Some(observed), Some(written)) => observed < written,
+            _ => true,
+        }
 }
 
 pub fn apply_at(settings: &Path, state: &Path, executable: &Path) -> Result<()> {
@@ -127,6 +142,32 @@ mod tests {
             original.get("session_id").and_then(Value::as_str),
             Some("parent-conversation")
         );
+    }
+
+    #[test]
+    fn an_observation_newer_than_the_disable_keeps_the_collector_live() {
+        use std::time::{Duration, SystemTime};
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let observation = directory.path().join("agy-statusline.observation.json");
+        let touch = |path: &Path, contents: &str, at: u64| {
+            std::fs::write(path, contents).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(at))
+                .unwrap();
+        };
+        let disabled = r#"{"statusLine":{"command":"x","enabled":false}}"#;
+        touch(&settings, disabled, 1_000);
+        assert!(disabled_at(&settings, &observation), "no observation");
+        touch(&observation, "{}", 999);
+        assert!(disabled_at(&settings, &observation), "observed before");
+        touch(&observation, "{}", 1_001);
+        assert!(!disabled_at(&settings, &observation), "observed after");
+        touch(&settings, r#"{"statusLine":{"command":"x"}}"#, 2_000);
+        assert!(!disabled_at(&settings, &observation), "enabled");
     }
 
     #[test]

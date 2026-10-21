@@ -97,7 +97,10 @@ impl CacheStore {
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let snapshot = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse cached {} snapshot", provider.source()))?;
-        Ok(Some(mark_collector_state(snapshot)))
+        Ok(Some(mark_collector_state(
+            snapshot,
+            &self.statusline_observation_path(Provider::Agy),
+        )))
     }
 
     /// Load the snapshot of a target that is not a canonical collector.
@@ -113,7 +116,10 @@ impl CacheStore {
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let snapshot = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse cached {} snapshot", target.cache_identity()))?;
-        Ok(Some(mark_collector_state(snapshot)))
+        Ok(Some(mark_collector_state(
+            snapshot,
+            &self.statusline_observation_path(Provider::Agy),
+        )))
     }
 
     pub fn save_target(&self, target: &BillingTarget, snapshot: &ProviderSnapshot) -> Result<()> {
@@ -1069,9 +1075,9 @@ impl CacheStore {
 
 /// Gate on read, not prune: pruning runs only on save, and a disabled
 /// collector never saves.
-fn mark_collector_state(mut snapshot: ProviderSnapshot) -> ProviderSnapshot {
+fn mark_collector_state(mut snapshot: ProviderSnapshot, observation: &Path) -> ProviderSnapshot {
     if snapshot.provider == Provider::Agy {
-        snapshot.collector_disabled = crate::configure::agy::collector_disabled();
+        snapshot.collector_disabled = crate::configure::agy::collector_disabled(observation);
     }
     snapshot
 }
