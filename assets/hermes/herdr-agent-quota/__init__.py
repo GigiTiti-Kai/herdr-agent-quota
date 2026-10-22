@@ -19,15 +19,17 @@ that route and nothing is sent anywhere to decide it.
 
 Scope, on purpose:
 
-* default profile only, interactive CLI/TUI sessions only, inside a Herdr pane only;
+* default profile only, interactive CLI/TUI sessions only (and CLI turns the shared gateway
+  runs), inside a Herdr pane only;
 * `openai-codex` over `https://chatgpt.com/backend-api` only. Anything else is recorded as an
   unsupported route with no quota, never asked about through another credential;
 * any change of provider, endpoint, pool entry, or token starts a new epoch and drops the quota
   before anything else happens. A usage answer that arrives for an older epoch is discarded.
 
-Hermes has no public way to reach the live agent from a hook, so `_live_agents` reads two private
-attributes. They are confined to that one function; when they are missing the plugin knows
-nothing and writes no quota.
+Hermes has no public way to reach the live agent from a hook, so `_live_agents` reads private
+attributes (the CLI's, the TUI gateway's, and the messaging gateway's that runs CLI turns since
+0.22.4). They are confined to those functions; when they are missing the plugin knows nothing
+and writes no quota.
 """
 
 # HERDR_AGENT_QUOTA_BRIDGE_VERSION=3
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import gc
 import hashlib
 import hmac
 import json
@@ -48,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -62,7 +66,11 @@ SUPPORTED_PROVIDER = "openai-codex"
 SUPPORTED_API_MODE = "codex_responses"
 SUPPORTED_HOST = "chatgpt.com"
 SUPPORTED_PATH = "/backend-api"
-INTERACTIVE_PLATFORMS = frozenset({"cli", "tui"})
+# `local` is a CLI turn run by the shared gateway (Hermes 0.22.4+). The gateway is one process for
+# every CLI, so its HERDR_PANE_ID is whichever pane started it: a record's pane is not the
+# session's. shortcut: the quota plugin's Hermes badge counts records by principal and never by
+# pane; per-pane bars need the CLI's pane in the hook payload, upgrade once Hermes passes one.
+INTERACTIVE_PLATFORMS = frozenset({"cli", "tui", "local"})
 # Hermes's labels for the two plain Codex pools. Anything else is not a window.
 WINDOW_KINDS = {"session": "5h", "weekly": "7d"}
 
@@ -371,7 +379,65 @@ def _live_agents():
             agent = record.get("agent") if isinstance(record, dict) else None
             if agent is not None and all(agent is not known for known in agents):
                 agents.append(agent)
+    for agent in _gateway_agents():
+        if all(agent is not known for known in agents):
+            agents.append(agent)
     return agents
+
+
+def _gateway_agents():
+    """The agents the messaging gateway holds, by its private per-session cache.
+
+    Since Hermes 0.22.4 an interactive CLI hands every turn to one shared `hermes gateway run`
+    (PLG-7: plugins load there, never in the CLI), which keeps each session's agent in
+    `GatewayRunner._agent_cache` as `(agent, signature)` and the busy ones behind
+    `_snapshot_running_agents()`. The runner has no global, so it is found by type once.
+    """
+    runner = _gateway_runner()
+    if runner is None:
+        return []
+    agents = []
+    try:
+        entries = list(runner._agent_cache.values())
+    except Exception:  # missing, reshaped, or resized while copying
+        entries = []
+    for entry in entries:
+        if isinstance(entry, tuple) and entry:
+            agents.append(entry[0])
+    try:
+        agents.extend(runner._snapshot_running_agents().values())
+    except Exception:
+        pass
+    return [agent for agent in agents if getattr(agent, "session_id", None)]
+
+
+_gateway_runner_ref = None
+_gateway_runner_missed_at = None
+# The scan walks every object in the gateway; a process without a runner is not walked again
+# more often than this.
+GATEWAY_RESCAN_SECONDS = 60.0
+
+
+def _gateway_runner():
+    global _gateway_runner_ref, _gateway_runner_missed_at
+    if "gateway.run" not in sys.modules:
+        return None
+    runner = _gateway_runner_ref() if _gateway_runner_ref is not None else None
+    if runner is not None:
+        return runner
+    now = time.monotonic()
+    if _gateway_runner_missed_at is not None and now - _gateway_runner_missed_at < GATEWAY_RESCAN_SECONDS:
+        return None
+    for candidate in gc.get_objects():
+        kind = type(candidate)
+        if kind.__name__ == "GatewayRunner" and kind.__module__ == "gateway.run":
+            try:
+                _gateway_runner_ref = weakref.ref(candidate)
+            except TypeError:
+                break
+            return candidate
+    _gateway_runner_missed_at = now
+    return None
 
 
 def find_live_agent(session_id):

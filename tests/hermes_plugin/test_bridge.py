@@ -1068,7 +1068,10 @@ class FetcherTests(unittest.TestCase):
 
 class AdapterTests(unittest.TestCase):
     def setUp(self):
-        self._saved = {name: sys.modules.get(name) for name in ("hermes_cli.plugins", "tui_gateway.server")}
+        self._saved = {
+            name: sys.modules.get(name) for name in ("hermes_cli.plugins", "tui_gateway.server", "gateway.run")
+        }
+        self.forget_gateway_runner()
 
     def tearDown(self):
         for name, module in self._saved.items():
@@ -1076,6 +1079,50 @@ class AdapterTests(unittest.TestCase):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+        self.forget_gateway_runner()
+
+    @staticmethod
+    def forget_gateway_runner():
+        bridge_module._gateway_runner_ref = None
+        bridge_module._gateway_runner_missed_at = None
+
+    def install_gateway(self, cached=(), running=None):
+        """A `gateway.run` module and one live GatewayRunner, as the shared gateway has them."""
+        module = types.ModuleType("gateway.run")
+        runner_class = type("GatewayRunner", (), {"__module__": "gateway.run"})
+        runner = runner_class()
+        runner._agent_cache = {"key-%d" % index: (agent, "signature") for index, agent in enumerate(cached)}
+        runner._snapshot_running_agents = lambda: dict(running or {})
+        module.GatewayRunner = runner_class
+        sys.modules["gateway.run"] = module
+        return runner
+
+    def test_cli_turns_the_shared_gateway_runs_are_found_in_its_agent_cache(self):
+        sys.modules.pop("hermes_cli.plugins", None)
+        sys.modules.pop("tui_gateway.server", None)
+        idle, busy = FakeAgent("local-idle"), FakeAgent("local-busy")
+        runner = self.install_gateway(cached=[idle], running={"key-busy": busy})
+        self.assertIs(bridge_module.find_live_agent("local-idle"), idle)
+        self.assertIs(bridge_module.find_live_agent("local-busy"), busy)
+        self.assertIsNone(bridge_module.find_live_agent("local-gone"))
+        # An agent both cached and running is one agent, not two claims on its session.
+        runner._snapshot_running_agents = lambda: {"key-idle": idle}
+        self.assertIs(bridge_module.find_live_agent("local-idle"), idle)
+
+    def test_a_process_without_a_gateway_runner_is_not_walked_on_every_call(self):
+        sys.modules["gateway.run"] = types.ModuleType("gateway.run")
+        walks = []
+        real = bridge_module.gc.get_objects
+        bridge_module.gc.get_objects = lambda: walks.append(1) or []
+        try:
+            self.assertEqual(bridge_module._gateway_agents(), [])
+            self.assertEqual(bridge_module._gateway_agents(), [])
+        finally:
+            bridge_module.gc.get_objects = real
+        self.assertEqual(len(walks), 1)
+        sys.modules.pop("gateway.run")
+        self.forget_gateway_runner()
+        self.assertEqual(bridge_module._gateway_agents(), [])  # not a gateway: nothing is walked
 
     def install(self, cli_agent=None, tui_sessions=None):
         plugins = types.ModuleType("hermes_cli.plugins")
@@ -1256,6 +1303,10 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn(KEY_A.encode(), data)
         hooks["on_session_finalize"](session_id="s1", platform="tui")
         self.assertEqual(os.listdir(mailbox), [])
+        # A CLI turn the shared gateway runs (Hermes 0.22.4+) is interactive too.
+        hooks["pre_api_request"](session_id="s1", platform="local")
+        self.assertEqual(sorted(os.listdir(mailbox)), ["s1.json", "s1.lock"])
+        hooks["on_session_finalize"](session_id="s1", platform="local")
 
     def test_the_notifier_passes_the_state_dir_without_touching_the_environment(self):
         out = self.root / "notified"
