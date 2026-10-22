@@ -494,6 +494,49 @@ class MailboxTests(BridgeCase):
                 sys.modules["gateway.run"] = saved
         self.assertIs(self.record()["pane_scoped"], False)
 
+    def in_gateway(self, client_env):
+        """A shared gateway's runner, in a turn it bound `client_env` for (None: unbound)."""
+        names = ("gateway.run", "agent", "agent.session_client_env")
+        saved = {name: sys.modules.get(name) for name in names}
+        gateway = types.ModuleType("gateway.run")
+        gateway._gateway_runner_ref = lambda: types.SimpleNamespace()
+        bound = types.ModuleType("agent.session_client_env")
+        bound.bound_client_env = lambda: client_env
+        sys.modules.update({names[0]: gateway, names[1]: types.ModuleType("agent"), names[2]: bound})
+
+        def restore():
+            for name, module in saved.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+        self.addCleanup(restore)
+
+    def test_a_gateway_session_names_the_pane_its_client_runs_in(self):
+        self.in_gateway({"HERDR_ENV": "1", "HERDR_PANE_ID": "w9:p2", "PATH": "/bin"})
+        self.bridge.observe("s1")
+        record = self.record()
+        self.assertEqual((record["pane_id"], record["pane_scoped"]), ("w9:p2", True))
+
+    def test_a_gateway_session_whose_client_sent_no_pane_is_no_panes_reading(self):
+        sessions = {"s1": {"PATH": "/bin"}, "s2": {"HERDR_PANE_ID": "w9:p2"}, "s3": {"HERDR_ENV": "1"}}
+        for session_id, client_env in sessions.items():
+            self.agents[session_id] = FakeAgent(session_id)
+            self.in_gateway(client_env)
+            self.bridge.observe(session_id)
+            record = self.record(session_id)
+            self.assertEqual((record["pane_id"], record["pane_scoped"]), ("w1:p1", False), client_env)
+
+    def test_a_pane_learned_after_the_first_record_rewrites_it_at_once(self):
+        self.in_gateway(None)  # `/new`'s reset fires outside the session's turn
+        self.bridge.observe("s1")
+        self.assertIs(self.record()["pane_scoped"], False)
+        self.in_gateway({"HERDR_ENV": "1", "HERDR_PANE_ID": "w9:p2"})
+        self.bridge.observe("s1")
+        record = self.record()
+        self.assertEqual((record["pane_id"], record["pane_scoped"]), ("w9:p2", True))
+
     def test_a_session_is_asked_about_at_most_once_a_minute(self):
         self.bridge.observe("s1")
         self.bridge.tick()
