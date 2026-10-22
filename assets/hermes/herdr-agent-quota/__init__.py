@@ -415,6 +415,25 @@ def _gateway_runner():
         return None
 
 
+def _session_pane():
+    """The herdr pane of the terminal whose CLI runs the session a hook fires for, else None.
+
+    The shared gateway binds each CLI session's client environment for its turns. HERDR_* are
+    in it once `terminal.client_env_passthrough` lists them (`herdr integration install
+    hermes` adds them). Outside a bound turn the bridge's own pane is the only one known.
+    """
+    try:
+        from agent.session_client_env import bound_client_env
+
+        env = bound_client_env()
+    except Exception:  # a Hermes without per-session client environments
+        return None
+    if env is None:
+        return None
+    pane = str(env.get("HERDR_PANE_ID", "")).strip()
+    return pane if env.get("HERDR_ENV") == "1" and _PANE_ID_RE.fullmatch(pane) else None
+
+
 def find_live_agent(session_id):
     """The one live agent whose session id is exactly `session_id`, else None."""
     matches = [
@@ -462,7 +481,7 @@ def fetch_codex_windows(base_url, api_key):
 
 class _Session:
     __slots__ = (
-        "session_id", "lock_fd", "epoch", "signature", "model", "quota", "wants_fetch",
+        "session_id", "lock_fd", "pane_id", "epoch", "signature", "model", "quota", "wants_fetch",
         "next_fetch_at", "failures", "fetch_token", "fetch_started", "missing_ticks", "written_at",
         "attempts", "claude_key", "claude_stamp", "claude_checked_at",
     )
@@ -470,6 +489,7 @@ class _Session:
     def __init__(self, session_id, lock_fd):
         self.session_id = session_id
         self.lock_fd = lock_fd
+        self.pane_id = None  # the session's own pane, once a hook in its turn names one
         self.epoch = 0
         self.signature = None
         self.model = None
@@ -541,6 +561,10 @@ class Bridge:
                 if lock_fd is None:  # another live process owns this session's mailbox
                     return
                 session = self._sessions[session_id] = _Session(session_id, lock_fd)
+            pane = _session_pane()
+            if pane is not None and pane != session.pane_id:
+                session.pane_id = pane
+                session.written_at = 0.0  # rewrite now: the reader finds the record by its pane
             self._reconcile(session, agent)
             if activity and session.signature is not None and session.signature.supported:
                 session.wants_fetch = True
@@ -778,12 +802,11 @@ class Bridge:
         record = {
             "schema": SCHEMA,
             "session_id": session.session_id,
-            "pane_id": self._pane_id,
             # The shared gateway serves every pane's CLI but has the HERDR_PANE_ID of the one
-            # that started it, so its records name no pane of their own. shortcut: the quota
-            # plugin then counts them for the Hermes badge only and shows no per-pane bars;
-            # upgrade once Hermes hands a hook the CLI's pane.
-            "pane_scoped": _gateway_runner() is None,
+            # that started it. A session whose own pane is unknown keeps that pane for the
+            # Hermes badge, and says it is no pane's reading.
+            "pane_id": session.pane_id or self._pane_id,
+            "pane_scoped": session.pane_id is not None or _gateway_runner() is None,
             "profile": "default",
             "pid": os.getpid(),
             "route": {
