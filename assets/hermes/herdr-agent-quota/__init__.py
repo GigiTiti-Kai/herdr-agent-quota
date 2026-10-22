@@ -19,15 +19,17 @@ that route and nothing is sent anywhere to decide it.
 
 Scope, on purpose:
 
-* default profile only, interactive CLI/TUI sessions only, inside a Herdr pane only;
+* default profile only, interactive CLI/TUI sessions only (and CLI turns the shared gateway
+  runs), inside a Herdr pane only;
 * `openai-codex` over `https://chatgpt.com/backend-api` only. Anything else is recorded as an
   unsupported route with no quota, never asked about through another credential;
 * any change of provider, endpoint, pool entry, or token starts a new epoch and drops the quota
   before anything else happens. A usage answer that arrives for an older epoch is discarded.
 
-Hermes has no public way to reach the live agent from a hook, so `_live_agents` reads two private
-attributes. They are confined to that one function; when they are missing the plugin knows
-nothing and writes no quota.
+Hermes has no public way to reach the live agent from a hook, so `_live_agents` reads private
+attributes (the CLI's, the TUI gateway's, and the messaging gateway's that runs CLI turns since
+0.22.4). They are confined to those functions; when they are missing the plugin knows nothing
+and writes no quota.
 """
 
 # HERDR_AGENT_QUOTA_BRIDGE_VERSION=3
@@ -62,7 +64,8 @@ SUPPORTED_PROVIDER = "openai-codex"
 SUPPORTED_API_MODE = "codex_responses"
 SUPPORTED_HOST = "chatgpt.com"
 SUPPORTED_PATH = "/backend-api"
-INTERACTIVE_PLATFORMS = frozenset({"cli", "tui"})
+# The shared gateway (Hermes 0.22.4+) runs CLI turns as `cli` and fires `/new`'s reset as `local`.
+INTERACTIVE_PLATFORMS = frozenset({"cli", "tui", "local"})
 # Hermes's labels for the two plain Codex pools. Anything else is not a window.
 WINDOW_KINDS = {"session": "5h", "weekly": "7d"}
 
@@ -169,8 +172,9 @@ def token_principal_stamp(api_key):
 
     The account is the token's own `chatgpt_account_id` claim: the value Hermes sends as the
     `ChatGPT-Account-ID` header of every Codex request made with this token. Members of one
-    workspace share it but each has their own quota, so the user (`sub`) is part of the stamp,
-    the same (account, sub) pair Hermes uses to tell two Codex credentials apart. The signature
+    workspace share it but each has their own quota, so the seat (`chatgpt_account_user_id`) is
+    part of the stamp. Not `sub`: it names the sign-in method too, so the same seat signed in to
+    Codex with email and to Hermes with Google would never match. The signature
     is not checked; the claims only name the principal, and the token is what the backend
     authenticates. A value that is not such a token names nothing.
     """
@@ -189,7 +193,7 @@ def token_principal_stamp(api_key):
         return None
     auth = claims.get(OPENAI_AUTH_CLAIM)
     account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
-    subject = claims.get("sub")
+    subject = auth.get("chatgpt_account_user_id") if isinstance(auth, dict) else None
     if not isinstance(account, str) or not account or not isinstance(subject, str) or not subject:
         return None
     return chatgpt_principal_stamp(account, subject)
@@ -370,7 +374,45 @@ def _live_agents():
             agent = record.get("agent") if isinstance(record, dict) else None
             if agent is not None and all(agent is not known for known in agents):
                 agents.append(agent)
+    for agent in _gateway_agents():
+        if all(agent is not known for known in agents):
+            agents.append(agent)
     return agents
+
+
+def _gateway_agents():
+    """The agents the messaging gateway holds, by its private per-session cache.
+
+    Since Hermes 0.22.4 an interactive CLI hands every turn to one shared `hermes gateway run`
+    (PLG-7: plugins load there, never in the CLI), which keeps each session's agent in
+    `GatewayRunner._agent_cache` as `(agent, signature)` and the busy ones behind
+    `_snapshot_running_agents()`. A gateway that multiplexes several profiles holds other
+    profiles' agents too, so it yields none.
+    """
+    runner = _gateway_runner()
+    if runner is None or getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+        return []
+    agents = []
+    try:
+        entries = list(runner._agent_cache.values())
+    except Exception:  # missing, reshaped, or resized while copying
+        entries = []
+    for entry in entries:
+        if isinstance(entry, tuple) and entry:
+            agents.append(entry[0])
+    try:
+        agents.extend(runner._snapshot_running_agents().values())
+    except Exception:
+        pass
+    return [agent for agent in agents if getattr(agent, "session_id", None)]
+
+
+def _gateway_runner():
+    """The live GatewayRunner of this process, by the weakref `gateway.run` keeps for its tools."""
+    try:
+        return sys.modules["gateway.run"]._gateway_runner_ref()
+    except Exception:  # not a gateway, or reshaped upstream
+        return None
 
 
 def find_live_agent(session_id):
@@ -737,6 +779,11 @@ class Bridge:
             "schema": SCHEMA,
             "session_id": session.session_id,
             "pane_id": self._pane_id,
+            # The shared gateway serves every pane's CLI but has the HERDR_PANE_ID of the one
+            # that started it, so its records name no pane of their own. shortcut: the quota
+            # plugin then counts them for the Hermes badge only and shows no per-pane bars;
+            # upgrade once Hermes hands a hook the CLI's pane.
+            "pane_scoped": _gateway_runner() is None,
             "profile": "default",
             "pid": os.getpid(),
             "route": {

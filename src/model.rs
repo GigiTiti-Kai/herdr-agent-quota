@@ -715,11 +715,11 @@ pub struct ProviderSnapshot {
     /// Never persisted, so a save merging this snapshot keeps the raw maps.
     #[serde(skip)]
     pub collector_disabled: bool,
-    /// Set on load when Agy's `settings.json` (rewritten by `/model`) is newer
-    /// than the last statusLine observation: its root `model` outranks every
-    /// pane-keyed model. Never persisted.
+    /// Set on load from Agy's `settings.json` (rewritten by `/model`): its
+    /// root `model` and write time. It outranks the pane-keyed model of any
+    /// pane last observed before that write. Never persisted.
     #[serde(skip)]
-    pub settings_model: Option<String>,
+    pub settings_model: Option<(String, u64)>,
 }
 
 impl ProviderSnapshot {
@@ -824,8 +824,16 @@ impl ProviderSnapshot {
     /// points at this same conversation. An exact hit in `session_windows`
     /// is not permission to borrow another pane's label.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
-        if let Some(model) = self.settings_model.as_deref() {
-            return Some(model);
+        if let Some((model, written)) = &self.settings_model {
+            let seen = match session_id {
+                Some(id) => self
+                    .session_for_lookup(id)
+                    .and_then(|id| self.session_seen_unix.get(id)),
+                None => self.session_seen_unix.values().max(),
+            };
+            if seen.is_none_or(|seen| seen < written) {
+                return Some(model);
+            }
         }
         if self.collector_disabled {
             return None;
@@ -1943,7 +1951,8 @@ mod tests {
 
         // `/model` after the toggle: settings.json names the model, the
         // context still has no current source.
-        snapshot.settings_model = Some("Gemini 4 Argon (High)".to_string());
+        snapshot.session_seen_unix.insert("w35:p3".to_string(), 500);
+        snapshot.settings_model = Some(("Gemini 4 Argon (High)".to_string(), 1_000));
         assert_eq!(
             snapshot.model_for_session(Some("w35:p3")),
             Some("Gemini 4 Argon (High)")
@@ -1962,6 +1971,32 @@ mod tests {
             Some("Gemini 4 Argon (High)")
         );
         assert!(snapshot.context_for_session(Some("w35:p3")).is_some());
+
+        // Live failure: another Agy pane fed the collector after the write.
+        // That pane keeps its own model; the silent pane still takes the
+        // settings model instead of its stale pane-keyed one.
+        snapshot
+            .session_models
+            .insert("w5V:p1".to_string(), "Gemini 3.8 Flash (Low)".to_string());
+        snapshot
+            .session_seen_unix
+            .insert("w5V:p1".to_string(), 2_000);
+        assert_eq!(
+            snapshot.model_for_session(Some("w5V:p1")),
+            Some("Gemini 3.8 Flash (Low)")
+        );
+        assert_eq!(
+            snapshot.model_for_session(Some("w35:p3")),
+            Some("Gemini 4 Argon (High)")
+        );
+        // Once the pane itself is observed after the write, its own wins.
+        snapshot
+            .session_seen_unix
+            .insert("w35:p3".to_string(), 1_500);
+        assert_eq!(
+            snapshot.model_for_session(Some("w35:p3")),
+            Some("Gemini 3.8 Flash (High)")
+        );
     }
 
     #[test]

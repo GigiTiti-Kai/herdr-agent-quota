@@ -47,10 +47,11 @@ pub struct CollectorState {
     /// `/statusline` wrote `enabled:false` and nothing was observed since:
     /// the cached context belongs to an earlier conversation.
     pub disabled: bool,
-    /// Root `model` of `settings.json`, which `/model` rewrites, when that
-    /// write is newer than the last observation. It is then the newest
-    /// evidence of the active model, whether or not the hook still runs.
-    pub settings_model: Option<String>,
+    /// Root `model` of `settings.json`, which `/model` rewrites, and when it
+    /// was written (unix seconds). For a pane observed before that write it
+    /// is the newest evidence of the active model, whether or not the hook
+    /// still runs; the snapshot decides per pane.
+    pub settings_model: Option<(String, u64)>,
 }
 
 /// Agy's `/statusline` toggle writes `enabled:false`; its pane-keyed
@@ -73,12 +74,17 @@ fn state_at(settings: &Path, observation: &Path) -> CollectorState {
         (Some(observed), Some(written)) => observed < written,
         _ => true,
     };
-    // shortcut: `model` is one value for every Agy pane, so with several
-    // panes it is right only for the one that ran `/model`; gate on the Agy
-    // pane count from the inventory if that mismatch ever shows up.
-    let settings_model = settings_newer
-        .then(|| std::fs::read(settings).ok())
-        .flatten()
+    // Compared with each pane's own last observation, not the shared
+    // observation file: another Agy calling the collector must not hand a
+    // silent pane back its stale pane-keyed model.
+    // shortcut: `model` is one value for every Agy pane, so a pane that has
+    // not rendered since another pane's `/model` shows that model until its
+    // next observation; key it by pane if Agy ever writes a per-pane model.
+    let written = modified(settings)
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|at| at.as_secs());
+    let settings_model = std::fs::read(settings)
+        .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| {
             value
@@ -87,7 +93,8 @@ fn state_at(settings: &Path, observation: &Path) -> CollectorState {
                 .map(str::trim)
                 .map(str::to_string)
         })
-        .filter(|model| !model.is_empty());
+        .filter(|model| !model.is_empty())
+        .zip(written);
     CollectorState {
         disabled: settings_newer && statusline_disabled(settings),
         settings_model,
@@ -210,8 +217,10 @@ mod tests {
     /// Live failure: `/statusline` off, then `/model` Flash→Opus→Argon→Flash.
     /// Every `/model` rewrites `settings.json`, so the pane-keyed cache can
     /// never catch up; the root `model` there is the only current evidence.
+    /// The model is read with its write time whatever the shared observation
+    /// file says: the snapshot compares it with each pane's own observation.
     #[test]
-    fn a_settings_write_newer_than_the_observation_supplies_the_model() {
+    fn the_settings_model_comes_with_its_write_time() {
         use std::time::{Duration, SystemTime};
         let directory = tempfile::tempdir().unwrap();
         let settings = directory.path().join("settings.json");
@@ -229,29 +238,24 @@ mod tests {
             r#"{"model":" Gemini 3.8 Flash (High) ","statusLine":{"command":"x","enabled":false}}"#;
         touch(&settings, flash, 1_000);
         touch(&observation, "{}", 999);
+        let model = Some(("Gemini 3.8 Flash (High)".to_string(), 1_000));
         assert_eq!(
             state_at(&settings, &observation),
             CollectorState {
                 disabled: true,
-                settings_model: Some("Gemini 3.8 Flash (High)".to_string()),
+                settings_model: model.clone(),
             }
         );
-        // Re-enabled but no observation yet: the model is still the newest.
-        touch(
-            &settings,
-            r#"{"model":"Gemini 3.8 Flash (High)","statusLine":{"command":"x"}}"#,
-            1_002,
-        );
+        // Another Agy's observation after the write keeps the model: whether
+        // it outranks a pane depends on that pane's own observation.
+        touch(&observation, "{}", 1_003);
         assert_eq!(
             state_at(&settings, &observation),
             CollectorState {
                 disabled: false,
-                settings_model: Some("Gemini 3.8 Flash (High)".to_string()),
+                settings_model: model,
             }
         );
-        // A later observation outranks the settings file.
-        touch(&observation, "{}", 1_003);
-        assert_eq!(state_at(&settings, &observation), CollectorState::default());
         // No model key gives nothing to fall back on.
         touch(
             &settings,

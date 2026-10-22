@@ -26,13 +26,14 @@ bridge_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge_module)
 
 
-def fake_jwt(account_id, subject=None, signature="fake-signature"):
-    """A made-up access token shaped like a ChatGPT one: only its account and user claims matter."""
+def fake_jwt(account_id, subject=None, signature="fake-signature", sub="auth0|fake"):
+    """A made-up access token shaped like a ChatGPT one: only its account and seat claims matter."""
     def segment(value):
         return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
 
-    claims = {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
-    claims["sub"] = SUBJECT_1 if subject is None else subject
+    claims = {"sub": sub, "https://api.openai.com/auth": {
+        "chatgpt_account_id": account_id,
+        "chatgpt_account_user_id": SUBJECT_1 if subject is None else subject}}
     return ".".join((segment({"alg": "none"}), segment(claims), signature))
 
 
@@ -276,6 +277,9 @@ class RouteTests(unittest.TestCase):
         refreshed = bridge_module.read_route(FakeAgent(key=JWT_X2), HMAC_KEY)[0]
         self.assertNotEqual(refreshed.identity, signature.identity)
         self.assertEqual(refreshed.principal, signature.principal)
+        # The same seat signed in another way: `sub` names the sign-in method, not the seat.
+        google = bridge_module.read_route(FakeAgent(key=fake_jwt(ACCOUNT_X, sub="google-oauth2|fake")), HMAC_KEY)[0]
+        self.assertEqual(google.principal, signature.principal)
         # Another seat of the same workspace (same account id, own quota), and another account.
         seat = bridge_module.read_route(FakeAgent(key=JWT_X_SEAT2), HMAC_KEY)[0]
         self.assertNotEqual(seat.principal, signature.principal)
@@ -457,8 +461,9 @@ class MailboxTests(BridgeCase):
         record = self.record()
         self.assertEqual(self.fetched, [(CODEX_BASE, KEY_A)])
         self.assertEqual(
-            set(record), {"schema", "session_id", "pane_id", "profile", "pid", "route", "quota"}
+            set(record), {"schema", "session_id", "pane_id", "pane_scoped", "profile", "pid", "route", "quota"}
         )
+        self.assertIs(record["pane_scoped"], True)  # not a shared gateway: the pane is this session's
         self.assertEqual(set(record["route"]), {"epoch", "provider", "supported", "identity", "principal",
                                                 "claude_credentials", "observed_at"})
         # A token that is not a ChatGPT access token names no principal.
@@ -474,6 +479,20 @@ class MailboxTests(BridgeCase):
         mode = stat.S_IMODE(os.stat(self.dir / "s1.json").st_mode)
         self.assertEqual(mode, 0o600)
         self.assertEqual(len(self.notified), 1)
+
+    def test_a_shared_gateways_record_names_no_pane_of_its_own(self):
+        saved = sys.modules.get("gateway.run")
+        gateway = types.ModuleType("gateway.run")
+        gateway._gateway_runner_ref = lambda: types.SimpleNamespace()
+        sys.modules["gateway.run"] = gateway
+        try:
+            self.bridge.observe("s1")
+        finally:
+            if saved is None:
+                sys.modules.pop("gateway.run", None)
+            else:
+                sys.modules["gateway.run"] = saved
+        self.assertIs(self.record()["pane_scoped"], False)
 
     def test_a_session_is_asked_about_at_most_once_a_minute(self):
         self.bridge.observe("s1")
@@ -1064,7 +1083,9 @@ class FetcherTests(unittest.TestCase):
 
 class AdapterTests(unittest.TestCase):
     def setUp(self):
-        self._saved = {name: sys.modules.get(name) for name in ("hermes_cli.plugins", "tui_gateway.server")}
+        self._saved = {
+            name: sys.modules.get(name) for name in ("hermes_cli.plugins", "tui_gateway.server", "gateway.run")
+        }
 
     def tearDown(self):
         for name, module in self._saved.items():
@@ -1072,6 +1093,39 @@ class AdapterTests(unittest.TestCase):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+    def install_gateway(self, cached=(), running=None, multiplex=False):
+        """A `gateway.run` module and its live runner, as the shared gateway has them."""
+        module = types.ModuleType("gateway.run")
+        runner = types.SimpleNamespace(config=types.SimpleNamespace(multiplex_profiles=multiplex))
+        runner._agent_cache = {"key-%d" % index: (agent, "signature") for index, agent in enumerate(cached)}
+        runner._snapshot_running_agents = lambda: dict(running or {})
+        module._gateway_runner_ref = lambda: runner
+        sys.modules["gateway.run"] = module
+        return runner
+
+    def test_cli_turns_the_shared_gateway_runs_are_found_in_its_agent_cache(self):
+        sys.modules.pop("hermes_cli.plugins", None)
+        sys.modules.pop("tui_gateway.server", None)
+        idle, busy = FakeAgent("local-idle"), FakeAgent("local-busy")
+        runner = self.install_gateway(cached=[idle], running={"key-busy": busy})
+        self.assertIs(bridge_module.find_live_agent("local-idle"), idle)
+        self.assertIs(bridge_module.find_live_agent("local-busy"), busy)
+        self.assertIsNone(bridge_module.find_live_agent("local-gone"))
+        # An agent both cached and running is one agent, not two claims on its session.
+        runner._snapshot_running_agents = lambda: {"key-idle": idle}
+        self.assertIs(bridge_module.find_live_agent("local-idle"), idle)
+
+    def test_no_runner_a_reshaped_one_or_a_multiplexing_one_yields_no_gateway_agent(self):
+        sys.modules.pop("gateway.run", None)
+        self.assertEqual(bridge_module._gateway_agents(), [])
+        sys.modules["gateway.run"] = types.ModuleType("gateway.run")  # imported, no runner ref
+        self.assertEqual(bridge_module._gateway_agents(), [])
+        self.install_gateway(cached=[FakeAgent("local-1")]).__dict__.pop("_agent_cache")
+        self.assertEqual(bridge_module._gateway_agents(), [])
+        # Another profile's agents share a multiplexing runner.
+        self.install_gateway(cached=[FakeAgent("local-1")], multiplex=True)
+        self.assertEqual(bridge_module._gateway_agents(), [])
 
     def install(self, cli_agent=None, tui_sessions=None):
         plugins = types.ModuleType("hermes_cli.plugins")
@@ -1252,6 +1306,10 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn(KEY_A.encode(), data)
         hooks["on_session_finalize"](session_id="s1", platform="tui")
         self.assertEqual(os.listdir(mailbox), [])
+        # The shared gateway (Hermes 0.22.4+) fires `/new`'s reset as `local`.
+        hooks["on_session_reset"](session_id="s1", platform="local")
+        self.assertEqual(sorted(os.listdir(mailbox)), ["s1.json", "s1.lock"])
+        hooks["on_session_finalize"](session_id="s1", platform="local")
 
     def test_the_notifier_passes_the_state_dir_without_touching_the_environment(self):
         out = self.root / "notified"

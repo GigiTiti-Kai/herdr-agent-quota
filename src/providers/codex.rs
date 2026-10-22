@@ -990,7 +990,7 @@ pub struct LoginPrincipal {
     /// snapshot is stamped with the same id when it belongs to this login.
     pub account_id: String,
     /// [`crate::providers::hermes::chatgpt_principal_stamp`] of that account
-    /// and the token's user (`sub`). Never written anywhere.
+    /// and the token's seat (`chatgpt_account_user_id`). Never written anywhere.
     pub stamp: String,
 }
 
@@ -1003,9 +1003,11 @@ pub fn current_login_principal() -> Option<LoginPrincipal> {
 /// The token is read only to decode its claims (the JWT payload; the
 /// signature is not checked, the claims only name the login) and is dropped
 /// at once. Members of one ChatGPT workspace share `tokens.account_id`, so
-/// the account id alone cannot tell two seats apart; the token's `sub` can.
-/// A token whose account claim disagrees with `tokens.account_id`, or that
-/// names no user, names no principal.
+/// the account id alone cannot tell two seats apart; the token's
+/// `chatgpt_account_user_id` can. Not `sub`: it also names the sign-in
+/// method, so one seat signed in two ways would look like two. A token whose
+/// account claim disagrees with `tokens.account_id`, or that names no seat,
+/// names no principal.
 pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
     #[derive(Deserialize)]
     struct AuthTokens {
@@ -1031,12 +1033,10 @@ pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
         .or(tokens.chatgpt_account_id)
         .filter(|value| !value.is_empty())?;
     let claims = tokens.access_token.as_deref().and_then(jwt_claims)?;
-    let claimed = claims
-        .get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_account_id"))
-        .and_then(Value::as_str)?;
-    let subject = claims
-        .get("sub")
+    let auth = claims.get("https://api.openai.com/auth")?;
+    let claimed = auth.get("chatgpt_account_id").and_then(Value::as_str)?;
+    let subject = auth
+        .get("chatgpt_account_user_id")
         .and_then(Value::as_str)
         .filter(|subject| !subject.is_empty())?;
     (claimed == account_id).then(|| LoginPrincipal {
@@ -1224,15 +1224,19 @@ mod tests {
     fn the_login_principal_is_the_tokens_account_and_user() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("auth.json");
-        let claims = |account: &str, subject: Option<&str>| {
+        let claims_signed_in = |account: &str, subject: Option<&str>, sub: &str| {
             let mut claims = serde_json::json!({
+                "sub": sub,
                 "https://api.openai.com/auth": {"chatgpt_account_id": account}
             });
             if let Some(subject) = subject {
-                claims["sub"] = serde_json::json!(subject);
+                claims["https://api.openai.com/auth"]["chatgpt_account_user_id"] =
+                    serde_json::json!(subject);
             }
             fake_access_token(&claims)
         };
+        let claims =
+            |account: &str, subject: Option<&str>| claims_signed_in(account, subject, "auth0|fake");
         write_auth(&path, "acc-1", &claims("acc-1", Some("user-1")));
         let principal = login_principal_from_auth(&path).expect("principal");
         assert_eq!(principal.account_id, "acc-1");
@@ -1245,6 +1249,13 @@ mod tests {
             login_principal_from_auth(&path).unwrap().stamp,
             principal.stamp
         );
+        // The same seat signed in another way (`sub` names the method).
+        write_auth(
+            &path,
+            "acc-1",
+            &claims_signed_in("acc-1", Some("user-1"), "google-oauth2|fake"),
+        );
+        assert_eq!(login_principal_from_auth(&path).unwrap(), principal);
 
         // The token names another account than the login records, or no user.
         write_auth(&path, "acc-1", &claims("acc-2", Some("user-1")));
