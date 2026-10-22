@@ -1235,9 +1235,8 @@ mod tests {
             }
             fake_access_token(&claims)
         };
-        let claims = |account: &str, subject: Option<&str>| {
-            claims_signed_in(account, subject, "auth0|fake")
-        };
+        let claims =
+            |account: &str, subject: Option<&str>| claims_signed_in(account, subject, "auth0|fake");
         write_auth(&path, "acc-1", &claims("acc-1", Some("user-1")));
         let principal = login_principal_from_auth(&path).expect("principal");
         assert_eq!(principal.account_id, "acc-1");

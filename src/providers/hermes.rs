@@ -144,6 +144,11 @@ pub fn load(
         return None;
     }
     let record = live_record(&directory, session_id)?;
+    // A shared Hermes gateway names the pane that started it, not this session's: such a
+    // record proves the badge's principal but never a pane's bars.
+    if record.get("pane_scoped").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
     parse_record(&record, pane_id, session_id, provider_id, now_unix)
 }
 
@@ -781,6 +786,25 @@ mod tests {
         );
         // No account id, no session maps: it is this session's reading only.
         assert_eq!(snapshot.account_id, None);
+    }
+
+    /// A shared Hermes gateway writes the pane that started it into every
+    /// session's record: still a principal for the badge, never a pane's bars.
+    #[test]
+    fn a_shared_gateways_record_counts_for_the_badge_but_is_no_panes_reading() {
+        let state = tempfile::tempdir().unwrap();
+        let principal = stamp("acc-1", "user-1");
+        let mut value = record("w1:p1", "s1", 12.0);
+        value["route"]["principal"] = json!(principal);
+        value["pane_scoped"] = json!(false);
+        let producer = write(state.path(), "s1", &value);
+        assert!(loaded(state.path()).is_none());
+        assert_eq!(live_principals(state.path(), NOW), vec![principal]);
+        drop(producer);
+        // An older bridge writes no such field: its pane is its own.
+        value.as_object_mut().unwrap().remove("pane_scoped");
+        let _producer = write(state.path(), "s1", &value);
+        assert!(loaded(state.path()).is_some());
     }
 
     /// The same record is a reading for exactly one pane, session, and

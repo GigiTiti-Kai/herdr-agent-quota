@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import atexit
 import base64
-import gc
 import hashlib
 import hmac
 import json
@@ -51,7 +50,6 @@ import subprocess
 import sys
 import threading
 import time
-import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -66,10 +64,7 @@ SUPPORTED_PROVIDER = "openai-codex"
 SUPPORTED_API_MODE = "codex_responses"
 SUPPORTED_HOST = "chatgpt.com"
 SUPPORTED_PATH = "/backend-api"
-# `local` is a CLI turn run by the shared gateway (Hermes 0.22.4+). The gateway is one process for
-# every CLI, so its HERDR_PANE_ID is whichever pane started it: a record's pane is not the
-# session's. shortcut: the quota plugin's Hermes badge counts records by principal and never by
-# pane; per-pane bars need the CLI's pane in the hook payload, upgrade once Hermes passes one.
+# The shared gateway (Hermes 0.22.4+) runs CLI turns as `cli` and fires `/new`'s reset as `local`.
 INTERACTIVE_PLATFORMS = frozenset({"cli", "tui", "local"})
 # Hermes's labels for the two plain Codex pools. Anything else is not a window.
 WINDOW_KINDS = {"session": "5h", "weekly": "7d"}
@@ -391,10 +386,11 @@ def _gateway_agents():
     Since Hermes 0.22.4 an interactive CLI hands every turn to one shared `hermes gateway run`
     (PLG-7: plugins load there, never in the CLI), which keeps each session's agent in
     `GatewayRunner._agent_cache` as `(agent, signature)` and the busy ones behind
-    `_snapshot_running_agents()`. The runner has no global, so it is found by type once.
+    `_snapshot_running_agents()`. A gateway that multiplexes several profiles holds other
+    profiles' agents too, so it yields none.
     """
     runner = _gateway_runner()
-    if runner is None:
+    if runner is None or getattr(getattr(runner, "config", None), "multiplex_profiles", False):
         return []
     agents = []
     try:
@@ -411,33 +407,12 @@ def _gateway_agents():
     return [agent for agent in agents if getattr(agent, "session_id", None)]
 
 
-_gateway_runner_ref = None
-_gateway_runner_missed_at = None
-# The scan walks every object in the gateway; a process without a runner is not walked again
-# more often than this.
-GATEWAY_RESCAN_SECONDS = 60.0
-
-
 def _gateway_runner():
-    global _gateway_runner_ref, _gateway_runner_missed_at
-    if "gateway.run" not in sys.modules:
+    """The live GatewayRunner of this process, by the weakref `gateway.run` keeps for its tools."""
+    try:
+        return sys.modules["gateway.run"]._gateway_runner_ref()
+    except Exception:  # not a gateway, or reshaped upstream
         return None
-    runner = _gateway_runner_ref() if _gateway_runner_ref is not None else None
-    if runner is not None:
-        return runner
-    now = time.monotonic()
-    if _gateway_runner_missed_at is not None and now - _gateway_runner_missed_at < GATEWAY_RESCAN_SECONDS:
-        return None
-    for candidate in gc.get_objects():
-        kind = type(candidate)
-        if kind.__name__ == "GatewayRunner" and kind.__module__ == "gateway.run":
-            try:
-                _gateway_runner_ref = weakref.ref(candidate)
-            except TypeError:
-                break
-            return candidate
-    _gateway_runner_missed_at = now
-    return None
 
 
 def find_live_agent(session_id):
@@ -804,6 +779,11 @@ class Bridge:
             "schema": SCHEMA,
             "session_id": session.session_id,
             "pane_id": self._pane_id,
+            # The shared gateway serves every pane's CLI but has the HERDR_PANE_ID of the one
+            # that started it, so its records name no pane of their own. shortcut: the quota
+            # plugin then counts them for the Hermes badge only and shows no per-pane bars;
+            # upgrade once Hermes hands a hook the CLI's pane.
+            "pane_scoped": _gateway_runner() is None,
             "profile": "default",
             "pid": os.getpid(),
             "route": {

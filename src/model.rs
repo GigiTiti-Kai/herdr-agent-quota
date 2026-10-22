@@ -1978,7 +1978,9 @@ mod tests {
         snapshot
             .session_models
             .insert("w5V:p1".to_string(), "Gemini 3.8 Flash (Low)".to_string());
-        snapshot.session_seen_unix.insert("w5V:p1".to_string(), 2_000);
+        snapshot
+            .session_seen_unix
+            .insert("w5V:p1".to_string(), 2_000);
         assert_eq!(
             snapshot.model_for_session(Some("w5V:p1")),
             Some("Gemini 3.8 Flash (Low)")
@@ -1988,7 +1990,9 @@ mod tests {
             Some("Gemini 4 Argon (High)")
         );
         // Once the pane itself is observed after the write, its own wins.
-        snapshot.session_seen_unix.insert("w35:p3".to_string(), 1_500);
+        snapshot
+            .session_seen_unix
+            .insert("w35:p3".to_string(), 1_500);
         assert_eq!(
             snapshot.model_for_session(Some("w35:p3")),
             Some("Gemini 3.8 Flash (High)")
