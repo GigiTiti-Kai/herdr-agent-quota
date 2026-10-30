@@ -1685,6 +1685,10 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
             }
             _ => snapshot,
         };
+    } else if provider == Provider::Agy {
+        // Reparse new bucket support without borrowing another session's quota or age.
+        snapshot.windows =
+            crate::providers::agy::parse_statusline(&value, snapshot.fetched_at_unix)?.windows;
     }
     let previous_cache = cache
         .load(provider)
@@ -1708,6 +1712,13 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
         .or_else(|| value.get("conversationId"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    if provider == Provider::Agy {
+        if let Some(session_id) = session_id.as_ref() {
+            snapshot
+                .session_windows
+                .insert(session_id.clone(), snapshot.windows.clone());
+        }
+    }
     Ok(FetchedSnapshot {
         snapshot,
         preserve_context: true,
@@ -2472,7 +2483,7 @@ fn tokens_for_loaded_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{PercentStyle, SidebarLayout};
+    use crate::cli::{FieldSet, PercentStyle, SidebarLayout};
     use crate::model::{
         ProviderSnapshot, ResetAt, SessionQuotaObservation, UsageWindow, WindowKind,
     };
@@ -3663,6 +3674,79 @@ mod tests {
             row,
         );
         assert_eq!(no_session.quota_5h, "5h 10%");
+    }
+
+    #[test]
+    fn argon_weekly_upgrade_reparses_only_the_latest_mailbox_session() {
+        let dir = tempdir().unwrap();
+        let cache = CacheStore::new(dir.path());
+        let payload = serde_json::json!({"session_id":"current", "model":{"display_name":"Gemini 4 Argon (High)"},
+        "quota": {
+            "gemini-5h":{"remaining_fraction":0.8,"reset_in_seconds":3600},
+            "gemini-weekly":{"remaining_fraction":0.6,"reset_in_seconds":86400},
+            "gemini-argon-wtu-weekly":{"remaining_fraction":0.08,"reset_in_seconds":7200}
+        }});
+        let mut old = crate::providers::agy::parse_statusline(&payload, SUMMARY_NOW).unwrap();
+        old.windows.retain(|w| w.kind != WindowKind::WeeklyScoped);
+        old.session_windows
+            .insert("current".into(), old.windows.clone());
+        old.session_windows.insert(
+            "sibling".into(),
+            vec![window(WindowKind::Weekly, 20.0, SUMMARY_NOW + 86400)],
+        );
+        old.session_models
+            .insert("sibling".into(), "Gemini Flash".into());
+        old.session_seen_unix
+            .insert("sibling".into(), SUMMARY_NOW - 10);
+        cache.save(&old).unwrap();
+        std::fs::write(
+            dir.path().join("agy-statusline.observation.json"),
+            serde_json::to_vec(&crate::cache::StatuslineObservation {
+                snapshot: old.clone(),
+                payload,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let fetched = load_statusline_snapshot(&cache, Provider::Agy).unwrap();
+        let snapshot = &fetched.snapshot;
+        assert_eq!(snapshot.fetched_at_unix, SUMMARY_NOW);
+        assert_eq!(snapshot.session_models, old.session_models);
+        assert_eq!(snapshot.session_seen_unix, old.session_seen_unix);
+        assert_eq!(
+            snapshot.session_windows["sibling"],
+            old.session_windows["sibling"]
+        );
+        assert_eq!(snapshot.windows_for_session(Some("current")).len(), 3);
+        assert_eq!(
+            snapshot
+                .window(WindowKind::WeeklyScoped)
+                .unwrap()
+                .display_label(),
+            "Arg"
+        );
+        let row = RowStyle {
+            fields: FieldSet::parse("no-30d,provider,model,cache,ttl,5h,7d,week-scoped").unwrap(),
+            ..summary_row(crate::cli::SummaryFormat::Lines)
+        };
+        let summary = workspace_summary(std::slice::from_ref(snapshot), SUMMARY_NOW, row, &[]);
+        assert!(
+            summary
+                .iter()
+                .any(|(name, value)| name.starts_with("quota_acct_ag_w3_")
+                    && value.contains("Arg")
+                    && value.contains("8%")),
+            "{summary:?}"
+        );
+        cache
+            .save_preserving_context_for_session(fetched.snapshot, fetched.session_id.as_deref())
+            .unwrap();
+        let saved = cache.load(Provider::Agy).unwrap().unwrap();
+        assert_eq!(saved.windows_for_session(Some("current")).len(), 3);
+        assert_eq!(
+            saved.session_windows["sibling"],
+            old.session_windows["sibling"]
+        );
     }
 
     #[test]

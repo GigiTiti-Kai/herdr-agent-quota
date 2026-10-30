@@ -2668,6 +2668,81 @@ mod tests {
     /// Fork: two same-vendor panes in one Space stay two flat panes, each
     /// with its own cache, TTL and 5h/7d/30d (`fork/README.md`).
     #[test]
+    fn argon_weekly_matches_fable_visibility_headroom_stack_and_noop_comparison() {
+        for (provider, model, label) in [
+            (Provider::Agy, "Gemini 3.8 Flash (High)", "Arg"),
+            (Provider::Agy, "Gemini 4 Argon (High)", "Arg"),
+            (Provider::Claude, "Opus 5.5", "Fab"),
+            (Provider::Claude, "Fable 5.1", "Fab"),
+        ] {
+            let snapshot = if provider == Provider::Agy {
+                crate::providers::agy::parse_statusline(&json!({"model":{"display_name":model}, "quota": {
+                    "gemini-5h":{"remaining_fraction":0.8,"reset_in_seconds":3600},
+                    "gemini-weekly":{"remaining_fraction":0.6,"reset_in_seconds":86400},
+                    "gemini-argon-wtu-weekly":{"remaining_fraction":0.08,"reset_in_seconds":7200}
+                }}), 1000).unwrap()
+            } else {
+                crate::providers::claude_api::parse_usage(&json!({"limits":[
+                    {"kind":"session","percent":20,"resets_at":"2030-01-01T00:00:00Z"}, {"kind":"weekly_all","percent":40,"resets_at":"2030-01-01T00:00:00Z"},
+                    {"kind":"weekly_scoped","percent":92,"scope":{"model":{"display_name":"Fable"}},"resets_at":"2030-01-01T00:00:00Z"}
+                ]}), 1000).unwrap().with_model(Some(model.into()))
+            };
+            for (fields, remaining) in [
+                (FieldSet::all(), "008"),
+                (FieldSet::parse("5h,7d").unwrap(), "060"),
+            ] {
+                let values = MetadataTokens::from_snapshot_for_pane_with_fields(
+                    &snapshot,
+                    1000,
+                    None,
+                    RowStyle {
+                        fields,
+                        ..RowStyle::default()
+                    },
+                );
+                let desired = desired_tokens(&values, "", SidebarShape::default());
+                assert_eq!(
+                    desired.get(HEADROOM_TOKEN).map(String::as_str),
+                    Some(remaining)
+                );
+                assert!(values.quota_week_scoped.starts_with(label));
+                assert_eq!(
+                    values.quota_week_scoped_severity,
+                    Some(crate::model::Severity::Danger)
+                );
+                assert!(metadata_matches(&desired, &desired));
+                let mut changed = desired.clone();
+                changed.insert("quota_week_scoped_danger".into(), "changed".into());
+                assert!(!metadata_matches(&changed, &desired));
+                let pane = AgentPane {
+                    pane_id: "w1:p1".into(),
+                    workspace_id: "w1".into(),
+                    cwd: String::new(),
+                    title: String::new(),
+                    harness: if provider == Provider::Agy {
+                        Harness::Agy
+                    } else {
+                        Harness::Claude
+                    },
+                    session: None,
+                    session_summary: String::new(),
+                    topic: String::new(),
+                    tokens: desired,
+                    status: AgentStatus::Idle,
+                    focused: false,
+                };
+                let panes = [pane];
+                let nesting = vendor_nesting(&panes, &panes, &[]);
+                assert_eq!(nesting.stack["w1:p1"], format!("{remaining}990{remaining}"));
+            }
+            let expired = MetadataTokens::from_snapshot(&snapshot, 1_893_456_001);
+            assert!(expired.quota_week_scoped.contains("--"));
+            assert_eq!(expired.quota_week_scoped_severity, None);
+            assert_eq!(expired.quota_headroom, None);
+        }
+    }
+
+    #[test]
     fn fork_never_nests_a_vendor() {
         for harness in crate::cli::AgentSelection::SUPPORTED {
             assert!(!shares_login_quota(harness), "{harness:?}");
