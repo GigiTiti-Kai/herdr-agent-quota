@@ -188,11 +188,19 @@ Installer options are also available through `./install.sh --help`.
 | Muse Code | CLI subscription endpoint; 5h and 7d | Current CLI account login; session via Muse's session lock (Linux) |
 | Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the macOS Keychain login from `cursor-agent login`, else `$CURSOR_STATE_DB` (`state.vscdb` access token) when the CLI has no login; model from local session files; topic from the generated session title; `cx` from `store.db` `token_details` (the CLI footer percent); cache from CLI hooks |
 | Claude Code | StatusLine; 5h and 7d | Exact session observation |
-| Agy / Antigravity | StatusLine; 5h, 7d, and api (third-party pool on Gemini) | Exact session and identifiable model pool |
+| Agy / Antigravity | StatusLine; 5h, 7d, Arg (Argon weekly), and api (third-party pool on Gemini) | Exact session and identifiable model pool |
 | OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
 | Pi | Canonical Codex quota | Only when the recorded account matches |
 | OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
 | Hermes Agent | A bridge plugin inside Hermes | ChatGPT/Codex sessions of the default profile only: the running session reports the limits of the key it holds. Other providers show provider, model, and topic without quota. Every session also shows its cache ratio from `state.db`, with Codex's `ttl≈` estimate on ChatGPT/Codex |
+
+Agy's `gemini-argon-wtu-weekly` bucket uses the `week-scoped` field and the
+`Arg` label. Like Claude's `Fab`, it is shown across its model family, including
+Gemini Flash, and contributes to headroom and quota ordering while visible and
+unexpired. In the `lines` footer it follows `7d`; the footer uses the latest Agy
+observation, while each pane keeps its own quota evidence. After an upgrade,
+refresh reparses the latest stored payload immediately; other panes gain the
+new window on their next StatusLine observation.
 
 The Claude Code status line keeps the user's own statusLine output and appends
 a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used

@@ -174,11 +174,17 @@ herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 | Muse Code | CLI 订阅接口；5h 和 7d | 当前 CLI 账号登录；会话通过 Muse 的 session lock 识别（Linux） |
 | Cursor | CLI DashboardService usage；at、api 和 30d | 当前 CLI `auth.json`，否则 macOS Keychain 里 `cursor-agent login` 的登录，否则在 CLI 没有自己的登录且设置了 `$CURSOR_STATE_DB` 时用桌面端 `state.vscdb` 的 access token；模型和主题来自本地会话文件；`cx` 来自 `store.db` `token_details`（CLI 底栏百分比）；cache 来自 CLI hook |
 | Claude Code | StatusLine；5h 和 7d | 精确会话的观测 |
-| Agy / Antigravity | StatusLine；5h、7d，以及 Gemini 会话上的 api（第三方池） | 精确会话与可确认的模型额度池 |
+| Agy / Antigravity | StatusLine；5h、7d、Arg（Argon 周额度），以及 Gemini 会话上的 api（第三方池） | 精确会话与可确认的模型额度池 |
 | OpenCode | OpenCode Go usage 接口 | Go 凭据；确认的 PAYG 路由不显示订阅额度 |
 | Pi | 规范 Codex collector 的额度 | 仅在记录的账号一致时复用 |
 | OMP | `omp usage --json --provider <id>` | usage 账号与会话 credential pin 一致 |
 | Hermes Agent | Hermes 进程内的 bridge 插件 | 仅限默认 profile 的 ChatGPT/Codex 会话：由运行中的会话报告它所持密钥的额度。其他 provider 只显示 provider、模型和主题，不显示额度。所有会话都会显示来自 `state.db` 的缓存命中率，ChatGPT/Codex 会话另有 Codex 的 `ttl≈` 估算 |
+
+Agy 的 `gemini-argon-wtu-weekly` 使用 `week-scoped` 字段，标签为 `Arg`。
+与 Claude 的 `Fab` 一样，它在整个 Gemini 模型系列（包括 Flash）中显示，
+可见且未过期时参与剩余额度和排序计算。`lines` 底栏中它紧跟 `7d`；
+底栏采用最新的 Agy 观测，各窗格仍保留自己的额度证据。升级后 refresh 会立即
+重新解析最近一次保存的原始数据；其他窗格在下一次 StatusLine 观测后获得新窗口。
 
 Claude Code 状态栏保留用户自己的 statusLine 输出，并在末尾追加当前生效额度窗口的
 消耗节奏，例如 `⏱ 5h ↓12%`：已用额度减去窗口已过去的时间比例，单位为百分点。

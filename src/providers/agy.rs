@@ -15,6 +15,7 @@ const PERCENT_KEYS: [&str; 2] = ["remaining_percent", "remainingPercentage"];
 
 const GEMINI_FIVE_HOUR_KEYS: [&str; 1] = ["gemini-5h"];
 const GEMINI_WEEKLY_KEYS: [&str; 1] = ["gemini-weekly"];
+const ARGON_WEEKLY_KEYS: [&str; 1] = ["gemini-argon-wtu-weekly"];
 const THIRD_PARTY_FIVE_HOUR_KEYS: [&str; 1] = ["3p-5h"];
 const THIRD_PARTY_WEEKLY_KEYS: [&str; 1] = ["3p-weekly"];
 /// Third-party (Claude/GPT) pool shown as `api` while Gemini is the active model.
@@ -45,13 +46,17 @@ impl Pool {
 
 /// Detect which quota pool the active model draws from.
 ///
-/// Gemini-family model names contain `gemini`, `flash`, or `learnlm`.
+/// Gemini-family model names contain `gemini`, `flash`, `learnlm`, or `argon`.
 /// Third-party model names include Claude variants (`claude`, `sonnet`,
 /// `haiku`, `opus`), GPT models, and OpenAI reasoning series (`o1`, `o3`,
 /// `o4`). Unknown names require an unambiguous single-pool response.
 fn active_pool(model: Option<&str>) -> Option<Pool> {
     let lower = model?.to_ascii_lowercase();
-    if lower.contains("gemini") || lower.contains("flash") || lower.contains("learnlm") {
+    if lower.contains("gemini")
+        || lower.contains("flash")
+        || lower.contains("learnlm")
+        || lower.contains("argon")
+    {
         Some(Pool::Gemini)
     } else if lower.contains("claude")
         || lower.contains("sonnet")
@@ -86,6 +91,7 @@ pub fn parse_statusline(
     let has_gemini = FIVE_HOUR_KEYS[..1]
         .iter()
         .chain(WEEKLY_KEYS[..1].iter())
+        .chain(ARGON_WEEKLY_KEYS.iter())
         .any(|key| quota.contains_key(*key));
     let has_third_party = FIVE_HOUR_KEYS[1..]
         .iter()
@@ -111,6 +117,14 @@ pub fn parse_statusline(
     // spare monthly slot as `api` so it does not replace the Gemini 5h/7d
     // rows. A Claude/GPT session already uses that pool for 5h/7d.
     if matches!(pool, Some(Pool::Gemini)) {
+        if let Some(window) = parse_window(
+            quota,
+            WindowKind::WeeklyScoped,
+            &ARGON_WEEKLY_KEYS,
+            fetched_at_unix,
+        )? {
+            windows.push(window.with_source_window("Arg", None));
+        }
         if let Some(window) = parse_window(
             quota,
             WindowKind::Monthly,
@@ -239,6 +253,88 @@ pub fn run_statusline(input: &[u8]) -> std::result::Result<ProviderSnapshot, Pro
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn argon_weekly_respects_the_active_pool_and_single_pool_fallback() {
+        for model in [
+            Some("Gemini 4 Argon (High)"),
+            Some("Gemini 3.8 Flash (High)"),
+            Some("Argon"),
+            Some("Claude Opus"),
+            Some("GPT-OSS"),
+            Some("Unknown"),
+            None,
+        ] {
+            for general in [false, true] {
+                for third_party in [false, true] {
+                    let mut value = json!({"quota": {"gemini-argon-wtu-weekly": {
+                        "remaining_fraction": 0.08, "reset_in_seconds": 7200
+                    }}});
+                    if let Some(model) = model {
+                        value["model"] = json!({"display_name": model});
+                    }
+                    if general {
+                        value["quota"]["gemini-5h"] = json!({"remaining_fraction": 0.8});
+                        value["quota"]["gemini-weekly"] = json!({"remaining_fraction": 0.6});
+                    }
+                    if third_party {
+                        value["quota"]["3p-weekly"] = json!({"remaining_fraction": 0.5});
+                    }
+                    let is_third_party = matches!(model, Some("Claude Opus" | "GPT-OSS"));
+                    let unknown = matches!(model, Some("Unknown") | None);
+                    let result = parse_statusline(&value, 1000);
+                    if is_third_party && !third_party {
+                        assert!(result.is_err());
+                        continue;
+                    }
+                    let snapshot = result.unwrap();
+                    let arg = snapshot.window(WindowKind::WeeklyScoped);
+                    if is_third_party || (unknown && third_party) {
+                        assert!(arg.is_none(), "{model:?} {general} {third_party}");
+                        if unknown {
+                            assert!(snapshot.windows.is_empty());
+                        }
+                    } else {
+                        let arg = arg.expect("Gemini pool includes Argon weekly");
+                        assert_eq!(arg.display_label(), "Arg");
+                        assert!((arg.remaining_percent - 8.0).abs() < 1e-9);
+                        assert_eq!(arg.resets_at, Some(ResetAt::from_unix_seconds(8200)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn argon_weekly_uses_existing_numeric_and_reset_validation() {
+        for (bucket, remaining) in [
+            (json!({"remaining_fraction": 0}), Some(0.0)),
+            (json!({"remainingFraction": 1}), Some(100.0)),
+            (json!({"remaining_percent": 0.5}), Some(0.5)),
+            (json!({"remaining_fraction": -1}), Some(0.0)),
+            (json!({"remaining_fraction": 2}), Some(100.0)),
+            (json!({"remaining_fraction": "bad"}), None),
+            (json!({}), None),
+        ] {
+            let mut value = json!({"model": {"display_name": "Gemini Flash"}, "quota": {
+                "gemini-5h": {"remaining_fraction": 0.8},
+                "gemini-argon-wtu-weekly": bucket,
+                "gemini-argon-other-weekly": {"remaining_fraction": 0.01}
+            }});
+            value["quota"]["gemini-argon-wtu-weekly"]["reset_time"] = json!("2030-01-01T00:00:00Z");
+            value["quota"]["gemini-argon-wtu-weekly"]["reset_in_seconds"] = json!(1);
+            let snapshot = parse_statusline(&value, 1000).unwrap();
+            assert_remaining_pct(&snapshot, WindowKind::FiveHour, 80.0);
+            let arg = snapshot.window(WindowKind::WeeklyScoped);
+            assert_eq!(arg.map(|w| w.remaining_percent), remaining);
+            if let Some(arg) = arg {
+                assert_eq!(
+                    arg.resets_at,
+                    Some(ResetAt::from_unix_seconds(1_893_456_000))
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_both_agy_windows_from_the_active_pool() {

@@ -85,6 +85,27 @@ fn claude_fixture_contains_both_subscription_windows() {
 }
 
 #[test]
+fn agy_argon_scoped_weekly_survives_serialization_and_renders_separately() {
+    let snapshot = agy::parse_statusline(
+        &serde_json::json!({
+            "model":{"display_name":"Gemini 4 Argon (High)"},
+            "quota": {
+                "gemini-weekly":{"remaining_fraction":0.6,"reset_in_seconds":86400},
+                "gemini-argon-wtu-weekly":{"remaining_fraction":0.08,"reset_in_seconds":7200}
+            }
+        }),
+        1000,
+    )
+    .unwrap();
+    let saved = serde_json::to_vec(&snapshot).unwrap();
+    let restored = serde_json::from_slice(&saved).unwrap();
+    let tokens = MetadataTokens::from_snapshot(&restored, 1000);
+    assert!(tokens.quota_week.starts_with("7d 60%"));
+    assert!(tokens.quota_week_scoped.starts_with("Arg 8%"));
+    assert_eq!(tokens.quota_headroom, Some(8));
+}
+
+#[test]
 fn agy_fixture_requires_an_identifiable_pool() {
     let mut value = fixture(include_str!("fixtures/agy/statusline-both.json"));
     assert!(agy::parse_statusline(&value, 1).unwrap().windows.is_empty());
