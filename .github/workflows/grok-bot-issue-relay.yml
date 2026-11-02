@@ -7,7 +7,8 @@ on:
 jobs:
   relay:
     # The webhook secrets exist only in the upstream repository; forks would fail on every issue event.
-    if: github.repository == 'levi-qiao/herdr-agent-quota'
+    # Match the owner, not the name: upstream is levi-qiao/herdr-agent-usage and has been renamed before.
+    if: github.repository_owner == 'levi-qiao'
     runs-on: ubuntu-latest
     steps:
       - name: Forward to Grok Bot
