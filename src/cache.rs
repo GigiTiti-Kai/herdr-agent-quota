@@ -1,6 +1,6 @@
 use crate::cli::{
     AgentOrder, BrandColors, FieldSet, IconSize, LowQuotaAlert, PercentStyle, SidebarLayout,
-    SidebarRowGap, SummaryFormat,
+    SidebarPacing, SidebarRowGap, StatuslinePace, SummaryFormat,
 };
 use crate::identity::PLUGIN_ID;
 use crate::model::{
@@ -24,6 +24,8 @@ const WATCH_INTERVAL_FILE: &str = "watch-interval-seconds";
 const SIDEBAR_LAYOUT_FILE: &str = "sidebar-layout";
 const ROW_GAP_FILE: &str = "row-gap";
 const QUOTA_PERCENT_FILE: &str = "quota-percent";
+const SIDEBAR_PACING_FILE: &str = "sidebar-pacing";
+const STATUSLINE_PACE_FILE: &str = "statusline-pace";
 const FIELDS_FILE: &str = "fields";
 const BRAND_COLORS_FILE: &str = "brand-colors";
 const AGENT_ORDER_FILE: &str = "agent-order";
@@ -683,6 +685,53 @@ impl CacheStore {
         }
     }
 
+    /// Whether 5h/7d sidebar rows render pacing instead of quota.
+    pub fn sidebar_pacing(&self) -> Option<SidebarPacing> {
+        fs::read_to_string(self.sidebar_pacing_path())
+            .ok()
+            .as_deref()
+            .and_then(SidebarPacing::parse)
+    }
+
+    pub fn set_sidebar_pacing(&self, pacing: SidebarPacing) -> Result<()> {
+        self.ensure()?;
+        fs::write(self.sidebar_pacing_path(), pacing.as_str()).context("write sidebar pacing")
+    }
+
+    pub fn clear_sidebar_pacing(&self) -> Result<()> {
+        match fs::remove_file(self.sidebar_pacing_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove sidebar pacing"),
+        }
+    }
+
+    /// Whether the Claude statusLine wrapper appends its quota pace segment.
+    ///
+    /// Claude Code launches the wrapper itself, outside Herdr's plugin runtime,
+    /// so only the state directory embedded in the wrapper command is guaranteed
+    /// to be available there. Configure mirrors the user preference here.
+    pub fn statusline_pace(&self) -> Option<StatuslinePace> {
+        fs::read_to_string(self.statusline_pace_path())
+            .ok()
+            .as_deref()
+            .and_then(StatuslinePace::parse)
+    }
+
+    pub fn set_statusline_pace(&self, pacing: StatuslinePace) -> Result<()> {
+        self.ensure()?;
+        fs::write(self.statusline_pace_path(), pacing.as_str())
+            .context("write Claude statusLine pace")
+    }
+
+    pub fn clear_statusline_pace(&self) -> Result<()> {
+        match fs::remove_file(self.statusline_pace_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove Claude statusLine pace"),
+        }
+    }
+
     /// The sidebar settings that shaped the rows currently on disk.
     ///
     /// Uninstall needs them to recognise its own work, and the settings pane
@@ -1032,6 +1081,14 @@ impl CacheStore {
 
     fn quota_percent_path(&self) -> PathBuf {
         self.root.join(QUOTA_PERCENT_FILE)
+    }
+
+    fn sidebar_pacing_path(&self) -> PathBuf {
+        self.root.join(SIDEBAR_PACING_FILE)
+    }
+
+    fn statusline_pace_path(&self) -> PathBuf {
+        self.root.join(STATUSLINE_PACE_FILE)
     }
 
     fn fields_path(&self) -> PathBuf {
@@ -3432,6 +3489,17 @@ mod tests {
         );
         cache.clear_sidebar_layout().unwrap();
         assert_eq!(cache.sidebar_layout(), None);
+    }
+
+    #[test]
+    fn sidebar_pacing_round_trips_and_defaults_when_absent() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        assert_eq!(cache.sidebar_pacing(), None);
+        cache.set_sidebar_pacing(SidebarPacing::On).unwrap();
+        assert_eq!(cache.sidebar_pacing(), Some(SidebarPacing::On));
+        cache.clear_sidebar_pacing().unwrap();
+        assert_eq!(cache.sidebar_pacing(), None);
     }
 
     #[test]

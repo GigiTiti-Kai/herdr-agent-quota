@@ -100,6 +100,8 @@ fn sync_binding(state_root: &Path, backend: Option<&str>, payload: &Value, now_u
 pub fn run_statusline_hook() -> Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
+    let cache = CacheStore::from_env()?;
+    let pace_enabled = super::resolved_statusline_pace(None, Some(&cache)).is_on();
     let mut pace = None;
     let backend = std::env::var("CLAUDE_BILLING_BACKEND").ok();
     if let Ok(value) = serde_json::from_slice::<Value>(&input) {
@@ -107,24 +109,19 @@ pub fn run_statusline_hook() -> Result<()> {
         let binding = billing_binding(backend.as_deref(), &value);
         if let Ok(snapshot) = parse_statusline(&value, now_unix) {
             // A Claude 5h pace means nothing to a DeepSeek / OpenRouter session.
-            if binding.is_none() {
+            if pace_enabled && binding.is_none() {
                 pace = pace_segment(&snapshot.windows, now_unix);
             }
-            if let Ok(cache) = CacheStore::from_env() {
-                let generation = api_generation(&value);
-                let _ = cache.save_statusline_observation_with_api_generation(
-                    Provider::Claude,
-                    snapshot,
-                    &value,
-                    generation.as_deref(),
-                );
-            }
+            let generation = api_generation(&value);
+            let _ = cache.save_statusline_observation_with_api_generation(
+                Provider::Claude,
+                snapshot,
+                &value,
+                generation.as_deref(),
+            );
         }
-        if let Ok(cache) = CacheStore::from_env() {
-            sync_binding(cache.root(), backend.as_deref(), &value, now_unix);
-        }
+        sync_binding(cache.root(), backend.as_deref(), &value, now_unix);
     }
-    let cache = CacheStore::from_env()?;
     let Some(output) = CONFIG.run_previous(cache.root(), &input)? else {
         if let Some(pace) = pace {
             println!("{pace}");

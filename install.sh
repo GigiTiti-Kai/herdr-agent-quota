@@ -8,6 +8,8 @@
 #   ./install.sh --sidebar-layout packed
 #   ./install.sh --row-gap 0
 #   ./install.sh --quota-percent used
+#   ./install.sh --sidebar-pacing on
+#   ./install.sh --statusline-pace off
 #   ./install.sh --fields topic,model,context,5h,7d
 #   ./install.sh --agent-order default
 #   ./install.sh --low-quota-alert 10
@@ -26,6 +28,14 @@
 #
 # --quota-percent remaining (default) shows how much quota is left; used shows
 # how much has been consumed. The colour always follows what is left.
+#
+# --sidebar-pacing off (default) keeps quota percentages and gauges. on shows
+# 5h/7d windows as a signed pace delta plus time remaining, such as
+# `5h -6% 45 min`. Negative means usage is ahead of the clock.
+#
+# --statusline-pace on (default) preserves the plugin's existing binding-window
+# pace segment. off leaves Claude's own statusLine output unchanged; quota
+# observations are collected either way.
 #
 # --fields picks the quota fields the sidebar shows: all, none, or a
 # comma-separated list of provider, topic, model, cache, ttl, context, 5h, 7d,
@@ -67,6 +77,8 @@ AGENTS=""
 SIDEBAR_LAYOUT=""
 ROW_GAP=""
 QUOTA_PERCENT=""
+SIDEBAR_PACING=""
+STATUSLINE_PACE=""
 FIELDS=""
 AGENT_ORDER=""
 LOW_QUOTA_ALERT=""
@@ -99,6 +111,16 @@ while (($# > 0)); do
       QUOTA_PERCENT="$2"
       shift 2
       ;;
+    --sidebar-pacing)
+      (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
+      SIDEBAR_PACING="$2"
+      shift 2
+      ;;
+    --statusline-pace)
+      (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
+      STATUSLINE_PACE="$2"
+      shift 2
+      ;;
     --fields)
       (($# >= 2)) || { printf 'error: missing value for %s\n' "$1" >&2; exit 1; }
       FIELDS="$2"
@@ -128,7 +150,7 @@ while (($# > 0)); do
       shift 2
       ;;
     -h|--help)
-      sed -n '2,59p' "$0"
+      sed -n '2,69p' "$0"
       exit 0
       ;;
     *)
@@ -157,6 +179,14 @@ esac
 case "$QUOTA_PERCENT" in
   ""|remaining|used) ;;
   *) die "quota-percent must be remaining or used" ;;
+esac
+case "$SIDEBAR_PACING" in
+  ""|off|on) ;;
+  *) die "sidebar-pacing must be off or on" ;;
+esac
+case "$STATUSLINE_PACE" in
+  ""|off|on) ;;
+  *) die "statusline-pace must be off or on" ;;
 esac
 case "$AGENT_ORDER" in
   ""|default|quota) ;;
@@ -203,6 +233,8 @@ write_plugin_pref watch-interval-seconds "$WATCH_INTERVAL_SECONDS"
 write_plugin_pref sidebar-layout "$SIDEBAR_LAYOUT"
 write_plugin_pref row-gap "$ROW_GAP"
 write_plugin_pref quota-percent "$QUOTA_PERCENT"
+write_plugin_pref sidebar-pacing "$SIDEBAR_PACING"
+write_plugin_pref statusline-pace "$STATUSLINE_PACE"
 write_plugin_pref fields "$FIELDS"
 write_plugin_pref agent-order "$AGENT_ORDER"
 write_plugin_pref low-quota-alert "$LOW_QUOTA_ALERT"

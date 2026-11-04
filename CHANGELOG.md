@@ -88,6 +88,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agent, and one blank row ends each Space before the next name. `configure`
   appends a `$quota_group_tail` row last in every managed layout and moves
   an older layout's rows into place.
+
+## [1.6.3] - 2026-09-26
+
+### Added
+
+- Claude statusLine pacing can now be turned off with
+  `--statusline-pace off` or from the settings pane. It stays on by default
+  for upgrade compatibility; quota observations are still collected for the
+  sidebar while pace output is off.
+- Optional sidebar pacing for recurring quota windows. Enable it in the
+  settings pane or with `--sidebar-pacing on` to render values such as
+  `5h -6% 45 min`; the default remains the existing quota/gauge display.
+
+### Changed
+
 - The GitHub repository and Herdr plugin id are now
   [`levi-qiao/herdr-agent-usage`](https://github.com/levi-qiao/herdr-agent-usage)
   / `herdr-agent-usage`. `./install.sh` adopts config and state from
@@ -100,6 +115,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Blocked agent panes now tag and color the brand icon instead of looking idle,
+  restoring an at-a-glance signal for panes waiting on user input.
+- Gauges panes keep the model token when the provider field is hidden, so
+  model-only identity rows render the model instead of only the brand icon.
 - Claude session-local quota no longer presents an idle pane's old percentage as
   current. The statusLine cache tracks per-window freshness from documented
   API-derived fields, timer-only redraws keep the original observation age,
@@ -1020,7 +1039,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A popup dashboard pane, event-driven refresh, and a local snapshot cache that
   survives provider failures.
 
-[Unreleased]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.2...HEAD
+[Unreleased]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.3...HEAD
+[1.6.3]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/levi-qiao/herdr-agent-usage/compare/v1.5.5...v1.6.0

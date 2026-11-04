@@ -33,7 +33,8 @@ separates different agents; nested extra tabs of the same vendor stay flush.
 Claude and Agy stay per-pane.
 Agent order defaults to Space grouping with least quota left first inside each space.
 Low-quota notifications stay off until you set a threshold. Switch layout,
-fields, and percentages from the settings pane (`prefix+shift+q`).
+fields, percentages, and optional pacing from the settings pane
+(`prefix+shift+q`).
 
 ## Install and upgrade
 
@@ -165,6 +166,8 @@ herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 | Setting | Options |
 | --- | --- |
 | Percentages | Remaining or used; colors always indicate remaining headroom |
+| Sidebar pacing | Off (default) keeps quota percentages and gauges; on shows signed pace on 5h/7d rows |
+| StatusLine pace | On (default) preserves the existing binding-window pace segment; off leaves Claude's statusLine output unchanged |
 | Layout | `gauges` (default) adds a meter beside each quota number; `packed` groups related fields; `stacked` gives each field a row |
 | Row gap | Zero or one blank line between agents |
 | Watch interval | 30 seconds–1 hour; default 60 seconds |
@@ -177,6 +180,20 @@ herdr plugin pane open --plugin herdr-agent-usage --entrypoint settings --focus
 
 Use arrows or Space to edit, `a` to apply, and `q` to close.
 Installer options are also available through `./install.sh --help`.
+
+Enable sidebar pacing, or opt out of the separate Claude statusLine pace, during installation with:
+
+```sh
+./install.sh --sidebar-pacing on
+./install.sh --statusline-pace off
+```
+
+Paced sidebar rows read like `5h -6% 45 min`: window, signed percentage-point
+headroom versus the remaining clock, and time left. Negative means usage is
+ahead of pace; positive means there is headroom. `3d2h` is one compact time
+value. Context and monthly rows keep their configured quota presentation.
+When a provider omits usable reset information, that row falls back to its
+normal quota percentage instead of guessing.
 
 ## Data sources and limits
 
@@ -202,8 +219,9 @@ observation, while each pane keeps its own quota evidence. After an upgrade,
 refresh reparses the latest stored payload immediately; other panes gain the
 new window on their next StatusLine observation.
 
-The Claude Code status line keeps the user's own statusLine output and appends
-a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
+The Claude Code status line always keeps the user's own statusLine output.
+With **StatusLine pace** enabled (it stays on by default for compatibility), the wrapper appends a
+spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
 minus the share of the window's clock already run, in points. `↓` means slow
 down, `↑` means there is headroom, `=` is within five points. The window with
 the least remaining quota is paced and named; if that window cannot be paced,
@@ -285,7 +303,7 @@ turn failures into zero usage.
 
 | Symptom | Check |
 | --- | --- |
-| Brand icons are boxes or `?` | The icon font is missing or this terminal has no U+E1A0–U+E1B6 map — see [Ask an agent to finish setup](#ask-an-agent-to-finish-setup). Reload the terminal after `configure`. A yellow `?` on a build older than 1.6.1 was the working-state ZWNJ bug; upgrade. Muse uses the text mark `◈` on purpose. Nested extra tabs of the same vendor have no icon by design. |
+| Brand icons are boxes or `?` | The icon font is missing or this terminal has no U+E1A0–U+E1B6 map — see [Ask an agent to finish setup](#ask-an-agent-to-finish-setup). Reload the terminal after `configure`. A yellow `?` on a build older than 1.6.1 was the working-state ZWNJ bug; upgrade. Muse uses the text mark `◈` on purpose. Nested extra tabs of vendors other than Codex have no icon by design. |
 | Session data is missing | Run `herdr integration status`; load missing integrations before restarting the affected agent |
 | Claude/Agy quota is missing | Send a turn so the session's StatusLine produces an observation |
 | Agy quota stays unchanged while tasks run | Check `configure --check --agent agy` with the installation's `HERDR_PLUGIN_STATE_DIR`. Agy quota comes only from its StatusLine hook; the watcher rereads that observation and cannot fetch fresh quota while `statusLine.enabled` is `false`. Run `/statusline on` in the affected Agy session. Compare `snapshot.fetched_at_unix` in `agy-statusline.observation.json` before and after a turn; the mtime of `agy-statusline.json` alone only proves the watcher rewrote the cache. An expired window shows `--`, while an unexpired window can still show the last observed percentage. |

@@ -325,7 +325,7 @@ fn cached_quota_is_stale(
         return true;
     }
     let mut values =
-        MetadataTokens::from_snapshot_for_pane_with_fields(&snapshot, now, session_id, row);
+        MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, now, session_id, row);
     // Compare against what the pane is given, or a stripped row reads as drift.
     if on_workspace(&values, workspace) {
         values.account = None;
@@ -930,6 +930,7 @@ fn publish_row(cache: &CacheStore) -> RowStyle {
         fields: cache.fields().unwrap_or_default(),
         summary: cache.account_summary().unwrap_or_default(),
         icon_size: cache.icon_size().unwrap_or_default(),
+        pacing: cache.sidebar_pacing().unwrap_or_default(),
         ..RowStyle::new(
             cache.percent_style().unwrap_or_default(),
             sidebar_shape(cache),
@@ -2117,8 +2118,7 @@ fn workspace_summary(
 ) -> BTreeMap<String, String> {
     let mut summary = BTreeMap::new();
     for (index, snapshot) in snapshots.iter().enumerate() {
-        let mut values =
-            MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now, None, row);
+        let mut values = MetadataTokens::from_snapshot_for_pane_with_row(snapshot, now, None, row);
         let sessions = hermes
             .iter()
             .find(|(provider, _)| *provider == snapshot.provider)
@@ -2448,7 +2448,7 @@ fn tokens_for_provider(
     row: RowStyle,
 ) -> Option<MetadataTokens> {
     snapshot.map(|snapshot| {
-        MetadataTokens::from_snapshot_for_pane_with_fields(snapshot, now_unix, session_id, row)
+        MetadataTokens::from_snapshot_for_pane_with_row(snapshot, now_unix, session_id, row)
     })
 }
 
@@ -2641,12 +2641,8 @@ mod tests {
         );
         // Exactly the tokens a pane of that family would have published.
         for snapshot in &snapshots {
-            let values = MetadataTokens::from_snapshot_for_pane_with_fields(
-                snapshot,
-                SUMMARY_NOW,
-                None,
-                row,
-            );
+            let values =
+                MetadataTokens::from_snapshot_for_pane_with_row(snapshot, SUMMARY_NOW, None, row);
             for (name, value) in crate::herdr::desired_summary_tokens(&values) {
                 assert_eq!(summary.get(&name), Some(&value), "{name}");
             }
@@ -2707,12 +2703,8 @@ mod tests {
             .with_account_windows(windows.clone());
         let workspace = workspace_summary(std::slice::from_ref(&account), SUMMARY_NOW, row, &[]);
         assert!(!family_names(&workspace, "cl").is_empty());
-        let pane = MetadataTokens::from_snapshot_for_pane_with_fields(
-            &account,
-            SUMMARY_NOW,
-            Some("s1"),
-            row,
-        );
+        let pane =
+            MetadataTokens::from_snapshot_for_pane_with_row(&account, SUMMARY_NOW, Some("s1"), row);
         assert!(!crate::herdr::desired_summary_tokens(&pane).is_empty());
         assert!(pane_summary(&pane, &workspace).is_empty());
 
@@ -2722,7 +2714,7 @@ mod tests {
         statusline.session_windows.insert("s1".to_string(), windows);
         let workspace = workspace_summary(std::slice::from_ref(&statusline), SUMMARY_NOW, row, &[]);
         assert!(family_names(&workspace, "cl").is_empty());
-        let pane = MetadataTokens::from_snapshot_for_pane_with_fields(
+        let pane = MetadataTokens::from_snapshot_for_pane_with_row(
             &statusline,
             SUMMARY_NOW,
             Some("s1"),
@@ -2890,7 +2882,7 @@ mod tests {
             vec![window(WindowKind::Weekly, 2.0, SUMMARY_NOW + 86_400)],
             SUMMARY_NOW,
         );
-        MetadataTokens::from_snapshot_for_pane_with_fields(&reading, SUMMARY_NOW, None, row)
+        MetadataTokens::from_snapshot_for_pane_with_row(&reading, SUMMARY_NOW, None, row)
     }
 
     /// A Hermes pane's own row is marked as the Codex row's only when its
@@ -4144,6 +4136,16 @@ mod tests {
         assert_eq!(cache.sidebar_layout(), Some(SidebarLayout::Stacked));
         assert_eq!(unset, stacked);
         assert_eq!(stacked.unwrap().quota_5h, "5h 42% 4h07m");
+    }
+
+    #[test]
+    fn publish_row_reads_the_persisted_sidebar_pacing_choice() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        cache
+            .set_sidebar_pacing(crate::cli::SidebarPacing::On)
+            .unwrap();
+        assert_eq!(publish_row(&cache).pacing, crate::cli::SidebarPacing::On);
     }
 
     #[test]
