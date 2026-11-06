@@ -150,9 +150,9 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             drop(_lock);
             return reexec_watch(server.as_ref(), interval_seconds);
         }
-        // A transient Herdr failure should not terminate a live watcher; the
-        // one-hour cap below still prevents an orphaned process. The next
-        // poll retries the single inventory call.
+        // A transient Herdr failure should not terminate a live watcher; an
+        // hour without a good inventory still ends an orphaned process. The
+        // next poll retries the single inventory call.
         let Ok(mut state) = list_agent_state() else {
             if last_inventory.elapsed() >= MAX_ACTIVE_TURN_WATCH {
                 break;
@@ -207,8 +207,11 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
         } else {
             providers
         };
-        refresh_paneless(&cache, &state.panes, paneless_scope, &active);
-        let _ = refresh_working_panes(&cache, &state.panes, &affected, &icon_dirty);
+        let fetched = refresh_paneless(&cache, &state.panes, paneless_scope, &active);
+        // A pass a kept-alive watcher has nothing for spends no Herdr calls.
+        if !polls_grok || !idle || fetched || !affected.is_empty() || !icon_dirty.is_empty() {
+            let _ = refresh_working_panes(&cache, &state.panes, &affected, &icon_dirty);
+        }
         if idle && !polls_grok {
             break;
         }
@@ -587,6 +590,11 @@ fn run_internal(
     publish_resolved(&cache, &mut publish_panes, topic_pane, force, false)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    }
+    // The click is the repair for a watcher that died; a live one keeps the
+    // lock and this one exits at once.
+    if force && covers_every_collector(providers) {
+        let _ = spawn_watch(false);
     }
     Ok(())
 }
@@ -1422,12 +1430,13 @@ fn in_watch_scope(always_on: Vec<Provider>, scope: &[Provider]) -> Vec<Provider>
 /// Refresh the enabled always-on providers that have no pane in this pass, so
 /// the workspace rows do not go stale. Reads no pane; a failed fetch still
 /// counts as the attempt (marked before the fetch) and keeps the last snapshot.
+/// Returns whether anything was due, so a caller knows there is news to publish.
 fn refresh_paneless(
     cache: &CacheStore,
     panes: &[AgentPane],
     scope: &[Provider],
     working: &[String],
-) {
+) -> bool {
     let always_on = in_watch_scope(
         always_on_providers(&AgentSelection::from_args_or_env(&[])),
         scope,
@@ -1435,9 +1444,10 @@ fn refresh_paneless(
     let backed = paneless_backed(panes, working);
     let now = CacheStore::now_unix();
     let Ok(due) = paneless_due(cache, &always_on, &backed, now, current_account_gate) else {
-        return;
+        return false;
     };
     let _ = refresh_selected(cache, &due, false, panes);
+    !due.is_empty()
 }
 
 fn refresh_provider(

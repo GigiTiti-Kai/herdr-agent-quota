@@ -56,7 +56,7 @@ Concretely, this means:
 | `refresh` | manual action, `startup` | No |
 | `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON`, and never a Pi, omp, Muse, Cursor, or Hermes pane — their transcripts or session rows carry the evidence |
 | `focus` | `pane.focused`, `workspace.focused`, `tab.focused` | No |
-| `watch` | detached from a working status event; `startup` | No (agent metadata only) |
+| `watch` | detached from a working status event; `startup`; `refresh --provider all --force` | No (agent metadata only) |
 
 `startup` exists because Herdr drops plugin-owned Agent views when the server
 exits, and startup hooks run again after a restart or a live handoff. It
@@ -95,7 +95,10 @@ it is enabled, in the watcher's scope, and `auth.json` exists. Usage outside
 Herdr (the Windows Grok Bot) raises no event, so only a poll can show it. A pass
 with nothing to do then asks Grok alone, on the same 300 seconds, so the longer
 life adds no around-the-clock requests to other providers (Claude's endpoint
-returns 429 when pushed). An idle Grok pane counts as no pane for this pass. The
+returns 429 when pushed), and it skips the publish pass unless that fetch ran or
+a pane needs it: one `herdr agent list` per interval is the idle cost. An idle
+Grok pane counts as no pane for this pass. `refresh --provider all --force`
+restarts a watcher that died. The
 one-hour limit runs from the last good `herdr agent list`, so a dead server
 still ends the watcher.
 
