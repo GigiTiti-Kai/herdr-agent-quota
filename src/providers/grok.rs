@@ -1,7 +1,7 @@
 use crate::cache::CacheStore;
 use crate::model::{
-    CacheTotals, CacheUsage, ContextUsage, Provider, ProviderSnapshot, ResetAt, UsageWindow,
-    WindowKind,
+    CacheTotals, CacheUsage, ContextUsage, Provider, ProviderSnapshot, RefreshFailure, ResetAt,
+    UsageWindow, WindowKind,
 };
 use crate::providers::ProviderError;
 use anyhow::{Context, Result};
@@ -11,17 +11,26 @@ use std::collections::{BTreeSet, BinaryHeap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const GROK_SESSION_TAIL_BYTES: u64 = 128 * 1024;
 const MAX_LOCAL_SESSIONS: usize = 128;
 const MAX_SUMMARY_CHARS: usize = 200;
+/// How long a fetch waits for `grok models`. The CLI normally takes 1.4 s.
+const CLI_REFRESH_BUDGET: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokCredentials {
     pub key: String,
     pub user_id: Option<String>,
+    pub expires_at: Option<u64>,
 }
 
 impl GrokCredentials {
@@ -46,7 +55,21 @@ pub fn fetch_for_sessions_with_cwds(
     cwds: &[(String, String)],
 ) -> Result<ProviderSnapshot> {
     let path = auth_path().context("resolve Grok auth path")?;
-    let credentials = read_credentials(&path).map_err(anyhow::Error::from)?;
+    let (credentials, response) =
+        with_fresh_token(&path, || refresh_token_with_cli(&path), request_billing)
+            .map_err(anyhow::Error::from)?;
+    let value: Value = response
+        .into_json()
+        .context("decode Grok billing response")?;
+    let mut snapshot =
+        parse_billing_response(&value, CacheStore::now_unix()).map_err(anyhow::Error::from)?;
+    enrich_local_sessions(&mut snapshot, session_ids, cwds);
+    Ok(snapshot.with_account_id(Some(credentials.account_id())))
+}
+
+fn request_billing(
+    credentials: &GrokCredentials,
+) -> std::result::Result<ureq::Response, ProviderError> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(10))
@@ -60,17 +83,101 @@ pub fn fetch_for_sessions_with_cwds(
     if let Some(user_id) = &credentials.user_id {
         request = request.set("x-userid", user_id);
     }
-    let response = request
+    request
         .call()
         .map_err(|error| ProviderError::Request(http_error_status(&error)))
-        .map_err(anyhow::Error::from)?;
-    let value: Value = response
-        .into_json()
-        .context("decode Grok billing response")?;
-    let mut snapshot =
-        parse_billing_response(&value, CacheStore::now_unix()).map_err(anyhow::Error::from)?;
-    enrich_local_sessions(&mut snapshot, session_ids, cwds);
-    Ok(snapshot.with_account_id(Some(credentials.account_id())))
+}
+
+/// Run `request` with a live token, refreshing at most once per fetch: first
+/// when the token has expired, otherwise after a 401.
+///
+/// The login belongs to the grok CLI and its refresh token rotates on every
+/// use. If this plugin refreshed it, the CLI's copy would die and the user
+/// would have to log in again, so `refresh` only asks the CLI and this re-reads
+/// the file. `refresh_token` is never read here.
+fn with_fresh_token<T>(
+    path: &Path,
+    refresh: impl Fn(),
+    request: impl Fn(&GrokCredentials) -> std::result::Result<T, ProviderError>,
+) -> std::result::Result<(GrokCredentials, T), ProviderError> {
+    let mut credentials = read_credentials(path)?;
+    let now = CacheStore::now_unix();
+    let expired = credentials
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now);
+    if expired {
+        refresh();
+        credentials = read_credentials(path)?;
+    }
+    let result = match request(&credentials) {
+        Err(error) if !expired && is_unauthorized(&error) => {
+            refresh();
+            credentials = read_credentials(path)?;
+            request(&credentials)
+        }
+        result => result,
+    };
+    result.map(|value| (credentials, value))
+}
+
+fn is_unauthorized(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::Request(status) if status == "HTTP 401")
+}
+
+/// What a failed fetch means for the reading that stays on screen. A 401 here
+/// has already survived the CLI refresh, so only a new login can fix it.
+pub fn failure_kind(error: &anyhow::Error) -> RefreshFailure {
+    match error.downcast_ref::<ProviderError>() {
+        Some(ProviderError::MissingCredentials) => RefreshFailure::LoginExpired,
+        Some(error) if is_unauthorized(error) => RefreshFailure::LoginExpired,
+        _ => RefreshFailure::Stale,
+    }
+}
+
+/// The CLI only knows `<grok home>/auth.json`; `GROK_AUTH_FILE` is this
+/// plugin's own override, and the CLI cannot refresh that file.
+fn refresh_token_with_cli(auth: &Path) {
+    let Ok(home) = grok_home() else {
+        return;
+    };
+    if auth == home.join("auth.json") {
+        run_grok_models(&home, CLI_REFRESH_BUDGET);
+    }
+}
+
+/// `grok models` refreshes an expired token under the CLI's own `flock`. Its
+/// output and exit code say nothing about that (measured: "You are not
+/// authenticated.", exit 0, token refreshed), so the caller re-reads the file.
+///
+/// Never kill it: between the provider's reply and the file write, a kill loses
+/// the rotated refresh token. Past the budget it is abandoned instead, in its
+/// own session so a hook supervisor's cleanup cannot reach it either.
+fn run_grok_models(home: &Path, budget: Duration) {
+    let mut command = Command::new(home.join("bin/grok"));
+    command
+        .arg("models")
+        .current_dir(home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let (done, finished) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = child.wait();
+        let _ = done.send(());
+    });
+    let _ = finished.recv_timeout(budget);
 }
 
 pub fn auth_path() -> Result<PathBuf> {
@@ -118,12 +225,12 @@ fn collect_credentials_into(value: &Value, credentials: &mut Vec<CredentialCandi
                                 .and_then(Value::as_str)
                                 .filter(|value| !value.is_empty())
                                 .map(str::to_string),
+                            expires_at: map
+                                .get("expires_at")
+                                .and_then(Value::as_str)
+                                .and_then(ResetAt::parse_rfc3339)
+                                .map(ResetAt::unix_seconds),
                         },
-                        expires_at: map
-                            .get("expires_at")
-                            .and_then(Value::as_str)
-                            .and_then(ResetAt::parse_rfc3339)
-                            .map(ResetAt::unix_seconds),
                         create_time: map
                             .get("create_time")
                             .and_then(Value::as_str)
@@ -155,6 +262,7 @@ fn select_credentials(candidates: Vec<CredentialCandidate>) -> Option<GrokCreden
         .iter()
         .filter(|candidate| {
             candidate
+                .credentials
                 .expires_at
                 .is_none_or(|expires_at| expires_at > now)
         })
@@ -169,7 +277,7 @@ fn select_credentials(candidates: Vec<CredentialCandidate>) -> Option<GrokCreden
         .max_by_key(|candidate| {
             (
                 candidate.create_time.unwrap_or(0),
-                candidate.expires_at.unwrap_or(0),
+                candidate.credentials.expires_at.unwrap_or(0),
             )
         })
         .map(|candidate| candidate.credentials)
@@ -178,7 +286,6 @@ fn select_credentials(candidates: Vec<CredentialCandidate>) -> Option<GrokCreden
 #[derive(Debug, Clone)]
 struct CredentialCandidate {
     credentials: GrokCredentials,
-    expires_at: Option<u64>,
     create_time: Option<u64>,
 }
 
@@ -882,7 +989,8 @@ mod tests {
             read_credentials(&path).unwrap(),
             GrokCredentials {
                 key: "login-token".to_string(),
-                user_id: Some("u1".to_string())
+                user_id: Some("u1".to_string()),
+                expires_at: None,
             }
         );
     }
@@ -962,9 +1070,159 @@ mod tests {
             read_credentials(&path).unwrap(),
             GrokCredentials {
                 key: "new-token".to_string(),
-                user_id: Some("u-new".to_string())
+                user_id: Some("u-new".to_string()),
+                expires_at: Some(
+                    ResetAt::parse_rfc3339("2099-06-01T00:00:00Z")
+                        .unwrap()
+                        .unix_seconds()
+                ),
             }
         );
+    }
+
+    const EXPIRED: &str =
+        r#"{"x":{"key":"old","user_id":"u1","expires_at":"2020-01-01T00:00:00Z"}}"#;
+    const LIVE: &str = r#"{"x":{"key":"new","user_id":"u1","expires_at":"2099-01-01T00:00:00Z"}}"#;
+
+    /// `with_fresh_token` over a billing call that accepts only `valid`.
+    /// Returns the result and how many refreshes and requests it took.
+    fn fetch_with(
+        initial: &str,
+        after_refresh: &str,
+        valid: &str,
+    ) -> (Result<String, ProviderError>, usize, usize) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        fs::write(&path, initial).unwrap();
+        let refreshes = std::cell::Cell::new(0);
+        let requests = std::cell::Cell::new(0);
+        let result = with_fresh_token(
+            &path,
+            || {
+                refreshes.set(refreshes.get() + 1);
+                fs::write(&path, after_refresh).unwrap();
+            },
+            |credentials| {
+                requests.set(requests.get() + 1);
+                if credentials.key == valid {
+                    Ok(credentials.key.clone())
+                } else {
+                    Err(ProviderError::Request("HTTP 401".to_string()))
+                }
+            },
+        )
+        .map(|(_, key)| key);
+        (result, refreshes.get(), requests.get())
+    }
+
+    #[test]
+    fn an_expired_token_is_refreshed_before_the_first_request() {
+        let (result, refreshes, requests) = fetch_with(EXPIRED, LIVE, "new");
+        assert_eq!(result.unwrap(), "new");
+        assert_eq!((refreshes, requests), (1, 1));
+    }
+
+    #[test]
+    fn a_rejected_live_token_is_refreshed_and_retried_once() {
+        let rejected = LIVE.replace("new", "rejected");
+        let (result, refreshes, requests) = fetch_with(&rejected, LIVE, "new");
+        assert_eq!(result.unwrap(), "new");
+        assert_eq!((refreshes, requests), (1, 2));
+    }
+
+    #[test]
+    fn a_live_token_never_starts_the_cli() {
+        let (result, refreshes, requests) = fetch_with(LIVE, LIVE, "new");
+        assert_eq!(result.unwrap(), "new");
+        assert_eq!((refreshes, requests), (0, 1));
+    }
+
+    #[test]
+    fn a_dead_login_stops_after_one_refresh_and_reads_as_login_expired() {
+        for initial in [EXPIRED, LIVE] {
+            let (result, refreshes, _) = fetch_with(initial, EXPIRED, "unreachable");
+            let error = anyhow::Error::from(result.unwrap_err());
+            assert_eq!(refreshes, 1, "{initial}");
+            assert_eq!(failure_kind(&error), RefreshFailure::LoginExpired);
+        }
+    }
+
+    #[test]
+    fn only_a_login_problem_reads_as_login_expired() {
+        let kind = |error: ProviderError| failure_kind(&anyhow::Error::from(error));
+        assert_eq!(
+            kind(ProviderError::MissingCredentials),
+            RefreshFailure::LoginExpired
+        );
+        for status in ["HTTP 403", "HTTP 429", "HTTP 503", "connection refused"] {
+            assert_eq!(
+                kind(ProviderError::Request(status.to_string())),
+                RefreshFailure::Stale,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            failure_kind(&anyhow::anyhow!("decode Grok billing response")),
+            RefreshFailure::Stale
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_cli(home: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = home.join("bin/grok");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cli_refresh_runs_grok_models_and_is_waited_for() {
+        let directory = tempdir().unwrap();
+        let home = directory.path();
+        fake_cli(home, r#"printf '%s' "$*" > called"#);
+        run_grok_models(home, Duration::from_secs(10));
+        assert_eq!(fs::read_to_string(home.join("called")).unwrap(), "models");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cli_past_its_budget_is_abandoned_and_still_finishes() {
+        let directory = tempdir().unwrap();
+        let home = directory.path();
+        fake_cli(home, "sleep 1; touch finished");
+        run_grok_models(home, Duration::from_millis(50));
+        assert!(!home.join("finished").exists(), "the budget did not apply");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !home.join("finished").exists() {
+            assert!(std::time::Instant::now() < deadline, "the CLI was killed");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_missing_cli_is_not_an_error() {
+        run_grok_models(Path::new("/nonexistent"), Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_grok_auth_file_override_never_starts_the_cli() {
+        let _env = crate::providers::test_support::env_guard();
+        let directory = tempdir().unwrap();
+        let home = directory.path();
+        fake_cli(home, "touch called");
+        let saved = std::env::var_os("GROK_HOME");
+        std::env::set_var("GROK_HOME", home);
+        refresh_token_with_cli(&home.join("elsewhere.json"));
+        assert!(!home.join("called").exists());
+        refresh_token_with_cli(&home.join("auth.json"));
+        match saved {
+            Some(value) => std::env::set_var("GROK_HOME", value),
+            None => std::env::remove_var("GROK_HOME"),
+        }
+        assert!(home.join("called").exists());
     }
 
     #[test]

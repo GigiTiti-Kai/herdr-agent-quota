@@ -623,6 +623,16 @@ pub struct SessionQuotaObservation {
     pub api_generation: Option<String>,
 }
 
+/// Why a kept reading is no longer current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshFailure {
+    /// The login is gone: a new login is the only fix.
+    LoginExpired,
+    /// The provider could not be asked; the next refresh may recover.
+    Stale,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSnapshot {
     /// StatusLine quota has no serving-account proof and is session-local.
@@ -654,6 +664,11 @@ pub struct ProviderSnapshot {
     /// active model, so an account-wide list would answer for the wrong pool.
     #[serde(default)]
     pub account_windows: Vec<UsageWindow>,
+    /// Why the last refresh failed, so the kept reading is not shown as
+    /// current. Lives here because a successful fetch saves a new snapshot,
+    /// which clears it without a second store to keep in step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_failure: Option<RefreshFailure>,
     pub provider: Provider,
     pub source: String,
     pub fetched_at_unix: u64,
@@ -725,6 +740,7 @@ pub struct ProviderSnapshot {
 impl ProviderSnapshot {
     pub fn new(provider: Provider, windows: Vec<UsageWindow>, fetched_at_unix: u64) -> Self {
         Self {
+            refresh_failure: None,
             session_quota_only: false,
             account_windows: Vec::new(),
             provider,

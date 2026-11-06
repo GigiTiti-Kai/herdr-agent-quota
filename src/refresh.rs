@@ -7,8 +7,8 @@ use crate::herdr::{
     refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens,
 };
 use crate::model::{
-    BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution, UsageWindow,
-    WindowKind,
+    BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, RefreshFailure,
+    Resolution, UsageWindow, WindowKind,
 };
 use crate::omp::OmpEvidence;
 use crate::opencode::OpenCodePaths;
@@ -96,7 +96,9 @@ pub fn startup(providers: &[Provider]) -> Result<()> {
     spawn_watch(false)
 }
 
-/// Refresh selected providers until their agents leave the working state.
+/// Refresh selected providers until their agents leave the working state, or
+/// keep going through idle time while a Grok login needs polling
+/// ([`polls_grok_while_idle`]).
 ///
 /// This command is normally launched detached by `event` and is deliberately
 /// quota-only: it never reads a pane. Claude/Agy statusLine hooks publish
@@ -135,6 +137,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
         .into_iter()
         .collect::<Vec<_>>();
     let mut settling = BTreeMap::new();
+    let mut last_inventory = started;
     loop {
         if !cache.root().is_dir() || cache.turn_watchers_stopped_after(started_millis)? {
             break;
@@ -151,12 +154,13 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
         // one-hour cap below still prevents an orphaned process. The next
         // poll retries the single inventory call.
         let Ok(mut state) = list_agent_state() else {
-            if started.elapsed() >= MAX_ACTIVE_TURN_WATCH {
+            if last_inventory.elapsed() >= MAX_ACTIVE_TURN_WATCH {
                 break;
             }
             wait_for_watch_tick(&cache, interval, started_at, started_millis);
             continue;
         };
+        last_inventory = Instant::now();
         let enabled = AgentSelection::from_args_or_env(&[]);
         state.panes.retain(|pane| enabled.contains(&pane.harness));
         let active = state
@@ -184,24 +188,35 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
         // same-tab idle inventory cannot paint white over a completion the
         // user has not focused yet.
         apply_icon_attention(&mut state.panes, &cache, None, true, false)?;
+        let stale_icons = state.panes.iter().any(has_stale_done_icon);
+        let idle = active.is_empty()
+            && settling.is_empty()
+            && !stale_icons
+            && cache.icon_attention().unseen.is_empty();
+        let polls_grok = polls_grok_while_idle(providers);
         let icon_dirty = state
             .panes
             .iter()
             .filter(|pane| pane.icon_needs_update())
             .map(|pane| pane.pane_id.clone())
             .collect::<Vec<_>>();
-        refresh_paneless(&cache, &state.panes, providers);
+        // An idle pass stays on Grok so keeping the watcher alive for it does
+        // not add around-the-clock requests to every other provider.
+        let paneless_scope = if idle && polls_grok {
+            &[Provider::Grok][..]
+        } else {
+            providers
+        };
+        refresh_paneless(&cache, &state.panes, paneless_scope, &active);
         let _ = refresh_working_panes(&cache, &state.panes, &affected, &icon_dirty);
-        let stale_icons = state.panes.iter().any(has_stale_done_icon);
-        if active.is_empty()
-            && settling.is_empty()
-            && !stale_icons
-            && cache.icon_attention().unseen.is_empty()
-        {
+        if idle && !polls_grok {
             break;
         }
         previous_active = active;
-        if started.elapsed() >= MAX_ACTIVE_TURN_WATCH && cache.icon_attention().unseen.is_empty() {
+        if !polls_grok
+            && started.elapsed() >= MAX_ACTIVE_TURN_WATCH
+            && cache.icon_attention().unseen.is_empty()
+        {
             break;
         }
         wait_for_watch_tick(&cache, interval, started_at, started_millis);
@@ -1365,6 +1380,34 @@ fn paneless_due(
     Ok(due)
 }
 
+/// Providers the paneless pass leaves to their panes. An idle Grok pane does
+/// not count: it fetches nothing, while a Grok client outside Herdr keeps
+/// spending the same quota.
+fn paneless_backed(panes: &[AgentPane], working: &[String]) -> Vec<Provider> {
+    let mut backed = pane_backed_providers(panes);
+    let working = panes
+        .iter()
+        .filter(|pane| working.contains(&pane.pane_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !pane_backed_providers(&working).contains(&Provider::Grok) {
+        backed.retain(|provider| *provider != Provider::Grok);
+    }
+    backed
+}
+
+/// Usage outside Herdr raises no event, so only a poll can show it. A signed-in
+/// Grok therefore keeps the watcher alive through idle time; the one-hour limit
+/// on a failing Herdr inventory is what still stops an orphaned watcher.
+fn polls_grok_while_idle(scope: &[Provider]) -> bool {
+    in_watch_scope(
+        always_on_providers(&AgentSelection::from_args_or_env(&[])),
+        scope,
+    )
+    .contains(&Provider::Grok)
+        && grok::auth_path().is_ok_and(|path| path.exists())
+}
+
 /// A watcher scoped to `--provider agy` must not fetch anything else.
 fn in_watch_scope(always_on: Vec<Provider>, scope: &[Provider]) -> Vec<Provider> {
     if covers_every_collector(scope) {
@@ -1379,12 +1422,17 @@ fn in_watch_scope(always_on: Vec<Provider>, scope: &[Provider]) -> Vec<Provider>
 /// Refresh the enabled always-on providers that have no pane in this pass, so
 /// the workspace rows do not go stale. Reads no pane; a failed fetch still
 /// counts as the attempt (marked before the fetch) and keeps the last snapshot.
-fn refresh_paneless(cache: &CacheStore, panes: &[AgentPane], scope: &[Provider]) {
+fn refresh_paneless(
+    cache: &CacheStore,
+    panes: &[AgentPane],
+    scope: &[Provider],
+    working: &[String],
+) {
     let always_on = in_watch_scope(
         always_on_providers(&AgentSelection::from_args_or_env(&[])),
         scope,
     );
-    let backed = pane_backed_providers(panes);
+    let backed = paneless_backed(panes, working);
     let now = CacheStore::now_unix();
     let Ok(due) = paneless_due(cache, &always_on, &backed, now, current_account_gate) else {
         return;
@@ -1505,13 +1553,34 @@ fn refresh_provider(
                 error: None,
             })
         }
-        Err(error) => Ok(ProviderOutcome {
-            provider,
-            available: load_usable_snapshot(cache, provider)?.is_some(),
-            from_cache: true,
-            error: Some(error.to_string()),
-        }),
+        Err(error) => {
+            if provider == Provider::Grok {
+                mark_refresh_failure(cache, provider, grok::failure_kind(&error))?;
+            }
+            Ok(ProviderOutcome {
+                provider,
+                available: load_usable_snapshot(cache, provider)?.is_some(),
+                from_cache: true,
+                error: Some(error.to_string()),
+            })
+        }
     }
+}
+
+/// Keep the last reading but stop showing it as current. Without a reading
+/// there is no row to mark. The next successful fetch replaces the snapshot.
+fn mark_refresh_failure(
+    cache: &CacheStore,
+    provider: Provider,
+    failure: RefreshFailure,
+) -> Result<()> {
+    if let Some(mut snapshot) = cache.load(provider)? {
+        if snapshot.refresh_failure != Some(failure) {
+            snapshot.refresh_failure = Some(failure);
+            cache.save(&snapshot)?;
+        }
+    }
+    Ok(())
 }
 
 /// Debounce for a provider some pane in the pass is billed to.
@@ -4530,6 +4599,76 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_grok_pane_does_not_hide_grok_from_the_paneless_pass() {
+        let panes = [test_pane("w1:p1", Harness::Grok)];
+        assert!(!paneless_backed(&panes, &[]).contains(&Provider::Grok));
+        assert!(paneless_backed(&panes, &["w1:p1".to_string()]).contains(&Provider::Grok));
+        // Other providers keep their pane-backed rule.
+        let panes = [test_pane("w1:p1", Harness::Codex)];
+        assert!(paneless_backed(&panes, &[]).contains(&Provider::Codex));
+    }
+
+    #[test]
+    fn a_failed_refresh_says_so_in_the_row_and_gives_up_the_headroom() {
+        let row = summary_row(crate::cli::SummaryFormat::Lines);
+        let mut snapshot = ProviderSnapshot::new(
+            Provider::Grok,
+            vec![window(WindowKind::Weekly, 40.0, SUMMARY_NOW + 86_400)],
+            SUMMARY_NOW - 7_200,
+        );
+        snapshot.refresh_failure = Some(RefreshFailure::LoginExpired);
+        let tokens = workspace_summary(std::slice::from_ref(&snapshot), SUMMARY_NOW, row, &[]);
+        assert_eq!(tokens["quota_acct_gk_w1_unknown"], "7d login expired");
+
+        snapshot.refresh_failure = Some(RefreshFailure::Stale);
+        let tokens = workspace_summary(std::slice::from_ref(&snapshot), SUMMARY_NOW, row, &[]);
+        assert_eq!(tokens["quota_acct_gk_w1_unknown"], "7d stale 2h");
+
+        let pane = MetadataTokens::from_snapshot_for_pane_with_row(
+            &snapshot,
+            SUMMARY_NOW,
+            None,
+            RowStyle::new(PercentStyle::default(), SidebarShape::default()),
+        );
+        assert_eq!(pane.quota_week, "7d stale 2h");
+        assert_eq!(
+            pane.quota_week_severity,
+            Some(crate::model::Severity::Unknown)
+        );
+        assert_eq!(pane.quota_headroom, None);
+    }
+
+    #[test]
+    fn a_grok_failure_is_recorded_and_a_new_reading_clears_it() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        // With no reading there is nothing to mark, and nothing to invent.
+        mark_refresh_failure(&cache, Provider::Grok, RefreshFailure::Stale).unwrap();
+        assert!(cache.load(Provider::Grok).unwrap().is_none());
+
+        let reading = ProviderSnapshot::new(
+            Provider::Grok,
+            vec![window(WindowKind::Weekly, 40.0, 4_000_000_000)],
+            900,
+        )
+        .with_account_id(Some("acc".into()));
+        cache.save(&reading).unwrap();
+        mark_refresh_failure(&cache, Provider::Grok, RefreshFailure::LoginExpired).unwrap();
+        let marked = cache.load(Provider::Grok).unwrap().unwrap();
+        assert_eq!(marked.refresh_failure, Some(RefreshFailure::LoginExpired));
+        assert_eq!(marked.fetched_at_unix, 900);
+
+        let mut fresh = reading.clone();
+        cache
+            .save_preserving_diagnostics_for_sessions(&mut fresh, &[], None)
+            .unwrap();
+        assert_eq!(
+            cache.load(Provider::Grok).unwrap().unwrap().refresh_failure,
+            None
+        );
+    }
+
+    #[test]
     fn a_failed_paneless_refresh_records_the_attempt_and_keeps_the_snapshot() {
         // No Grok auth file: the fetch fails locally, before any request.
         let _env = crate::providers::test_support::env_guard();
@@ -4564,10 +4703,9 @@ mod tests {
             cache.should_debounce(Provider::Grok, now, 300).unwrap(),
             "the failed attempt must count as an attempt (marker: {marked:?})"
         );
-        assert_eq!(
-            cache.load(Provider::Grok).unwrap().unwrap().fetched_at_unix,
-            900
-        );
+        let kept = cache.load(Provider::Grok).unwrap().unwrap();
+        assert_eq!(kept.fetched_at_unix, 900);
+        assert_eq!(kept.refresh_failure, Some(RefreshFailure::LoginExpired));
     }
 
     #[test]

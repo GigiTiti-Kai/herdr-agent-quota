@@ -56,7 +56,7 @@ Concretely, this means:
 | `refresh` | manual action, `startup` | No |
 | `event` | `pane.agent_detected`, `pane.agent_status_changed` | Only the pane named in `HERDR_PLUGIN_EVENT_JSON`, and never a Pi, omp, Muse, Cursor, or Hermes pane — their transcripts or session rows carry the evidence |
 | `focus` | `pane.focused`, `workspace.focused`, `tab.focused` | No |
-| `watch` | detached from a working status event | No (agent metadata only) |
+| `watch` | detached from a working status event; `startup` | No (agent metadata only) |
 
 `startup` exists because Herdr drops plugin-owned Agent views when the server
 exits, and startup hooks run again after a restart or a live handoff. It
@@ -89,6 +89,41 @@ last usable snapshot survives it, even when its windows have lapsed. These rows
 refresh during watch, refresh and startup passes only (a watcher scoped with `--provider`
 refreshes only providers in that scope; `--provider all` covers every one); `event` does not do this: it stays on the
 named pane's budget.
+
+Grok is the one provider that keeps the watcher alive through idle time, while
+it is enabled, in the watcher's scope, and `auth.json` exists. Usage outside
+Herdr (the Windows Grok Bot) raises no event, so only a poll can show it. A pass
+with nothing to do then asks Grok alone, on the same 300 seconds, so the longer
+life adds no around-the-clock requests to other providers (Claude's endpoint
+returns 429 when pushed). An idle Grok pane counts as no pane for this pass. The
+one-hour limit runs from the last good `herdr agent list`, so a dead server
+still ends the watcher.
+
+## Grok's token belongs to the grok CLI
+
+`auth.json`'s access token lasts six hours, and only the CLI refreshes it. Its
+`refresh_token` rotates on every refresh (measured), so a refresh by this plugin
+would kill the CLI's copy and force a new login. `src/providers/grok.rs` never
+reads `refresh_token` and never calls the identity provider. When the token has
+expired, or billing answers 401, it runs `<grok home>/bin/grok models` once and
+re-reads the file. Four rules hold that together:
+
+1. **Never kill that process.** Killed between the provider's reply and the file
+   write, the rotated token is lost. Past its budget it is abandoned, in its own
+   session. Do not use `process::run_shell_with_deadline`, which kills.
+2. **Judge it by the file, not its output.** A successful refresh printed "You
+   are not authenticated." and exited 0.
+3. **Never point it at a copy.** With `GROK_HOME` on a copy of `auth.json` the
+   real file's refresh token dies. For the same reason `GROK_AUTH_FILE`, which
+   the CLI does not know, skips the CLI.
+4. **One refresh per fetch.** A login that a refresh cannot save is an error,
+   not a loop.
+
+A failed fetch stays in the snapshot as `refresh_failure` (Grok only). The window
+then reads `7d login expired` (401 after the refresh, or no credentials) or
+`7d stale 2h` (anything else, aged from the last reading) with no severity colour
+and no `quota_headroom`, so a fired low-quota alert stays fired. A successful
+fetch saves a new snapshot, which clears it.
 
 ## omp's quota does not come from a provider endpoint
 
