@@ -138,6 +138,60 @@ fn every_supported_working_harness_keeps_the_watcher_alive() {
     }
 }
 
+/// Whether a watcher with nothing to do is still running 3 s after its first pass.
+fn idle_watcher_outlives_its_first_pass(auth: &std::path::Path) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let herdr = dir.path().join("herdr");
+    fs::write(
+        &herdr,
+        "#!/bin/sh\nprintf x >> \"$TEST_INVENTORY\"\nprintf '%s\\n' '{\"result\":{\"agents\":[]}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
+        .args(["watch", "--provider", "grok", "--interval-seconds", "30"])
+        .env("HERDR_PLUGIN_STATE_DIR", dir.path())
+        .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
+        .env("HERDR_BIN_PATH", herdr)
+        .env("TEST_INVENTORY", dir.path().join("inventory"))
+        .env("GROK_AUTH_FILE", auth)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The first pass reads the inventory, then decides whether to stay.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !dir.path().join("inventory").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let settle = Instant::now() + Duration::from_secs(3);
+    let mut exited = child.try_wait().unwrap().is_some();
+    while !exited && Instant::now() < settle {
+        thread::sleep(Duration::from_millis(50));
+        exited = child.try_wait().unwrap().is_some();
+    }
+    if !exited {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    !exited
+}
+
+#[test]
+fn a_grok_login_keeps_an_idle_watcher_and_no_login_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth = dir.path().join("auth.json");
+    assert!(
+        !idle_watcher_outlives_its_first_pass(&auth),
+        "a machine without a Grok login must not keep a watcher running"
+    );
+    fs::write(&auth, "{}").unwrap();
+    assert!(
+        idle_watcher_outlives_its_first_pass(&auth),
+        "an idle watcher exited, so usage outside Herdr would stop showing"
+    );
+}
+
 #[test]
 fn partial_install_startup_and_events_ignore_unselected_working_agents() {
     let dir = tempfile::tempdir().unwrap();

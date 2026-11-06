@@ -241,6 +241,13 @@ are debounced for 60 seconds, including a final refresh after a turn settles.
 OMP additionally retains its own five-minute usage cache. Idle panes sharing a
 verified quota source receive the same reading.
 
+With a Grok login the watcher also stays alive while everything is idle and
+refreshes Grok every five minutes, so usage outside Herdr shows up on its own.
+When the CLI's token has expired, the collector runs `grok models` once to
+refresh it; the plugin never touches the refresh token itself. If a refresh
+fails, the row reads `7d login expired` (run `grok` to log in again) or
+`7d stale 2h` (the provider could not be reached) instead of the old percentage.
+
 Hermes is the exception to the watcher: its quota is never fetched by this
 plugin. Installing for Hermes adds a small Hermes plugin
 (`~/.hermes/plugins/herdr-agent-quota`) and enables it with

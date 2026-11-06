@@ -3,7 +3,7 @@ use crate::cli::{
 };
 use crate::model::{
     format_percent, live_windows, printed_percent, window_in, Harness, Provider, ProviderSnapshot,
-    ResetAt, Severity, UsageWindow, WindowKind,
+    RefreshFailure, ResetAt, Severity, UsageWindow, WindowKind,
 };
 
 /// Three-character label, three spaces, `100%`, and a six-character ETA.
@@ -453,6 +453,38 @@ impl MetadataTokens {
             },
             account: None,
         };
+        let failure = refresh_failure_note(snapshot, now_unix);
+        if let Some(note) = &failure {
+            // As with a stale window above: no current headroom to sort on,
+            // and an alert that already fired stays until a real reading.
+            values.quota_headroom = None;
+            for (kind, text, severity) in [
+                (
+                    WindowKind::FiveHour,
+                    &mut values.quota_5h,
+                    &mut values.quota_5h_severity,
+                ),
+                (
+                    WindowKind::Weekly,
+                    &mut values.quota_week,
+                    &mut values.quota_week_severity,
+                ),
+                (
+                    WindowKind::Monthly,
+                    &mut values.quota_month,
+                    &mut values.quota_month_severity,
+                ),
+            ] {
+                if let Some(window) = window_in(all_windows, kind) {
+                    *text = format!("{} {note}", window.display_label());
+                    *severity = Some(Severity::Unknown);
+                }
+            }
+            // No window row to carry it, and no footer row without summary mode.
+            if all_windows.is_empty() && !row.summary.is_on() {
+                values.quota_error = Some(note.clone());
+            }
+        }
         if row.summary.is_on() {
             values.account = Some(account_summary(
                 AccountFamily::for_provider(snapshot.provider),
@@ -460,6 +492,7 @@ impl MetadataTokens {
                 now_unix,
                 row,
                 None,
+                failure.as_deref(),
             ))
             .filter(|account| !account.segments.is_empty());
             values.clear_window_rows();
@@ -552,6 +585,18 @@ fn stale_quota_age(
     }
 }
 
+/// What replaces a kept reading's value after a failed refresh.
+fn refresh_failure_note(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
+    snapshot.refresh_failure.map(|failure| match failure {
+        RefreshFailure::LoginExpired => "login expired".to_string(),
+        RefreshFailure::Stale if snapshot.windows.is_empty() => "quota unavailable".to_string(),
+        RefreshFailure::Stale => format!(
+            "stale {}",
+            format_stale_age(now_unix.saturating_sub(snapshot.fetched_at_unix))
+        ),
+    })
+}
+
 fn stale_window(window: &UsageWindow, age_seconds: Option<u64>) -> String {
     let label = window.display_label();
     match age_seconds {
@@ -621,6 +666,7 @@ fn account_summary(
     now_unix: u64,
     row: RowStyle,
     badge: Option<usize>,
+    failure: Option<&str>,
 ) -> AccountSummary {
     let live = live_windows(windows, now_unix);
     let shown: Vec<&UsageWindow> = [
@@ -645,20 +691,37 @@ fn account_summary(
         .map(|sessions| hermes_badge(sessions, lines_icon(family.icon).chars().count()));
     let clearance = row.icon_size.mark_clearance_rows();
     let (badge_line, _) = hermes_badge_lines(clearance);
-    let segments: Vec<AccountSegment> = shown
+    let mut segments: Vec<AccountSegment> = shown
         .iter()
         .enumerate()
         .map(|(index, window)| {
-            if lines {
-                // Lines 2 and 3 start under line 1's text, unless the badge
-                // fills that line's icon column instead of the pad.
-                let padded = index > 0 && !(badge.is_some() && index + 1 == badge_line);
+            // Lines 2 and 3 start under line 1's text, unless the badge
+            // fills that line's icon column instead of the pad.
+            let padded = lines && index > 0 && !(badge.is_some() && index + 1 == badge_line);
+            if let Some(note) = failure {
+                let pad = if padded {
+                    lines_pad(family.icon)
+                } else {
+                    String::new()
+                };
+                AccountSegment {
+                    text: format!("{pad}{} {note}", window.display_label()),
+                    severity: Some(Severity::Unknown),
+                }
+            } else if lines {
                 line_segment(window, family.icon, now_unix, row, padded)
             } else {
                 summary_segment(window, now_unix, row.percent, cells)
             }
         })
         .collect();
+    // Nothing was ever read, so the reason stands in for the windows.
+    if let (true, Some(note)) = (segments.is_empty(), failure) {
+        segments.push(AccountSegment {
+            text: note.to_string(),
+            severity: Some(Severity::Unknown),
+        });
+    }
     let mut used = family.icon.chars().count()
         + segments
             .iter()
@@ -796,6 +859,7 @@ pub(crate) fn hermes_badged_account(
         now_unix,
         row,
         Some(sessions),
+        refresh_failure_note(snapshot, now_unix).as_deref(),
     ))
     .filter(|account| !account.segments.is_empty())
 }

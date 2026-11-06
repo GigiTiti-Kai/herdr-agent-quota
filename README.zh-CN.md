@@ -204,6 +204,10 @@ Claude Code 状态栏始终保留用户自己的 statusLine 输出。**StatusLin
 所有受支持的工作中 agent 共用一个后台 watcher，请求间隔至少 60 秒，并在回合结束后
 完成收尾刷新。OMP 另有自身的五分钟 usage 缓存。共享已确认额度来源的闲置窗格会收到同一读数。
 
+有 Grok 登录时，watcher 在全部闲置时也会保持运行，每五分钟刷新一次 Grok，Herdr 之外的用量会自动显示。
+CLI 的令牌过期后，collector 运行一次 `grok models` 让 CLI 刷新，插件本身不碰 refresh token。刷新失败时，
+该行不再显示旧百分比，而是显示 `7d login expired`（运行 `grok` 重新登录）或 `7d stale 2h`（无法连接服务商）。
+
 Hermes 不走 watcher：本插件从不自行获取它的额度。为 Hermes 安装时会写入一个小的
 Hermes 插件（`~/.hermes/plugins/herdr-agent-quota`），并用 `hermes plugins enable`
 启用；该命令也会让已在运行的 Hermes 进程加载它。插件在 Hermes 进程内向 Hermes 自身的

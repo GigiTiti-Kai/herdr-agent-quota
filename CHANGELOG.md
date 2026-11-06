@@ -89,6 +89,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   appends a `$quota_group_tail` row last in every managed layout and moves
   an older layout's rows into place.
 
+### Fixed
+
+- Grok: an expired token no longer leaves the quota frozen with no sign of it.
+  When the token has expired or billing answers 401, the collector runs
+  `grok models` once, which refreshes `auth.json` under the CLI's own lock, and
+  fetches again. The plugin never touches the rotating refresh token, so the
+  CLI keeps working without a new login.
+- Grok: a failed refresh is visible. The row reads `7d login expired`, or
+  `7d stale 2h` when the provider could not be reached, instead of the old
+  percentage, and stops counting for sorting and low-quota alerts.
+- Grok: usage outside Herdr now reaches the sidebar while nothing is running.
+  With a Grok login, the watcher stays alive when idle and refreshes Grok every
+  five minutes, also while a Grok pane sits idle.
+
 ## [1.6.3] - 2026-09-26
 
 ### Added
