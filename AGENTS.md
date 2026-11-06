@@ -128,6 +128,12 @@ then reads `7d login expired` (401 after the refresh, or no credentials) or
 and no `quota_headroom`, so a fired low-quota alert stays fired. A successful
 fetch saves a new snapshot, which clears it.
 
+The row is drawn only from a usable snapshot, so a failure with no usable reading
+(the first fetch, a removed `auth.json`, a new login) writes a windowless snapshot
+of the current login. Its row reads `login expired` or `quota unavailable`, and
+`quota_error` says the same when summary mode is off. No reading and no auth file
+means Grok was never signed in here, and no row appears.
+
 ## omp's quota does not come from a provider endpoint
 
 Every other collector either reads a local credential and calls the provider

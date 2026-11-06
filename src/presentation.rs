@@ -480,6 +480,10 @@ impl MetadataTokens {
                     *severity = Some(Severity::Unknown);
                 }
             }
+            // No window row to carry it, and no footer row without summary mode.
+            if all_windows.is_empty() && !row.summary.is_on() {
+                values.quota_error = Some(note.clone());
+            }
         }
         if row.summary.is_on() {
             values.account = Some(account_summary(
@@ -585,6 +589,7 @@ fn stale_quota_age(
 fn refresh_failure_note(snapshot: &ProviderSnapshot, now_unix: u64) -> Option<String> {
     snapshot.refresh_failure.map(|failure| match failure {
         RefreshFailure::LoginExpired => "login expired".to_string(),
+        RefreshFailure::Stale if snapshot.windows.is_empty() => "quota unavailable".to_string(),
         RefreshFailure::Stale => format!(
             "stale {}",
             format_stale_age(now_unix.saturating_sub(snapshot.fetched_at_unix))
@@ -686,7 +691,7 @@ fn account_summary(
         .map(|sessions| hermes_badge(sessions, lines_icon(family.icon).chars().count()));
     let clearance = row.icon_size.mark_clearance_rows();
     let (badge_line, _) = hermes_badge_lines(clearance);
-    let segments: Vec<AccountSegment> = shown
+    let mut segments: Vec<AccountSegment> = shown
         .iter()
         .enumerate()
         .map(|(index, window)| {
@@ -710,6 +715,13 @@ fn account_summary(
             }
         })
         .collect();
+    // Nothing was ever read, so the reason stands in for the windows.
+    if let (true, Some(note)) = (segments.is_empty(), failure) {
+        segments.push(AccountSegment {
+            text: note.to_string(),
+            severity: Some(Severity::Unknown),
+        });
+    }
     let mut used = family.icon.chars().count()
         + segments
             .iter()

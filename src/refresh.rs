@@ -1569,7 +1569,8 @@ fn refresh_provider(
             }
             Ok(ProviderOutcome {
                 provider,
-                available: load_usable_snapshot(cache, provider)?.is_some(),
+                available: load_usable_snapshot(cache, provider)?
+                    .is_some_and(|snapshot| !snapshot.windows.is_empty()),
                 from_cache: true,
                 error: Some(error.to_string()),
             })
@@ -1577,18 +1578,30 @@ fn refresh_provider(
     }
 }
 
-/// Keep the last reading but stop showing it as current. Without a reading
-/// there is no row to mark. The next successful fetch replaces the snapshot.
+/// Keep the last reading but stop showing it as current. A reading the current
+/// login cannot use (or none at all) gives way to a windowless snapshot of that
+/// login, because the row is drawn only from a usable snapshot and a silent
+/// failure would drop it. No reading and no auth file means Grok was never
+/// signed in here, so no row appears. The next successful fetch replaces it.
 fn mark_refresh_failure(
     cache: &CacheStore,
     provider: Provider,
     failure: RefreshFailure,
 ) -> Result<()> {
-    if let Some(mut snapshot) = cache.load(provider)? {
-        if snapshot.refresh_failure != Some(failure) {
-            snapshot.refresh_failure = Some(failure);
-            cache.save(&snapshot)?;
-        }
+    let (account, mtime) = current_account_gate(provider);
+    let previous = cache.load(provider)?;
+    if previous.is_none() && account.is_none() && mtime.is_none() {
+        return Ok(());
+    }
+    let mut snapshot = previous
+        .filter(|snapshot| snapshot.usable_for_account(account.as_deref(), mtime))
+        .unwrap_or_else(|| {
+            ProviderSnapshot::new(provider, Vec::new(), CacheStore::now_unix())
+                .with_account_id(account)
+        });
+    if snapshot.refresh_failure != Some(failure) {
+        snapshot.refresh_failure = Some(failure);
+        cache.save(&snapshot)?;
     }
     Ok(())
 }
@@ -4648,13 +4661,131 @@ mod tests {
         assert_eq!(pane.quota_headroom, None);
     }
 
+    /// Points the Grok auth path at `path` until dropped.
+    struct GrokAuthFile(Option<std::ffi::OsString>);
+    impl GrokAuthFile {
+        fn at(path: &std::path::Path) -> Self {
+            let saved = std::env::var_os("GROK_AUTH_FILE");
+            std::env::set_var("GROK_AUTH_FILE", path);
+            Self(saved)
+        }
+    }
+    impl Drop for GrokAuthFile {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("GROK_AUTH_FILE", value),
+                None => std::env::remove_var("GROK_AUTH_FILE"),
+            }
+        }
+    }
+
+    fn grok_footer(cache: &CacheStore) -> BTreeMap<String, String> {
+        let row = summary_row(crate::cli::SummaryFormat::Lines);
+        desired_workspace_summary(cache, &[Provider::Grok], CacheStore::now_unix(), row)
+    }
+
+    #[test]
+    fn a_machine_that_never_signed_in_to_grok_gets_no_failure_row() {
+        let _env = crate::providers::test_support::env_guard();
+        let directory = tempdir().unwrap();
+        let _auth = GrokAuthFile::at(&directory.path().join("absent.json"));
+        let cache = CacheStore::new(directory.path());
+        mark_refresh_failure(&cache, Provider::Grok, RefreshFailure::LoginExpired).unwrap();
+        assert!(cache.load(Provider::Grok).unwrap().is_none());
+        assert!(grok_footer(&cache).is_empty());
+    }
+
+    #[test]
+    fn a_failure_before_the_first_reading_still_shows_a_row() {
+        let _env = crate::providers::test_support::env_guard();
+        let directory = tempdir().unwrap();
+        let auth = directory.path().join("auth.json");
+        std::fs::write(&auth, r#"{"x":{"key":"fake","user_id":"u1"}}"#).unwrap();
+        let _auth = GrokAuthFile::at(&auth);
+        let cache = CacheStore::new(directory.path());
+
+        mark_refresh_failure(&cache, Provider::Grok, RefreshFailure::Stale).unwrap();
+        let snapshot = cache.load(Provider::Grok).unwrap().unwrap();
+        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.account_id.as_deref(), Some("u1"));
+        assert_eq!(
+            grok_footer(&cache)["quota_acct_gk_w1_unknown"],
+            "quota unavailable"
+        );
+
+        mark_refresh_failure(&cache, Provider::Grok, RefreshFailure::LoginExpired).unwrap();
+        assert_eq!(
+            grok_footer(&cache)["quota_acct_gk_w1_unknown"],
+            "login expired"
+        );
+
+        // Without the footer, the pane says it instead.
+        let snapshot = cache.load(Provider::Grok).unwrap().unwrap();
+        let pane = MetadataTokens::from_snapshot_for_pane_with_row(
+            &snapshot,
+            CacheStore::now_unix(),
+            None,
+            RowStyle::new(PercentStyle::default(), SidebarShape::default()),
+        );
+        assert_eq!(pane.quota_error.as_deref(), Some("login expired"));
+    }
+
+    #[test]
+    fn a_removed_login_shows_login_expired_instead_of_dropping_the_row() {
+        let _env = crate::providers::test_support::env_guard();
+        let directory = tempdir().unwrap();
+        let _auth = GrokAuthFile::at(&directory.path().join("absent.json"));
+        let cache = CacheStore::new(directory.path());
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 4_000_000_000)],
+                    900,
+                )
+                .with_account_id(Some("gone".into())),
+            )
+            .unwrap();
+        let outcome = refresh_provider(&cache, Provider::Grok, true, &[], 60).unwrap();
+        assert!(outcome.error.is_some());
+        assert!(!outcome.available);
+        let footer = grok_footer(&cache);
+        assert_eq!(footer["quota_acct_gk_w1_unknown"], "login expired");
+        assert!(footer.keys().all(|name| !name.contains("danger")));
+    }
+
+    #[test]
+    fn a_failure_under_a_new_login_never_shows_the_old_logins_windows() {
+        let _env = crate::providers::test_support::env_guard();
+        let directory = tempdir().unwrap();
+        let auth = directory.path().join("auth.json");
+        std::fs::write(&auth, r#"{"x":{"key":"fake","user_id":"new"}}"#).unwrap();
+        let _auth = GrokAuthFile::at(&auth);
+        let cache = CacheStore::new(directory.path());
+        cache
+            .save(
+                &ProviderSnapshot::new(
+                    Provider::Grok,
+                    vec![window(WindowKind::Weekly, 40.0, 4_000_000_000)],
+                    900,
+                )
+                .with_account_id(Some("old".into())),
+            )
+            .unwrap();
+        mark_refresh_failure(&cache, Provider::Grok, RefreshFailure::Stale).unwrap();
+        let snapshot = cache.load(Provider::Grok).unwrap().unwrap();
+        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.account_id.as_deref(), Some("new"));
+    }
+
     #[test]
     fn a_grok_failure_is_recorded_and_a_new_reading_clears_it() {
+        let _env = crate::providers::test_support::env_guard();
         let directory = tempdir().unwrap();
+        let auth = directory.path().join("auth.json");
+        std::fs::write(&auth, r#"{"x":{"key":"fake","user_id":"acc"}}"#).unwrap();
+        let _auth = GrokAuthFile::at(&auth);
         let cache = CacheStore::new(directory.path());
-        // With no reading there is nothing to mark, and nothing to invent.
-        mark_refresh_failure(&cache, Provider::Grok, RefreshFailure::Stale).unwrap();
-        assert!(cache.load(Provider::Grok).unwrap().is_none());
 
         let reading = ProviderSnapshot::new(
             Provider::Grok,
