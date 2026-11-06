@@ -104,6 +104,20 @@ fn run_claude_collector_with_config_dir(
     assert!(child.wait_with_output().unwrap().status.success());
 }
 
+fn run_claude_statusline_output(state: &Path, input: &[u8]) -> std::process::Output {
+    let mut child = isolated_plugin_command()
+        .arg("claude-statusline")
+        .env("HERDR_PLUGIN_STATE_DIR", state)
+        .env_remove("HERDR_PLUGIN_CONFIG_DIR")
+        .env_remove("HERDR_AGENT_QUOTA_STATUSLINE_PACE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn run_claude_collector_with_timeout(state: &Path, input: &[u8], timeout: Duration) -> bool {
     let mut child = isolated_plugin_command()
         .arg("claude-statusline")
@@ -573,6 +587,36 @@ fn claude_collector_is_silent_without_a_previous_statusline() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn claude_statusline_pace_can_be_disabled_without_disabling_observations() {
+    let root = tempdir().unwrap();
+    let state = root.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("claude-statusline.original.json"),
+        r#"{"type":"command","command":"printf custom"}"#,
+    )
+    .unwrap();
+    let reset = future_reset_unix();
+    let payload = format!(
+        r#"{{"session_id":"pace-test","rate_limits":{{"five_hour":{{"used_percentage":58.0,"resets_at":{reset}}}}}}}"#
+    );
+
+    let default_on = run_claude_statusline_output(&state, payload.as_bytes());
+    assert!(default_on.status.success());
+    let stdout = String::from_utf8(default_on.stdout).unwrap();
+    assert!(stdout.starts_with("custom ⏱ 5h "), "{stdout}");
+
+    fs::write(state.join("statusline-pace"), "off\n").unwrap();
+    let off = run_claude_statusline_output(&state, payload.as_bytes());
+    assert!(off.status.success());
+    assert_eq!(off.stdout, b"custom");
+    assert!(
+        state.join("claude-statusline.observation.json").exists(),
+        "turning statusLine pace off must not disable quota observation"
+    );
 }
 
 #[test]
@@ -3145,6 +3189,103 @@ fn stacked_sidebar_layout_is_persisted_across_a_repair() {
         sidebar_is_packed(&homes.sidebar()),
         "explicit packed did not switch: {}",
         homes.sidebar()
+    );
+}
+
+#[test]
+fn sidebar_pacing_is_opt_in_and_persisted_across_a_repair() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+
+    assert!(homes.configure(&["--apply"]).status.success());
+    assert_eq!(
+        fs::read_to_string(homes.state.join("sidebar-pacing")).unwrap(),
+        "off"
+    );
+
+    assert!(homes
+        .configure(&["--apply", "--sidebar-pacing", "on"])
+        .status
+        .success());
+    assert_eq!(
+        fs::read_to_string(homes.state.join("sidebar-pacing")).unwrap(),
+        "on"
+    );
+
+    assert!(homes.configure(&["--apply"]).status.success());
+    assert_eq!(
+        fs::read_to_string(homes.state.join("sidebar-pacing")).unwrap(),
+        "on"
+    );
+}
+
+#[test]
+fn statusline_pace_is_opt_out_and_persisted_across_a_repair() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    let config = root.path().join("plugin-config");
+    fs::create_dir_all(&config).unwrap();
+    let config_str = config.to_str().unwrap();
+
+    let output = homes.configure_with_env(&["--apply"], &[("HERDR_PLUGIN_CONFIG_DIR", config_str)]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(config.join("statusline-pace")).unwrap(),
+        "on"
+    );
+    assert_eq!(
+        fs::read_to_string(homes.state.join("statusline-pace")).unwrap(),
+        "on"
+    );
+
+    let output = homes.configure_with_env(
+        &["--apply", "--statusline-pace", "off"],
+        &[("HERDR_PLUGIN_CONFIG_DIR", config_str)],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(config.join("statusline-pace")).unwrap(),
+        "off"
+    );
+    assert_eq!(
+        fs::read_to_string(homes.state.join("statusline-pace")).unwrap(),
+        "off"
+    );
+
+    let output = homes.configure_with_env(&["--apply"], &[("HERDR_PLUGIN_CONFIG_DIR", config_str)]);
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(config.join("statusline-pace")).unwrap(),
+        "off"
+    );
+    assert_eq!(
+        fs::read_to_string(homes.state.join("statusline-pace")).unwrap(),
+        "off"
+    );
+}
+
+#[test]
+fn sidebar_pacing_can_be_selected_through_the_installer_environment() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    let output =
+        homes.configure_with_env(&["--apply"], &[("HERDR_AGENT_QUOTA_SIDEBAR_PACING", "on")]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(homes.state.join("sidebar-pacing")).unwrap(),
+        "on"
     );
 }
 

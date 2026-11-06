@@ -297,7 +297,7 @@ impl AgentPane {
 
     /// Status the brand icon should mirror.
     ///
-    /// Working is yellow, unseen completion is teal, acknowledged is white.
+    /// Working is yellow, unseen completion is teal, blocked is red, acknowledged is white.
     /// Callers fold the plugin unseen-set into `status` before publish. Do
     /// not treat a leftover `$quota_icon_done` token as unseen: a concurrent
     /// inventory read after mark-seen still carries that token and would
@@ -327,10 +327,12 @@ impl AgentPane {
             .unwrap_or("");
         let working = value.contains(crate::icons::WORKING_TAG);
         let done = value.contains(crate::icons::DONE_TAG);
+        let blocked = value.contains(crate::icons::BLOCKED_TAG);
         match self.icon_status() {
-            AgentStatus::Working => !working || done,
-            AgentStatus::Done => !done,
-            _ => working || done || value.is_empty(),
+            AgentStatus::Working => !working || done || blocked,
+            AgentStatus::Done => !done || working || blocked,
+            AgentStatus::Blocked => !blocked || working || done,
+            _ => working || done || blocked || value.is_empty(),
         }
     }
 }
@@ -552,11 +554,131 @@ fn attach_muse_sessions(panes: &mut [AgentPane]) {
 /// hooks while leaving Herdr's foreground cwd intact, so use the rollout's
 /// exact session_meta cwd only when one missing pane and one rollout agree.
 fn attach_codex_sessions(panes: &mut [AgentPane]) {
+    if !crate::cli::AgentSelection::from_args_or_env(&[]).contains(&Harness::Codex) {
+        return;
+    }
+    let mut started = BTreeMap::new();
+    for pane in panes
+        .iter_mut()
+        .filter(|pane| pane.harness == Harness::Codex && pane.session.is_none())
+    {
+        let Some(process) = codex_foreground_process(&pane.pane_id) else {
+            continue;
+        };
+        if let Some(session_id) = codex_resume_session_id(&process) {
+            pane.session = Some(AgentSession {
+                kind: Some("id".to_string()),
+                value: session_id,
+            });
+        } else if let Some(time) = codex_process_started_at(&process) {
+            started.insert(pane.pane_id.clone(), time);
+        }
+    }
     attach_codex_sessions_with(
         panes,
-        codex_process_started_at,
+        |pane_id| started.get(pane_id).copied(),
         crate::providers::codex::session_ids_for_panes,
     );
+}
+
+fn codex_foreground_process(pane_id: &str) -> Option<Value> {
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let output = Command::new(executable)
+        .args(["pane", "process-info", "--pane", pane_id])
+        .output()
+        .ok()?;
+    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+    value
+        .pointer("/result/process_info/foreground_processes")?
+        .as_array()?
+        .iter()
+        .find(|process| {
+            process
+                .get("argv")
+                .and_then(Value::as_array)
+                .and_then(|argv| argv.first())
+                .and_then(Value::as_str)
+                .is_some_and(|argv0| argv0 == "codex" || argv0.ends_with("/codex"))
+        })
+        .cloned()
+}
+
+/// A restored pane exposes its exact session in `codex resume <id>` even when
+/// Herdr's session hook has not reported it after a reboot.
+fn codex_resume_session_id(process: &Value) -> Option<String> {
+    let argv = process.get("argv")?.as_array()?;
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next().and_then(Value::as_str) {
+        match arg {
+            "resume" => {
+                while let Some(candidate) = args.next().and_then(Value::as_str) {
+                    if codex_session_uuid(candidate) {
+                        return Some(candidate.to_string());
+                    }
+                    match candidate {
+                        "--last" | "--all" | "--include-non-interactive" => {}
+                        flag if codex_cli_option_takes_value(flag) => {
+                            args.next()?.as_str()?;
+                        }
+                        flag if codex_cli_inline_value(flag) => {}
+                        // Unknown post-resume flags fail closed. Treating a
+                        // following UUID as the session could bind a pane to a
+                        // future option's value instead of the resume target.
+                        flag if flag.starts_with('-') => return None,
+                        _ => return None,
+                    }
+                }
+                return None;
+            }
+            flag if codex_cli_option_takes_value(flag) => {
+                args.next()?.as_str()?;
+            }
+            flag if codex_cli_inline_value(flag) || flag.starts_with('-') => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn codex_session_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn codex_cli_option_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-m" | "--model"
+            | "-c"
+            | "--config"
+            | "-p"
+            | "--profile"
+            | "-s"
+            | "--sandbox"
+            | "-a"
+            | "--ask-for-approval"
+            | "-C"
+            | "--cd"
+            | "-i"
+            | "--image"
+            | "--add-dir"
+            | "--enable"
+            | "--disable"
+            | "--remote"
+            | "--remote-auth-token-env"
+            | "--local-provider"
+    )
+}
+
+fn codex_cli_inline_value(flag: &str) -> bool {
+    flag.split_once('=')
+        .is_some_and(|(name, _)| codex_cli_option_takes_value(name))
 }
 
 fn attach_codex_sessions_with(
@@ -599,25 +721,7 @@ fn attach_codex_sessions_with(
     }
 }
 
-fn codex_process_started_at(pane_id: &str) -> Option<u64> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-    let output = Command::new(executable)
-        .args(["pane", "process-info", "--pane", pane_id])
-        .output()
-        .ok()?;
-    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let process = value
-        .pointer("/result/process_info/foreground_processes")?
-        .as_array()?
-        .iter()
-        .find(|process| {
-            process
-                .get("argv")
-                .and_then(Value::as_array)
-                .and_then(|argv| argv.first())
-                .and_then(Value::as_str)
-                .is_some_and(|argv0| argv0 == "codex" || argv0.ends_with("/codex"))
-        })?;
+fn codex_process_started_at(process: &Value) -> Option<u64> {
     let pid = process.get("pid")?.as_u64()?.to_string();
     let elapsed = Command::new("ps")
         .args(["-p", &pid, "-o", "etime="])
@@ -1074,8 +1178,20 @@ fn publish_pane_tokens_inner(
             PaneQuotaUpdate::Preserve => pane.tokens.clone(),
         };
         let role = vendor_row_for(wide, &nesting, &pane.pane_id);
+        // A Codex helper is a separately steerable seat even when it shares
+        // account quota with the workspace head. Keep its own identity line.
+        let codex_child = role == VendorRow::Child && pane.harness == Harness::Codex;
         if let Some(identity) = &pane_tokens.identity {
-            apply_identity(&mut desired, identity, row.shape.content_width, role);
+            apply_identity(
+                &mut desired,
+                identity,
+                row.shape.content_width,
+                if codex_child { VendorRow::Head } else { role },
+            );
+        } else if codex_child {
+            unindent_token(&mut desired, "quota_model");
+            desired.insert("quota_provider".to_string(), "Codex".to_string());
+            apply_nested_head_from_tokens(&mut desired);
         } else if role == VendorRow::Child {
             apply_nested_child_from_tokens(&mut desired);
         } else if role == VendorRow::Head {
@@ -1108,16 +1224,14 @@ fn publish_pane_tokens_inner(
                 }
             }
         }
-        if row.shape.layout == crate::cli::SidebarLayout::Gauges && role == VendorRow::Flat {
-            desired.remove("quota_model");
-        }
+        strip_flat_gauge_model_if_unused(&mut desired, row, role);
         apply_group_and_icon(
             &mut desired,
             pane,
             &group_heads,
             &group_tails,
             &workspace_labels,
-            role,
+            if codex_child { VendorRow::Flat } else { role },
             Some(vendor_icon_status(&nesting, pane, role)),
         );
         apply_pack_gap(
@@ -1827,10 +1941,29 @@ fn group_label_for(
 /// colour twin on screen after working→done or done→idle.
 const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_icon_done"];
 
+/// Flat Gauges normally render the packed `$quota_provider_model` identity,
+/// so the standalone model token is redundant and can stay out of the report
+/// budget. When the provider field is hidden, configure deliberately degrades
+/// that identity row to `$quota_model`; keep it only for that exact shape.
+fn strip_flat_gauge_model_if_unused(
+    desired: &mut BTreeMap<String, String>,
+    row: RowStyle,
+    role: VendorRow,
+) {
+    if row.shape.layout != crate::cli::SidebarLayout::Gauges || role != VendorRow::Flat {
+        return;
+    }
+    let model_only_identity = row.fields.contains(crate::cli::SidebarField::Model)
+        && !row.fields.contains(crate::cli::SidebarField::Provider);
+    if !model_only_identity {
+        desired.remove("quota_model");
+    }
+}
+
 /// Vendor mark always; group header only on the Space head pane.
 ///
 /// `$quota_icon` always carries the glyph so it stays the first identity
-/// token. Working/done colour is an invisible suffix matched by Herdr
+/// token. Working/done/blocked colour is an invisible suffix matched by Herdr
 /// `rules`; publishing a later twin on a Space head hang-indents the mark
 /// one cell to the right. Stale `$quota_pad` from older builds is cleared,
 /// as are leftover `_working` / `_done` twins.
@@ -1860,6 +1993,7 @@ fn apply_group_and_icon(
         let tag = match icon_status.unwrap_or_else(|| pane.icon_status()) {
             AgentStatus::Working => crate::icons::WORKING_TAG,
             AgentStatus::Done => crate::icons::DONE_TAG,
+            AgentStatus::Blocked => crate::icons::BLOCKED_TAG,
             _ => "",
         };
         let glyph = crate::icons::for_harness(pane.harness);
@@ -2659,7 +2793,7 @@ fn is_help_command_row(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{FieldSet, PercentStyle, SidebarLayout, SummaryFormat};
+    use crate::cli::{FieldSet, PercentStyle, SidebarField, SidebarLayout, SummaryFormat};
     use crate::model::{
         CacheUsage, ContextUsage, ProviderSnapshot, ResetAt, UsageWindow, WindowKind,
     };
@@ -2691,7 +2825,7 @@ mod tests {
                 (FieldSet::all(), "008"),
                 (FieldSet::parse("5h,7d").unwrap(), "060"),
             ] {
-                let values = MetadataTokens::from_snapshot_for_pane_with_fields(
+                let values = MetadataTokens::from_snapshot_for_pane_with_row(
                     &snapshot,
                     1000,
                     None,
@@ -2766,7 +2900,7 @@ mod tests {
             .collect(),
             0,
         );
-        MetadataTokens::from_snapshot_for_pane_with_fields(
+        MetadataTokens::from_snapshot_for_pane_with_row(
             &snapshot,
             0,
             None,
@@ -2798,7 +2932,7 @@ mod tests {
             ],
             0,
         );
-        MetadataTokens::from_snapshot_for_pane_with_fields(
+        MetadataTokens::from_snapshot_for_pane_with_row(
             &snapshot,
             0,
             None,
@@ -2920,7 +3054,7 @@ mod tests {
                     ..RowStyle::default()
                 };
                 let render = |summary| {
-                    MetadataTokens::from_snapshot_for_pane_with_fields(
+                    MetadataTokens::from_snapshot_for_pane_with_row(
                         &snapshot,
                         0,
                         None,
@@ -2999,13 +3133,12 @@ mod tests {
         .unwrap();
         let tokens = |windows: Vec<UsageWindow>, summary, sessions| {
             let snapshot = ProviderSnapshot::new(Provider::Codex, windows, 0);
-            let plain =
-                desired_summary_tokens(&MetadataTokens::from_snapshot_for_pane_with_fields(
-                    &snapshot,
-                    0,
-                    None,
-                    style(summary),
-                ));
+            let plain = desired_summary_tokens(&MetadataTokens::from_snapshot_for_pane_with_row(
+                &snapshot,
+                0,
+                None,
+                style(summary),
+            ));
             let account =
                 crate::presentation::hermes_badged_account(&snapshot, 0, style(summary), sessions);
             let badged = desired_summary_tokens(&MetadataTokens {
@@ -3087,7 +3220,7 @@ mod tests {
             0,
         );
         let render = |summary| {
-            MetadataTokens::from_snapshot_for_pane_with_fields(
+            MetadataTokens::from_snapshot_for_pane_with_row(
                 &snapshot,
                 0,
                 None,
@@ -3227,6 +3360,43 @@ mod tests {
             &moved,
             SidebarShape::default()
         ));
+    }
+
+    #[test]
+    fn codex_resume_session_id_accepts_exact_uuid_with_supported_flags() {
+        let id = "019f6908-3bc1-7c83-98df-d8ea91694d2c";
+        for argv in [
+            vec!["codex", "resume", id],
+            vec![
+                "/opt/homebrew/bin/codex",
+                "--model",
+                "gpt-5.6-codex",
+                "resume",
+                "--all",
+                id,
+            ],
+            vec!["codex", "resume", "--include-non-interactive", id],
+            vec!["codex", "resume", "--model", "gpt-5.6-codex", id],
+            vec!["codex", "--model=gpt-5.6-codex", "resume", id],
+        ] {
+            assert_eq!(
+                codex_resume_session_id(&json!({"argv": argv})).as_deref(),
+                Some(id)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_resume_session_id_fails_closed_without_an_exact_uuid_target() {
+        let id = "019f6908-3bc1-7c83-98df-d8ea91694d2c";
+        for argv in [
+            vec!["codex", "resume", "--last"],
+            vec!["codex", "resume", "named-session"],
+            vec!["codex", "resume", "not-a-uuid"],
+            vec!["codex", "resume", "--future-option", id],
+        ] {
+            assert_eq!(codex_resume_session_id(&json!({"argv": argv})), None);
+        }
     }
 
     #[test]
@@ -3478,6 +3648,121 @@ mod tests {
         assert_eq!(
             nesting.header_icon.get("w5:pA").copied(),
             Some(AgentStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn codex_vendor_child_keeps_its_identity_and_context_without_account_quota() {
+        let pane = AgentPane {
+            pane_id: "w5:pD".to_string(),
+            workspace_id: "w5".to_string(),
+            cwd: String::new(),
+            title: String::new(),
+            harness: Harness::Codex,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::new(),
+            status: AgentStatus::Idle,
+            focused: false,
+        };
+        let mut desired = BTreeMap::from([
+            ("quota_provider".to_string(), "Codex".to_string()),
+            (
+                "quota_provider_model".to_string(),
+                "Codex/gpt-5.6-codex".to_string(),
+            ),
+            ("quota_model".to_string(), "gpt-5.6-codex".to_string()),
+            ("quota_topic".to_string(), "child work".to_string()),
+            ("quota_context_normal".to_string(), "cx 42%".to_string()),
+            ("quota_5h_normal".to_string(), "5h 80%".to_string()),
+            ("quota_week_normal".to_string(), "7d 70%".to_string()),
+            ("quota_month_normal".to_string(), "30d 60%".to_string()),
+        ]);
+
+        // This mirrors the Codex-child remap in publish_pane_tokens_inner:
+        // head semantics for identity, child semantics for account quota, and
+        // flat semantics for the icon.
+        apply_identity(
+            &mut desired,
+            &PaneIdentity {
+                provider: "Codex".to_string(),
+                model: "gpt-5.6-codex".to_string(),
+            },
+            30,
+            VendorRow::Head,
+        );
+        strip_account_quota_tokens(&mut desired);
+        strip_vendor_child_extras(&mut desired);
+        let heads = BTreeMap::from([("w5".to_string(), "w5:p1".to_string())]);
+        apply_group_and_icon(
+            &mut desired,
+            &pane,
+            &heads,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            VendorRow::Flat,
+            None,
+        );
+
+        assert!(desired.contains_key("quota_icon"), "{desired:?}");
+        assert_eq!(
+            desired.get("quota_provider").map(String::as_str),
+            Some("Codex")
+        );
+        assert_eq!(
+            desired.get("quota_provider_model").map(String::as_str),
+            Some("Codex")
+        );
+        assert_eq!(
+            desired.get("quota_model").map(String::as_str),
+            Some("gpt-5.6-codex")
+        );
+        assert_eq!(
+            desired.get("quota_context_normal").map(String::as_str),
+            Some("cx 42%")
+        );
+        assert_eq!(
+            desired.get("quota_topic").map(String::as_str),
+            Some("child work")
+        );
+        for name in ACCOUNT_QUOTA_TOKEN_NAMES {
+            assert!(!desired.contains_key(name), "{name}: {desired:?}");
+        }
+        assert!(
+            desired.keys().all(|name| !name.starts_with("quota_share_")),
+            "{desired:?}"
+        );
+    }
+
+    #[test]
+    fn flat_gauges_keep_model_when_provider_field_is_hidden() {
+        let model = ("quota_model".to_string(), "Opus 5.5".to_string());
+        let row = RowStyle {
+            percent: PercentStyle::Remaining,
+            shape: SidebarShape::new(SidebarLayout::Gauges, 36),
+            fields: FieldSet::all().toggled(SidebarField::Provider),
+            ..RowStyle::default()
+        };
+        let mut desired = BTreeMap::from([model.clone()]);
+        strip_flat_gauge_model_if_unused(&mut desired, row, VendorRow::Flat);
+        assert_eq!(
+            desired.get("quota_model").map(String::as_str),
+            Some("Opus 5.5")
+        );
+
+        let mut default_fields = BTreeMap::from([model]);
+        strip_flat_gauge_model_if_unused(
+            &mut default_fields,
+            RowStyle {
+                fields: FieldSet::all(),
+                ..row
+            },
+            VendorRow::Flat,
+        );
+        assert!(
+            !default_fields.contains_key("quota_model"),
+            "packed provider/model identity should still omit the redundant token"
         );
     }
 
@@ -3778,6 +4063,35 @@ mod tests {
         assert!(!done_desired.contains_key("quota_icon_done"));
         assert!(!done_desired.contains_key("quota_icon_working"));
 
+        let mut blocked = sibling.clone();
+        blocked.status = AgentStatus::Blocked;
+        assert!(
+            blocked.icon_needs_update(),
+            "a bare brand icon must be republished when the pane becomes blocked"
+        );
+        let mut blocked_desired = BTreeMap::new();
+        apply_group_and_icon(
+            &mut blocked_desired,
+            &blocked,
+            &heads,
+            &tails,
+            &labels,
+            VendorRow::Flat,
+            None,
+        );
+        assert!(
+            blocked_desired
+                .get("quota_icon")
+                .is_some_and(|icon| icon.contains(crate::icons::BLOCKED_TAG)),
+            "blocked panes tag the brand icon: {:?}",
+            blocked_desired.get("quota_icon")
+        );
+        blocked.tokens = blocked_desired.clone();
+        assert!(
+            !blocked.icon_needs_update(),
+            "a correctly tagged blocked icon must not churn metadata"
+        );
+
         let mut head_done = head.clone();
         head_done.status = AgentStatus::Done;
         let mut head_done_desired = BTreeMap::new();
@@ -3865,7 +4179,9 @@ mod tests {
         );
         assert!(
             stale_desired.get("quota_icon").is_some_and(|icon| {
-                !icon.contains(crate::icons::DONE_TAG) && !icon.contains(crate::icons::WORKING_TAG)
+                !icon.contains(crate::icons::DONE_TAG)
+                    && !icon.contains(crate::icons::WORKING_TAG)
+                    && !icon.contains(crate::icons::BLOCKED_TAG)
             }),
             "idle + leftover done token must not restore teal"
         );

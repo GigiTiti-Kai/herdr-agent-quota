@@ -108,6 +108,14 @@ pub enum Command {
         /// passes this through $HERDR_AGENT_QUOTA_PERCENT.
         #[arg(long, value_enum)]
         quota_percent: Option<PercentStyle>,
+        /// Show 5h/7d windows as a signed pace delta plus time remaining.
+        /// `off` (default) keeps the configured quota percentage and gauges.
+        #[arg(long, value_enum)]
+        sidebar_pacing: Option<SidebarPacing>,
+        /// Append Claude's quota spending pace to the user's statusLine output.
+        /// On by default to preserve existing output; quota observations are still collected either way.
+        #[arg(long, value_enum)]
+        statusline_pace: Option<StatuslinePace>,
         /// Quota fields the sidebar shows: all (default), none, or a
         /// comma-separated list of provider, topic, model, cache, ttl,
         /// context, 5h, 7d. The error token is always shown.
@@ -544,6 +552,8 @@ pub struct ConfigureOptions {
     pub watch_interval_seconds: Option<u64>,
     pub sidebar_layout: Option<SidebarLayout>,
     pub quota_percent: Option<PercentStyle>,
+    pub sidebar_pacing: Option<SidebarPacing>,
+    pub statusline_pace: Option<StatuslinePace>,
     pub row_gap: Option<SidebarRowGap>,
     pub fields: Option<FieldSet>,
     pub brand_colors: Option<BrandColors>,
@@ -551,6 +561,96 @@ pub struct ConfigureOptions {
     pub low_quota_alert: Option<LowQuotaAlert>,
     pub icon_size: Option<IconSize>,
     pub account_summary: Option<SummaryFormat>,
+}
+
+/// Whether recurring quota windows show quota or spending pace in the sidebar.
+///
+/// This affects only 5h/7d-style rows with enough reset information to compute
+/// pace. Context and monthly rows keep their normal quota presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SidebarPacing {
+    /// Keep quota percentages and gauges.
+    #[default]
+    Off,
+    /// Show `5h -6% 45 min` style pace text.
+    On,
+}
+
+impl SidebarPacing {
+    pub const ENV: &'static str = "HERDR_AGENT_QUOTA_SIDEBAR_PACING";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "quota" => Some(Self::Off),
+            "on" | "true" | "pace" | "pacing" => Some(Self::On),
+            _ => None,
+        }
+    }
+
+    pub fn from_arg_or_env(value: Option<Self>) -> Option<Self> {
+        if value.is_some() {
+            return value;
+        }
+        std::env::var(Self::ENV)
+            .ok()
+            .as_deref()
+            .and_then(Self::parse)
+    }
+}
+
+/// Whether the Claude statusLine wrapper appends its quota pace segment.
+///
+/// Observation collection is independent of this switch: `off` changes only
+/// the wrapper's stdout so custom statusLine scripts retain full layout control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum StatuslinePace {
+    Off,
+    #[default]
+    On,
+}
+
+impl StatuslinePace {
+    pub const ENV: &'static str = "HERDR_AGENT_QUOTA_STATUSLINE_PACE";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" => Some(Self::Off),
+            "on" | "true" => Some(Self::On),
+            _ => None,
+        }
+    }
+
+    pub fn from_arg_or_env(value: Option<Self>) -> Option<Self> {
+        if value.is_some() {
+            return value;
+        }
+        std::env::var(Self::ENV)
+            .ok()
+            .as_deref()
+            .and_then(Self::parse)
+    }
 }
 
 /// Which side of a quota window a percentage reports.
@@ -1482,6 +1582,24 @@ mod tests {
             PercentStyle::from_arg_or_env(Some(PercentStyle::Used)),
             Some(PercentStyle::Used)
         );
+    }
+
+    #[test]
+    fn sidebar_pacing_is_opt_in_and_accepts_human_spellings() {
+        assert_eq!(SidebarPacing::default(), SidebarPacing::Off);
+        assert_eq!(SidebarPacing::parse("on"), Some(SidebarPacing::On));
+        assert_eq!(SidebarPacing::parse("pace"), Some(SidebarPacing::On));
+        assert_eq!(SidebarPacing::parse("quota"), Some(SidebarPacing::Off));
+        assert_eq!(SidebarPacing::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn statusline_pace_preserves_existing_default() {
+        assert_eq!(StatuslinePace::default(), StatuslinePace::On);
+        assert_eq!(StatuslinePace::parse("on"), Some(StatuslinePace::On));
+        assert_eq!(StatuslinePace::parse("true"), Some(StatuslinePace::On));
+        assert_eq!(StatuslinePace::parse("off"), Some(StatuslinePace::Off));
+        assert_eq!(StatuslinePace::parse("nonsense"), None);
     }
 
     #[test]

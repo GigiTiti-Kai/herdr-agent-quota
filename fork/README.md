@@ -44,8 +44,8 @@ undocumented endpoint; keep it fork-local unless upstream asks for it.
 
 2026-09-19. v1.6.1 was merged, installed, looked at, and reverted. `dev` carries
 the merge and its revert; the resolved merge is kept on `fork/v1.6.1-merge`
-together with `fork/specs/2026-09-19-upstream-v1.6.1-merge.md`. `main` stays at
-v1.6.1.
+together with `fork/specs/2026-09-19-upstream-v1.6.1-merge.md`. That was then;
+`main` has since moved on (see "Where `main` is pinned").
 
 Two of its presentation changes are unwanted here:
 
@@ -86,6 +86,15 @@ Keep the icon-colour change from v1.6.1 (`rules` on `$quota_icon` plus an
 invisible working/done suffix). It is the fix for teal icons sitting one cell
 right, and it is not part of either problem above.
 
+### Where `main` is pinned
+
+`main` is at `cd6927b` (v1.6.3), the release commit, with no tag on it here.
+v1.7.0 and later are not taken. The v1.6.3 merge kept `shares_login_quota` off
+(`FORK_VENDOR_NESTING = false`), the `group_head_pane_ids` default branch, Hermes,
+the account summary rows, and Agy. `--sidebar-pacing` from v1.6.3 changes pane
+rows only: with an account summary on, the 5h/7d text lives in the footer, which
+still prints plain percentages.
+
 ### Fork-local: the Space header follows Herdr's draw order (PR #5)
 
 This install runs `agent-order default`, so Herdr draws its own layout order
@@ -105,10 +114,10 @@ theirs.
 
 ## After a sync
 
-The plugin runs from `target/release/herdr-agent-quota` in this checkout, so a
+The plugin runs from `target/release/herdr-agent-usage` in this checkout, so a
 rebuild is enough — Herdr does not need reinstalling. Pick the new binary up with:
 
-    herdr plugin action invoke refresh --plugin herdr-agent-quota
+    herdr plugin action invoke refresh --plugin herdr-agent-usage
 
 Settings and cached quota survive a rebuild.
 
@@ -122,11 +131,11 @@ containing window kinds it does not know. Loading it fails outright, which
 aborts the whole refresh: no pane is updated at all, so the sidebar keeps
 whatever it last showed rather than going blank. Recover by
 deleting that provider's cached snapshot and refreshing — the state directory is
-`~/.local/state/herdr/plugins/herdr-agent-quota/` and the file is named after the
+`~/.local/state/herdr/plugins/herdr-agent-usage/` and the file is named after the
 source (`claude-statusline.json`, `codex-app-server.json`, ...):
 
-    rm -f ~/.local/state/herdr/plugins/herdr-agent-quota/claude-statusline.json
-    herdr plugin action invoke refresh --plugin herdr-agent-quota
+    rm -f ~/.local/state/herdr/plugins/herdr-agent-usage/claude-statusline.json
+    herdr plugin action invoke refresh --plugin herdr-agent-usage
 
 The sidebar field preference lives beside it in `fields` and is not touched by
 that, so a field you turned on stays on.
