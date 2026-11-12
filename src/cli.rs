@@ -149,7 +149,8 @@ pub enum Command {
         /// Agent panel footer: off (default) keeps meters on every agent row;
         /// compact, bars, or numbers move 5h/7d/30d into one footer row per
         /// account; lines gives one footer line per window with its own reset,
-        /// blank line below the title and between accounts (needs a Herdr footer cap of 64 rows).
+        /// blank line below the title and between accounts (needs a Herdr footer cap of 64 rows);
+        /// wide is compact for a wide bottom band: 6-cell bars, no 38-column cap.
         /// Needs a Herdr build that understands `footer`.
         #[arg(long, value_enum)]
         account_summary: Option<SummaryFormat>,
@@ -882,8 +883,8 @@ impl IconSize {
 /// How the Agent panel footer summarises each account's quota.
 ///
 /// `off` keeps today's meters on every agent row and writes no footer. The
-/// other four move 5h/7d/scoped/30d into the footer: `compact`, `bars` and
-/// `numbers` one row per account family, `lines` one line per window.
+/// other five move 5h/7d/scoped/30d into the footer: `compact`, `bars`, `numbers`
+/// and `wide` one row per account family, `lines` one line per window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SummaryFormat {
     /// `5h▱▱▱  0% 7d▰▱▱ 24% 2d2h`: 3-cell bars, then the most-used window's reset.
@@ -894,6 +895,9 @@ pub enum SummaryFormat {
     Numbers,
     /// One footer line per window, each with its own reset.
     Lines,
+    /// `compact` for a wide bottom band: 6-cell bars, a full-size mark, and no
+    /// 38-column cap on the row.
+    Wide,
     /// Per-agent meters, no footer.
     #[default]
     Off,
@@ -901,12 +905,13 @@ pub enum SummaryFormat {
 
 impl SummaryFormat {
     /// The order the settings pane cycles through, the default first.
-    pub const CHOICES: [Self; 5] = [
+    pub const CHOICES: [Self; 6] = [
         Self::Off,
         Self::Compact,
         Self::Bars,
         Self::Numbers,
         Self::Lines,
+        Self::Wide,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -915,6 +920,7 @@ impl SummaryFormat {
             Self::Bars => "bars",
             Self::Numbers => "numbers",
             Self::Lines => "lines",
+            Self::Wide => "wide",
             Self::Off => "off",
         }
     }
@@ -1272,7 +1278,8 @@ mod tests {
             SummaryFormat::parse(" Compact\n"),
             Some(SummaryFormat::Compact)
         );
-        assert_eq!(SummaryFormat::parse("wide"), None);
+        assert_eq!(SummaryFormat::parse("wide"), Some(SummaryFormat::Wide));
+        assert_eq!(SummaryFormat::parse("nope"), None);
         assert_eq!(SummaryFormat::default(), SummaryFormat::Off);
         assert!(!SummaryFormat::Off.is_on() && SummaryFormat::Numbers.is_on());
     }

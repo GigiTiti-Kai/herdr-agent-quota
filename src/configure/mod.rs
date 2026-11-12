@@ -402,7 +402,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         prefs::testing::with_config_dir(directory.path(), || {
             assert_eq!(resolved_account_summary(None, None), SummaryFormat::Off);
-            prefs::write(prefs::ACCOUNT_SUMMARY, "wide").unwrap();
+            prefs::write(prefs::ACCOUNT_SUMMARY, "nonsense").unwrap();
             assert_eq!(resolved_account_summary(None, None), SummaryFormat::Off);
             prefs::write(prefs::ACCOUNT_SUMMARY, "compact\n").unwrap();
             assert_eq!(resolved_account_summary(None, None), SummaryFormat::Compact);

@@ -3503,6 +3503,14 @@ mod tests {
     }
 
     #[test]
+    fn the_wide_account_summary_persists_and_reads_back() {
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        cache.set_account_summary(SummaryFormat::Wide).unwrap();
+        assert_eq!(cache.account_summary(), Some(SummaryFormat::Wide));
+    }
+
+    #[test]
     fn row_gap_persists_flush_and_separated() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());

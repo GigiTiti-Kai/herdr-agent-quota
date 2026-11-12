@@ -164,6 +164,9 @@ pub struct AccountSummary {
     pub reset: String,
     /// Lines mode: a blank line closes the provider block.
     pub gap: bool,
+    /// Wide mode: the mark carries [`lines_icon`]'s blank reserve so a
+    /// terminal can draw it full size, without lines mode's blank rows.
+    pub roomy_icon: bool,
     /// The Hermes badge (published by [`hermes_badge_tokens`]): live Hermes
     /// sessions are proven to bill this row's account as the same user. Only
     /// a workspace row carries it; a one-row format only when it fits.
@@ -683,9 +686,13 @@ fn account_summary(
     let cells = match row.summary {
         SummaryFormat::Compact => Some(3),
         SummaryFormat::Bars => Some(4),
+        SummaryFormat::Wide => Some(6),
         SummaryFormat::Numbers | SummaryFormat::Lines | SummaryFormat::Off => None,
     };
     let lines = row.summary == SummaryFormat::Lines;
+    let wide = row.summary == SummaryFormat::Wide;
+    // A bottom band has no Agents-panel width to fit.
+    let row_width = if wide { usize::MAX } else { SUMMARY_ROW_WIDTH };
     let badge = badge
         .filter(|_| !shown.is_empty())
         .map(|sessions| hermes_badge(sessions, lines_icon(family.icon).chars().count()));
@@ -732,7 +739,7 @@ fn account_summary(
     let hermes_badge = if lines {
         badge
     } else {
-        badge.filter(|badge| used + badge_cells(badge) <= SUMMARY_ROW_WIDTH)
+        badge.filter(|badge| used + badge_cells(badge) <= row_width)
     };
     if let Some(badge) = hermes_badge.as_ref().filter(|_| !lines) {
         used += badge_cells(badge);
@@ -749,7 +756,7 @@ fn account_summary(
             .map(|reset| {
                 fit_eta(
                     format_reset_eta(reset, now_unix),
-                    SUMMARY_ROW_WIDTH.saturating_sub(used + 1),
+                    row_width.saturating_sub(used + 1),
                 )
             })
             .unwrap_or_default()
@@ -759,6 +766,7 @@ fn account_summary(
         segments,
         reset,
         gap: lines,
+        roomy_icon: wide,
         hermes_badge,
         hermes_clearance: clearance,
         same_account_as: None,
@@ -1959,6 +1967,53 @@ mod tests {
             hermes_badge_tokens(&compact),
             named(&[("quota_acct_cl_hermes", &hermes_badge(3, 4))])
         );
+    }
+
+    /// `wide` is `compact` with 6-cell bars and the reserved icon, and the
+    /// 38-column cap does not apply: the Hermes badge and the full reset stay.
+    #[test]
+    fn the_wide_row_has_six_cell_bars_and_no_width_cap() {
+        let wide = |sessions| {
+            hermes_badged_account(
+                &spec_claude(),
+                0,
+                summary_style(SummaryFormat::Wide),
+                sessions,
+            )
+            .unwrap()
+        };
+        let plain = summarised(&spec_claude(), 0, SummaryFormat::Wide)
+            .account
+            .unwrap();
+        let texts: Vec<&str> = plain.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["5h▱▱▱▱▱▱  0%", "7d▰▱▱▱▱▱ 24%", "Fab▰▱▱▱▱▱ 16%"]);
+        assert_eq!(plain.reset, "2d2h");
+        assert!(plain.roomy_icon && !plain.gap);
+        let badged = wide(12);
+        let badge = badged
+            .hermes_badge
+            .clone()
+            .expect("wide never drops the badge");
+        assert_eq!(
+            badge,
+            hermes_badge(
+                12,
+                lines_icon(crate::icons::for_harness(Harness::Claude))
+                    .chars()
+                    .count()
+            )
+        );
+        assert_eq!(badged.reset, "2d2h");
+        assert_eq!(badged.segments, plain.segments);
+        // Past 38 columns, where `compact` would have shortened the reset.
+        assert!(
+            footer_line(&badged).chars().count() + badge.chars().count() + 1 > SUMMARY_ROW_WIDTH
+        );
+        let compact =
+            hermes_badged_account(&spec_claude(), 0, summary_style(SummaryFormat::Compact), 12)
+                .unwrap();
+        assert!(!compact.roomy_icon);
+        assert_ne!(compact.reset, "2d2h");
     }
 
     /// The one-row formats put the badge right after the icon, and the row with it still fits the footer: their shared reset
