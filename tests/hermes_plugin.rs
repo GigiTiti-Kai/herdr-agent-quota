@@ -39,7 +39,18 @@ fn output(program: &str, args: &[&str]) -> String {
 #[test]
 fn the_bridge_plugin_unit_tests_pass() {
     let ran = run("python3", &["tests/hermes_plugin/test_bridge.py"]);
-    assert!(ran >= 61, "only {ran} plugin tests ran");
+    assert!(ran >= 73, "only {ran} plugin tests ran");
+}
+
+/// `test_real_hermes.py` must run no test and write nothing when loaded outside the
+/// sandbox; the guard tests point every child at a temporary HOME.
+#[test]
+fn the_real_hermes_tests_refuse_to_run_outside_the_sandbox() {
+    let ran = run(
+        "python3",
+        &["tests/hermes_plugin/test_real_hermes_guard.py"],
+    );
+    assert!(ran >= 4, "only {ran} guard tests ran");
 }
 
 /// An earlier version of this file would run a Hermes interpreter straight on

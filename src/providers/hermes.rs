@@ -28,6 +28,12 @@
 //! is a session on that row's login. The file follows one login however often
 //! its token is refreshed, which is why the path is the identity and the
 //! token never is.
+//!
+//! An `xai-oauth` route (never supported either) may carry `xai_principal`:
+//! [`xai_principal_stamp`] of the `team_id` and `principal_id` claims of the
+//! access token the session holds. The Grok row stamps the same two claims of
+//! the Grok CLI login it reads, so an equal stamp is a session on that row's
+//! account. Neither id is written anywhere.
 
 use crate::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
 use serde_json::Value;
@@ -39,6 +45,8 @@ pub const MAILBOX_DIR: &str = "hermes-bridge";
 pub const BRIDGED_PROVIDER: &str = "openai-codex";
 /// The route whose records may carry a Claude credentials file stamp.
 pub const CLAUDE_ROUTE_PROVIDER: &str = "anthropic";
+/// The route whose records may carry an xAI principal stamp.
+pub const XAI_ROUTE_PROVIDER: &str = "xai-oauth";
 
 const SCHEMA: u64 = 1;
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
@@ -56,6 +64,9 @@ const PRINCIPAL_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/chatgpt-principal\0";
 /// Domain of [`claude_credentials_stamp`]. The bridge plugin hashes the same
 /// bytes; `the_claude_credentials_stamp_is_pinned` keeps the two together.
 const CLAUDE_CREDENTIALS_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/claude-credentials-file\0";
+/// Domain of [`xai_principal_stamp`]. The bridge plugin hashes the same bytes;
+/// `the_xai_principal_stamp_is_pinned` keeps the two together.
+const XAI_PRINCIPAL_STAMP_DOMAIN: &[u8] = b"herdr-agent-quota/xai-principal\0";
 
 fn hex_sha256(parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
@@ -83,6 +94,20 @@ pub fn chatgpt_principal_stamp(account_id: &str, subject: &str) -> String {
         account_id.as_bytes(),
         &[0],
         subject.as_bytes(),
+    ])
+}
+
+/// The comparable form of an xAI principal: lowercase hex of
+/// `sha256("herdr-agent-quota/xai-principal\0" || team id || "\0" || principal id)`,
+/// both claims of an xAI access token. The bridge stamps the token a Hermes
+/// `xai-oauth` session holds; this plugin stamps the Grok CLI login's. Neither
+/// raw value leaves the process that read it.
+pub fn xai_principal_stamp(team_id: &str, principal_id: &str) -> String {
+    hex_sha256(&[
+        XAI_PRINCIPAL_STAMP_DOMAIN,
+        team_id.as_bytes(),
+        &[0],
+        principal_id.as_bytes(),
     ])
 }
 
@@ -184,7 +209,36 @@ pub fn live_claude_credentials(state: &Path, now_unix: u64) -> Vec<String> {
         .into_iter()
         .filter_map(|(session_id, record)| {
             let pane_id = record_pane_id(&record)?;
-            parse_claude_credentials(&record, pane_id, &session_id, now_unix)
+            parse_route_stamp(
+                &record,
+                pane_id,
+                &session_id,
+                now_unix,
+                CLAUDE_ROUTE_PROVIDER,
+                "claude_credentials",
+            )
+        })
+        .collect()
+}
+
+/// The xAI principal stamp of every Hermes session a live producer is
+/// watching on the `xai-oauth` route right now, one entry per session. The
+/// Grok row's Hermes badge counts these, under the same rules as
+/// [`live_claude_credentials`]. A session whose token names no team and
+/// principal, or that is on any other route, is not counted.
+pub fn live_xai_principals(state: &Path, now_unix: u64) -> Vec<String> {
+    live_records(state)
+        .into_iter()
+        .filter_map(|(session_id, record)| {
+            let pane_id = record_pane_id(&record)?;
+            parse_route_stamp(
+                &record,
+                pane_id,
+                &session_id,
+                now_unix,
+                XAI_ROUTE_PROVIDER,
+                "xai_principal",
+            )
         })
         .collect()
 }
@@ -320,20 +374,23 @@ fn parse_route(
     })
 }
 
-/// The Claude credentials file stamp of a native Anthropic route its
-/// producer checked recently. That route is never supported and carries no
-/// identity or quota; only the stamp is read.
-fn parse_claude_credentials(
+/// The stamp `key` of a `provider` route its producer checked recently
+/// (native Anthropic: the credentials file; `xai-oauth`: the principal).
+/// Those routes are never supported and carry no identity or quota; only the
+/// stamp is read.
+fn parse_route_stamp(
     record: &Value,
     pane_id: &str,
     session_id: &str,
     now_unix: u64,
+    provider: &str,
+    key: &str,
 ) -> Option<String> {
     let route = checked_route(record, pane_id, session_id, now_unix)?;
-    if route.get("provider").and_then(Value::as_str) != Some(CLAUDE_ROUTE_PROVIDER) {
+    if route.get("provider").and_then(Value::as_str) != Some(provider) {
         return None;
     }
-    optional_stamp(route, "claude_credentials")?
+    optional_stamp(route, key)?
 }
 
 /// The record's route, once the record is for this session and pane in the
@@ -671,6 +728,96 @@ mod tests {
         // Not a principal stamp of anything: another domain.
         assert!(is_identity(&stamp("/home/u/.claude/.credentials.json")));
         assert!(!stamp("/home/u/.claude/.credentials.json").contains("claude"));
+    }
+
+    /// The bridge plugin hashes the same bytes
+    /// (`test_the_xai_principal_stamp_is_pinned` in
+    /// `tests/hermes_plugin/test_bridge.py` asserts this exact digest).
+    #[test]
+    fn the_xai_principal_stamp_is_pinned() {
+        assert_eq!(
+            xai_principal_stamp("team-1", "principal-1"),
+            "9b499e63af08336bd886c0038daa0fe82d8030f5bbfff8aaaffdaef1d292c40e"
+        );
+        // Another team's principal, and another principal of the team.
+        assert_ne!(
+            xai_principal_stamp("team-1", "principal-1"),
+            xai_principal_stamp("team-2", "principal-1")
+        );
+        assert_ne!(
+            xai_principal_stamp("team-1", "principal-1"),
+            xai_principal_stamp("team-1", "principal-2")
+        );
+        // Not another family's stamp: its own domain.
+        assert_ne!(
+            xai_principal_stamp("acc-1", "user-1"),
+            chatgpt_principal_stamp("acc-1", "user-1")
+        );
+    }
+
+    /// An `xai-oauth` record with the given `xai_principal` value, as the
+    /// bridge writes it: never supported, no identity, no quota.
+    fn xai_record(pane: &str, session: &str, stamp: Option<Value>) -> Value {
+        let mut value = record(pane, session, 12.0);
+        value["route"] = json!({
+            "epoch": 2, "provider": "xai-oauth", "supported": false, "identity": null,
+            "principal": null, "observed_at": NOW - 10,
+        });
+        if let Some(stamp) = stamp {
+            value["route"]["xai_principal"] = stamp;
+        }
+        value["quota"] = Value::Null;
+        value
+    }
+
+    /// The Grok badge counts live `xai-oauth` sessions whose producer stamped
+    /// a principal, and nothing else: not another route, not a stale check,
+    /// not a malformed or missing stamp, not a dead producer.
+    #[test]
+    fn live_xai_principals_are_the_stamps_of_live_xai_sessions() {
+        let state = tempfile::tempdir().unwrap();
+        let mine = xai_principal_stamp("team-1", "principal-1");
+        let other = xai_principal_stamp("team-1", "principal-2");
+        let mut producers = Vec::new();
+        let mut put =
+            |session: &str, value: Value| producers.push(write(state.path(), session, &value));
+        put("s1", xai_record("w1:p1", "s1", Some(json!(mine))));
+        put("s2", xai_record("w2:p4", "s2", Some(json!(mine))));
+        put("s3", xai_record("w1:p2", "s3", Some(json!(other))));
+        // A token that names no team and principal, or a bridge without the field.
+        put("s4", xai_record("w1:p3", "s4", Some(Value::Null)));
+        put("s5", xai_record("w1:p5", "s5", None));
+        // Another route never counts, whatever it carries.
+        let mut codex = record("w1:p6", "s6", 12.0);
+        codex["route"]["xai_principal"] = json!(mine);
+        put("s6", codex);
+        let mut claude = claude_record("w1:pa", "sa", None);
+        claude["route"]["xai_principal"] = json!(mine);
+        put("sa", claude);
+        let mut stale = xai_record("w1:p7", "s7", Some(json!(mine)));
+        stale["route"]["observed_at"] = json!(NOW - ROUTE_TTL_SECONDS - 1);
+        put("s7", stale);
+        for (session, malformed) in [("s9", json!("principal-1")), ("sb", json!(7))] {
+            put(session, xai_record("w1:p9", session, Some(malformed)));
+        }
+        let mut profile = xai_record("w1:pc", "sc", Some(json!(mine)));
+        profile["profile"] = json!("work");
+        put("sc", profile);
+        drop(write(
+            state.path(),
+            "se",
+            &xai_record("w1:pe", "se", Some(json!(mine))),
+        ));
+
+        assert_eq!(
+            live_xai_principals(state.path(), NOW),
+            vec![mine.clone(), mine, other]
+        );
+        // The other families ignore xAI records.
+        assert!(live_principals(state.path(), NOW).is_empty());
+        assert!(live_claude_credentials(state.path(), NOW).is_empty());
+        drop(producers);
+        assert!(live_xai_principals(state.path(), NOW).is_empty());
     }
 
     /// An Anthropic record with the given `claude_credentials` value, as the

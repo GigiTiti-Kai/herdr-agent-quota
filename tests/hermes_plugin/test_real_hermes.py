@@ -30,6 +30,7 @@ from pathlib import Path
 HOME = Path(os.environ.get("HOME", "/nonexistent")) / ".hermes"
 ROOT = HOME / "hermes-agent"
 WORK = Path("/work")
+SANDBOX_VERIFIED = False  # set only by refuse_outside_sandbox() under __main__
 STATE = WORK / "state"
 MAILBOX = STATE / "hermes-bridge"
 NOTIFY_LOG = WORK / "notify.log"
@@ -80,8 +81,8 @@ def register(ctx):
 '''
 
 
-def refuse_outside_sandbox():
-    """Exit 3 unless every boundary the sandbox promises is observable from here."""
+def sandbox_problems(probe_network=True):
+    """Every boundary the sandbox promises that is not observable from here. Empty inside it."""
     problems = []
     for path in (ROOT, HOME / "installs", HOME / "tools"):
         try:
@@ -94,15 +95,50 @@ def refuse_outside_sandbox():
             problems.append(f"{HOME / name} is present")
     if not (Path("/plugin-src") / "__init__.py").is_file() or not WORK.is_dir():
         problems.append("sandbox mounts /plugin-src and /work are missing")
-    if not problems:  # never opened on a host that already failed the checks above
+    if probe_network and not problems:  # never opened on a host that already failed the checks above
         try:
             socket.create_connection(("1.1.1.1", 53), timeout=2).close()
             problems.append("the network is reachable")
         except OSError:
             pass
+    return problems
+
+
+def refuse_outside_sandbox():
+    """Exit 3 unless every boundary the sandbox promises is observable from here."""
+    global SANDBOX_VERIFIED
+    problems = sandbox_problems()
     if problems:
         print("REFUSED: not inside real_hermes_sandbox.sh: " + "; ".join(problems), file=sys.stderr)
         sys.exit(3)
+    SANDBOX_VERIFIED = True
+
+
+def skip_outside_sandbox():
+    """Skip the caller unless the sandbox's boundaries are observable (or `__main__` verified them)."""
+    if not SANDBOX_VERIFIED:
+        problems = sandbox_problems()
+        if problems:
+            raise unittest.SkipTest("not inside real_hermes_sandbox.sh: " + "; ".join(problems))
+
+
+def setUpModule():
+    """Loaded by `unittest discover` or `-m unittest`, where `__main__` never runs: skip every test
+    here rather than run them against the real Hermes home. `RealHermes.setUpClass` and `setUp`
+    check again, for a test run without its module's fixtures."""
+    skip_outside_sandbox()
+
+
+def require_sandbox_write(path, root=HOME):
+    """Second guard, checked at each write: the sandbox's read-only mounts are observable (cheap,
+    no network probe) and `path` resolves to somewhere under `root`, the Hermes home unless a
+    caller names the scratch directory it writes to. Raises RuntimeError before anything is written."""
+    problems = sandbox_problems(probe_network=False)
+    inside = os.path.realpath(path).startswith(os.path.realpath(root) + os.sep)
+    if not inside:
+        problems.append(f"{path} is not under {root}")
+    if problems:
+        raise RuntimeError(f"refusing to write {path} outside real_hermes_sandbox.sh: " + "; ".join(problems))
 
 
 def reexec_with_launcher_python():
@@ -117,6 +153,7 @@ def reexec_with_launcher_python():
 
 def install_fixture_home():
     """What `configure` would leave in a default profile, pointing at stubs under /work."""
+    require_sandbox_write(HOME / "plugins")
     plugin = HOME / "plugins" / PLUGIN
     plugin.mkdir(parents=True)
     for name in ("__init__.py", "plugin.yaml"):
@@ -140,6 +177,7 @@ def write_config(*plugins, model=None, provider=None):
     """The allow-list as `hermes plugins enable` leaves it. The command itself cannot run here: it
     submits the selection to Hermes's package manager, which needs its install state writable.
     Retries are cut so a turn without a network ends in seconds, not minutes."""
+    require_sandbox_write(HOME / "config.yaml")
     enabled = "".join(f"  - {name}\n" for name in plugins)
     chosen = f"model:\n  default: {model}\n  provider: {provider}\n" if model else ""
     (HOME / "config.yaml").write_text(
@@ -197,6 +235,7 @@ def claude_record():
 
 def write_claude_credentials(token):
     """Claude Code's credentials file, where `CLAUDE_CONFIG_DIR` points Hermes."""
+    require_sandbox_write(CLAUDE_DIR / ".credentials.json", root=CLAUDE_DIR)
     CLAUDE_DIR.mkdir(mode=0o700, exist_ok=True)
     path = CLAUDE_DIR / ".credentials.json"
     path.write_text(json.dumps({"claudeAiOauth": {
@@ -228,6 +267,13 @@ class RealHermes(unittest.TestCase):
     """One session's life, in order. Each step builds on the one before."""
 
     state = types.SimpleNamespace(observed=[], requests=[])
+
+    @classmethod
+    def setUpClass(cls):
+        skip_outside_sandbox()
+
+    def setUp(self):
+        skip_outside_sandbox()
 
     def test_1_real_discovery_loads_the_plugin_and_its_hooks(self):
         from hermes_cli import plugins

@@ -17,6 +17,11 @@ path, written only once the live key was seen to be the file's token. The quota 
 same file for its Claude row, so equal stamps mean both follow one login. No quota is fetched for
 that route and nothing is sent anywhere to decide it.
 
+An `xai-oauth` session is marked with `xai_principal`: a domain-separated sha256 of the `team_id`
+and `principal_id` claims of the access token it holds. The quota plugin stamps the same two
+claims of the Grok CLI login, so equal stamps mean the Grok row's account. No quota is fetched
+for that route either.
+
 Scope, on purpose:
 
 * default profile only, interactive CLI/TUI sessions only (and CLI turns the shared gateway
@@ -97,6 +102,13 @@ MAX_TOKEN_CHARS = 16 * 1024
 # The quota plugin hashes the file its Claude row reads the same way (`claude_credentials_stamp`
 # in src/providers/hermes.rs); both sides pin one digest in a test.
 CLAUDE_CREDENTIALS_STAMP_DOMAIN = b"herdr-agent-quota/claude-credentials-file\0"
+# `xai_principal` stamps: sha256(domain || team_id || 0x00 || principal_id), both claims of an xAI
+# access token. The quota plugin hashes the same two claims of the Grok CLI login
+# (`xai_principal_stamp` in src/providers/hermes.rs); both sides pin one digest in a test.
+XAI_PRINCIPAL_STAMP_DOMAIN = b"herdr-agent-quota/xai-principal\0"
+XAI_PROVIDER = "xai-oauth"
+XAI_API_MODE = "codex_responses"
+XAI_HOST = "api.x.ai"
 CLAUDE_PROVIDER = "anthropic"
 CLAUDE_API_MODE = "anthropic_messages"
 CLAUDE_HOST = "api.anthropic.com"
@@ -113,11 +125,12 @@ _MISSING = object()
 
 class _Signature(tuple):
     """What identifies a route for epoch purposes:
-    (provider, supported, identity, principal, claude_credentials).
+    (provider, supported, identity, principal, claude_credentials, xai_principal).
 
     `principal` is derived from the same token as `identity`, so it never changes on its own; it
     is carried here so that the record written for an epoch always names that epoch's principal.
-    `claude_credentials` is set only on a native Anthropic route (`Bridge._claude_stamp`).
+    `claude_credentials` is set only on a native Anthropic route (`Bridge._claude_stamp`);
+    `xai_principal` only on an `xai-oauth` route (`read_route`).
     """
 
     __slots__ = ()
@@ -127,9 +140,10 @@ class _Signature(tuple):
     identity = property(lambda self: self[2])
     principal = property(lambda self: self[3])
     claude_credentials = property(lambda self: self[4])
+    xai_principal = property(lambda self: self[5])
 
 
-_UNKNOWN = _Signature((None, False, None, None, None))
+_UNKNOWN = _Signature((None, False, None, None, None, None))
 
 
 def _read_once(agent):
@@ -161,10 +175,73 @@ def _is_supported_endpoint(base_url):
         return False
 
 
+def _is_xai_endpoint(base_url):
+    try:
+        parts = urlsplit(base_url)
+        return (
+            parts.scheme == "https"
+            and parts.hostname == XAI_HOST
+            and parts.port in (None, 443)
+            and not parts.username
+            and not parts.password
+        )
+    except ValueError:
+        return False
+
+
 def chatgpt_principal_stamp(account_id, subject):
     """The comparable form of a ChatGPT principal. Neither id is ever written anywhere."""
     material = account_id.encode("utf-8") + b"\0" + subject.encode("utf-8")
     return hashlib.sha256(PRINCIPAL_STAMP_DOMAIN + material).hexdigest()
+
+
+def _jwt_claims(token):
+    """The claims of a JWT, signature unchecked, or None for anything that is not one."""
+    if not isinstance(token, str) or len(token) > MAX_TOKEN_CHARS:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or not parts[1]:
+        return None
+    try:
+        payload = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+        claims = json.loads(payload)
+    # binascii.Error and JSONDecodeError are ValueErrors; absurd nesting is a RecursionError.
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def xai_principal_stamp(team_id, principal_id):
+    """The comparable form of an xAI principal. Neither id is ever written anywhere."""
+    material = team_id.encode("utf-8") + b"\0" + principal_id.encode("utf-8")
+    return hashlib.sha256(XAI_PRINCIPAL_STAMP_DOMAIN + material).hexdigest()
+
+
+def _claim_text(value):
+    """A claim usable in a stamp: a non-empty string with no NUL (the stamp's separator) that
+    encodes as UTF-8. A lone surrogate does not; the error is dropped, as its text holds the value."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return None
+    return value
+
+
+def token_xai_stamp(api_key):
+    """The stamp of the xAI team and principal this access token names, or None.
+
+    The same two claims (`team_id`, `principal_id`) of the Grok CLI's login are what the quota
+    plugin stamps for its Grok row. Not the id token: it carries an email.
+    """
+    claims = _jwt_claims(api_key)
+    if claims is None:
+        return None
+    team, principal = _claim_text(claims.get("team_id")), _claim_text(claims.get("principal_id"))
+    if team is None or principal is None:
+        return None
+    return xai_principal_stamp(team, principal)
 
 
 def token_principal_stamp(api_key):
@@ -178,23 +255,13 @@ def token_principal_stamp(api_key):
     is not checked; the claims only name the principal, and the token is what the backend
     authenticates. A value that is not such a token names nothing.
     """
-    if not isinstance(api_key, str) or len(api_key) > MAX_TOKEN_CHARS:
-        return None
-    parts = api_key.split(".")
-    if len(parts) != 3 or not parts[1]:
-        return None
-    try:
-        payload = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
-        claims = json.loads(payload)
-    # binascii.Error and JSONDecodeError are ValueErrors; absurd nesting is a RecursionError.
-    except (ValueError, UnicodeError, RecursionError):
-        return None
-    if not isinstance(claims, dict):
+    claims = _jwt_claims(api_key)
+    if claims is None:
         return None
     auth = claims.get(OPENAI_AUTH_CLAIM)
-    account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
-    subject = auth.get("chatgpt_account_user_id") if isinstance(auth, dict) else None
-    if not isinstance(account, str) or not account or not isinstance(subject, str) or not subject:
+    account = _claim_text(auth.get("chatgpt_account_id") if isinstance(auth, dict) else None)
+    subject = _claim_text(auth.get("chatgpt_account_user_id") if isinstance(auth, dict) else None)
+    if account is None or subject is None:
         return None
     return chatgpt_principal_stamp(account, subject)
 
@@ -215,10 +282,18 @@ def read_route(agent, hmac_key):
     if not isinstance(provider, str) or not provider.strip():
         return _UNKNOWN, model, None
     provider = provider.strip().lower()
-    unsupported = _Signature((provider, False, None, None, None))
+    unsupported = _Signature((provider, False, None, None, None, None))
     # A rotating key source is installed as a callable; there is no single key to speak for.
     if not isinstance(api_key, str) or not api_key.strip() or not isinstance(base_url, str):
         return unsupported, model, None
+    if provider == XAI_PROVIDER and api_mode == XAI_API_MODE:
+        # Never supported: no quota is fetched, so no secret pair is handed back. Only the stamp,
+        # and only when the client really sends this key to xAI.
+        if client_key != api_key or not isinstance(client_base, str) \
+                or client_base.rstrip("/") != base_url.rstrip("/"):
+            return unsupported, model, None
+        stamp = token_xai_stamp(api_key) if _is_xai_endpoint(base_url) else None
+        return _Signature((provider, False, None, None, None, stamp)), model, None
     if provider != SUPPORTED_PROVIDER or api_mode != SUPPORTED_API_MODE:
         return unsupported, model, None
     if client_key is _MISSING or client_base is _MISSING or client_key != api_key:
@@ -233,7 +308,7 @@ def read_route(agent, hmac_key):
     material = "\0".join((provider, api_mode, base_url.rstrip("/"), entry, api_key))
     identity = hmac.new(hmac_key, material.encode("utf-8"), hashlib.sha256).hexdigest()
     principal = token_principal_stamp(api_key)
-    return _Signature((provider, True, identity, principal, None)), model, (base_url, api_key)
+    return _Signature((provider, True, identity, principal, None, None)), model, (base_url, api_key)
 
 
 def claude_credentials_stamp(path):
@@ -603,7 +678,7 @@ class Bridge:
             signature, model, _secret = read_route(agent, self._hmac_key)
             session.missing_ticks = 0
             if signature.provider == CLAUDE_PROVIDER:
-                signature = _Signature(signature[:4] + (self._claude_stamp(session, agent),))
+                signature = _Signature(signature[:4] + (self._claude_stamp(session, agent), None))
         if signature != session.signature:
             # Debounce and backoff belong to the credential that was asked, not the session:
             # a pool that moves on to a fresh entry is asked about it at once, and coming back
@@ -816,6 +891,7 @@ class Bridge:
                 "identity": signature.identity,
                 "principal": signature.principal,
                 "claude_credentials": signature.claude_credentials,
+                "xai_principal": signature.xai_principal,
                 "observed_at": int(self._now()),
             },
             "quota": session.quota,

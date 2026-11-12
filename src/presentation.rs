@@ -125,8 +125,11 @@ impl AccountFamily {
     /// path once it saw the Hermes session's key equal that token. Codex: its
     /// snapshot carries the ChatGPT account id, the Codex login's token names
     /// that account and its user, and the bridge stamps the same pair for
-    /// the token Hermes holds.
-    pub const HERMES_BADGED: [&'static str; 2] = ["cl", "cx"];
+    /// the token Hermes holds. Grok: its snapshot carries the Grok CLI
+    /// login's account id, that login's access token names an xAI team and
+    /// principal, and the bridge stamps the same pair for the `xai-oauth`
+    /// token Hermes holds.
+    pub const HERMES_BADGED: [&'static str; 3] = ["cl", "cx", "gk"];
 
     /// A family is keyed by the collector, so a Pi pane that resolved to
     /// canonical Codex shares the Codex row and nothing is borrowed.

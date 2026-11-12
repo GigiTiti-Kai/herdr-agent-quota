@@ -202,6 +202,49 @@ pub fn read_credentials(path: &Path) -> std::result::Result<GrokCredentials, Pro
     select_credentials(collect_credentials(&value)).ok_or(ProviderError::MissingCredentials)
 }
 
+/// The xAI account the current Grok CLI login belongs to, as the Hermes bridge
+/// stamps it for an `xai-oauth` session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginPrincipal {
+    /// The id the Grok snapshot is stamped with when it belongs to this login.
+    pub account_id: String,
+    /// [`super::hermes::xai_principal_stamp`] of the token's `team_id` and
+    /// `principal_id`. Never written anywhere.
+    pub stamp: String,
+}
+
+pub fn current_login_principal() -> Option<LoginPrincipal> {
+    login_principal_from_auth(&auth_path().ok()?)
+}
+
+/// The principal the selected login's access token names. A pure file read:
+/// the token is decoded for its claims (the signature is not checked, the
+/// claims only name the login) and dropped; nothing is refreshed and
+/// `refresh_token` is never read. A token that names no team or principal, or
+/// whose principal disagrees with the file's `user_id`, names no login.
+pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
+    let credentials = read_credentials(path).ok()?;
+    let claims = super::codex::jwt_claims(&credentials.key)?;
+    let claim = |name: &str| {
+        claims
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && !value.contains('\0'))
+    };
+    let (team, principal) = (claim("team_id")?, claim("principal_id")?);
+    if credentials
+        .user_id
+        .as_deref()
+        .is_some_and(|user| user != principal)
+    {
+        return None;
+    }
+    Some(LoginPrincipal {
+        account_id: credentials.account_id(),
+        stamp: super::hermes::xai_principal_stamp(team, principal),
+    })
+}
+
 pub fn auth_mtime_unix(path: &Path) -> Option<u64> {
     CacheStore::file_mtime_unix(path)
 }
@@ -992,6 +1035,103 @@ mod tests {
                 user_id: Some("u1".to_string()),
                 expires_at: None,
             }
+        );
+    }
+
+    fn fake_xai_token(team: Option<&str>, principal: Option<&str>) -> String {
+        use base64::Engine as _;
+        let encode = |value: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        let mut claims = json!({"sub": "p-1", "principal_type": "User"});
+        if let Some(team) = team {
+            claims["team_id"] = json!(team);
+        }
+        if let Some(principal) = principal {
+            claims["principal_id"] = json!(principal);
+        }
+        format!(
+            "{}.{}.fake-signature",
+            encode(&json!({"alg": "none"})),
+            encode(&claims)
+        )
+    }
+
+    fn write_login(path: &Path, key: &str, user_id: Option<&str>) {
+        let mut login = json!({"key": key, "expires_at": "2099-06-01T00:00:00Z"});
+        if let Some(user_id) = user_id {
+            login["user_id"] = json!(user_id);
+        }
+        fs::write(path, json!({"https://auth.x.ai::fake": login}).to_string()).unwrap();
+    }
+
+    /// The Grok row names its login by the token's team and principal, the
+    /// same stamp the Hermes bridge writes for an `xai-oauth` token.
+    #[test]
+    fn the_login_names_its_xai_principal_as_a_stamp() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        write_login(
+            &path,
+            &fake_xai_token(Some("team-1"), Some("principal-1")),
+            Some("principal-1"),
+        );
+        let login = login_principal_from_auth(&path).expect("principal");
+        assert_eq!(login.account_id, "principal-1");
+        assert_eq!(
+            login.stamp,
+            super::super::hermes::xai_principal_stamp("team-1", "principal-1")
+        );
+        assert!(!login.stamp.contains("principal-1"));
+        // Without a `user_id` in the file the token alone names the principal.
+        write_login(
+            &path,
+            &fake_xai_token(Some("team-1"), Some("principal-1")),
+            None,
+        );
+        let login = login_principal_from_auth(&path).expect("principal");
+        assert_eq!(
+            login.stamp,
+            super::super::hermes::xai_principal_stamp("team-1", "principal-1")
+        );
+    }
+
+    #[test]
+    fn a_login_that_names_no_principal_has_no_stamp() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        for (key, user_id) in [
+            (
+                fake_xai_token(None, Some("principal-1")),
+                Some("principal-1"),
+            ),
+            (fake_xai_token(Some("team-1"), None), Some("principal-1")),
+            (
+                fake_xai_token(Some(""), Some("principal-1")),
+                Some("principal-1"),
+            ),
+            // The file's user disagrees with the token's principal.
+            (
+                fake_xai_token(Some("team-1"), Some("principal-1")),
+                Some("principal-2"),
+            ),
+            ("not-a-jwt".to_string(), Some("principal-1")),
+            // A NUL is the stamp's separator: it names nothing.
+            (
+                fake_xai_token(Some("team\u{0}1"), Some("principal-1")),
+                Some("principal-1"),
+            ),
+            (
+                fake_xai_token(Some("team-1"), Some("principal\u{0}1")),
+                None,
+            ),
+        ] {
+            write_login(&path, &key, user_id);
+            assert_eq!(login_principal_from_auth(&path), None, "{key}");
+        }
+        assert_eq!(
+            login_principal_from_auth(&directory.path().join("missing.json")),
+            None
         );
     }
 

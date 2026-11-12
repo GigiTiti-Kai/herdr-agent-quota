@@ -8,9 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Account summary: the Grok row now carries the Hermes badge too, for Hermes
+  sessions on the `xai-oauth` route that run on the Grok CLI's own xAI account.
+  The bridge records a domain-separated sha256 of the `team_id` and
+  `principal_id` claims of the session's access token (`route.xai_principal`);
+  the plugin hashes the same claims of the Grok CLI login with a pure read of
+  `auth.json`. No quota is fetched for that route. Run `configure` to add the
+  badge token to the footer; Hermes processes pick up the new bridge on
+  restart (HCM-177).
 - Account summary: a `wide` footer format (`--account-summary wide`) for a wide
   bottom band: `compact`'s one row per account with 6-cell bars, the full-size
   vendor mark, and no 38-column cap on the row (HCM-177).
+
+### Fixed
+
+- Hermes bridge: a claim that cannot be hashed (a lone surrogate, or a NUL, the
+  stamp's separator) now yields no principal stamp instead of raising in the
+  hook; the Rust side rejects a NUL claim too (HCM-177).
+- Tests: `tests/hermes_plugin/test_real_hermes.py` checked for its sandbox only
+  under `__main__`, so `python -m unittest discover` ran it against the real
+  `~/.hermes` and overwrote its `config.yaml`. When tests run, `setUpModule`,
+  `setUpClass` and `setUp` check it and skip every test outside
+  `real_hermes_sandbox.sh`; `write_config`, `install_fixture_home` and
+  `write_claude_credentials` refuse to write outside it too
+  (HCM-177).
 
 ### Changed
 

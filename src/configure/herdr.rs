@@ -3762,12 +3762,12 @@ mod field_tests {
         }
     }
 
-    /// Only the Claude and Codex rows can carry the Hermes badge, inked like
+    /// Only the Claude, Codex, and Grok rows can carry the Hermes badge, inked like
     /// the footer marks: right after the icon on the one-row formats' row, in the icon column
     /// of a lines block (one slot on each of lines 2 and 3). The Hermes row
     /// itself stays for a Hermes session whose account no other row shows.
     #[test]
-    fn only_the_claude_and_codex_footer_rows_carry_the_hermes_badge() {
+    fn only_the_claude_codex_and_grok_footer_rows_carry_the_hermes_badge() {
         for summary in SummaryFormat::CHOICES.into_iter().filter(|s| s.is_on()) {
             let (updated, rows) = written_footer(summary);
             let carriers: Vec<&Vec<String>> = rows
@@ -3777,10 +3777,10 @@ mod field_tests {
             let lines = summary == SummaryFormat::Lines;
             assert_eq!(
                 carriers.len(),
-                if lines { 4 } else { 2 },
+                AccountFamily::HERMES_BADGED.len() * if lines { 2 } else { 1 },
                 "{summary:?}: {carriers:?}"
             );
-            for id in ["cl", "cx"] {
+            for id in AccountFamily::HERMES_BADGED {
                 let names: &[String] = if lines {
                     &[
                         format!("$quota_acct_{id}_hermes_l2"),

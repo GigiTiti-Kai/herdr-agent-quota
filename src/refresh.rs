@@ -2103,8 +2103,10 @@ fn desired_workspace_summary(
 /// account (`AccountFamily::HERMES_BADGED`). Codex: the principal stamp a
 /// session's own process published equals the stamp of the Codex login the
 /// row's snapshot belongs to. Claude: the session's key was seen to be the
-/// token in the credentials file the Claude row reads. Nothing is counted
-/// while Hermes is not an enabled agent.
+/// token in the credentials file the Claude row reads. Grok: the xAI
+/// principal stamp of an `xai-oauth` session equals the stamp of the Grok CLI
+/// login the row's snapshot belongs to. Nothing is counted while Hermes is
+/// not an enabled agent.
 fn hermes_sessions_by_provider(
     cache: &CacheStore,
     snapshots: &[ProviderSnapshot],
@@ -2128,7 +2130,38 @@ fn hermes_sessions_by_provider(
         claude_row_file_stamp,
         || crate::providers::hermes::live_claude_credentials(cache.root(), now),
     ));
+    if snapshots
+        .iter()
+        .any(|snapshot| snapshot.provider == Provider::Grok)
+    {
+        rows.extend(grok_sessions_on_row(
+            snapshots,
+            grok::current_login_principal().as_ref(),
+            || crate::providers::hermes::live_xai_principals(cache.root(), now),
+        ));
+    }
     rows
+}
+
+/// The Grok row's Hermes sessions: live `xai-oauth` sessions whose token
+/// names the xAI team and principal of the Grok CLI login this row's snapshot
+/// belongs to. A snapshot of another login, or a login whose token names no
+/// principal, proves nothing.
+fn grok_sessions_on_row(
+    snapshots: &[ProviderSnapshot],
+    login: Option<&grok::LoginPrincipal>,
+    live_xai_principals: impl FnOnce() -> Vec<String>,
+) -> Option<(Provider, usize)> {
+    let login = login?;
+    snapshots.iter().find(|snapshot| {
+        snapshot.provider == Provider::Grok
+            && snapshot.account_id.as_deref() == Some(login.account_id.as_str())
+    })?;
+    let sessions = live_xai_principals()
+        .iter()
+        .filter(|stamp| **stamp == login.stamp)
+        .count();
+    (sessions > 0).then_some((Provider::Grok, sessions))
 }
 
 /// The stamp of the credentials file the Claude row's account windows are
@@ -2909,6 +2942,75 @@ mod tests {
             (vec![codex], None),
         ] {
             assert!(hermes_sessions_on_rows(&rows, login, unscanned).is_empty());
+        }
+    }
+
+    fn grok_login(account: &str, team: &str, principal: &str) -> grok::LoginPrincipal {
+        grok::LoginPrincipal {
+            account_id: account.to_string(),
+            stamp: crate::providers::hermes::xai_principal_stamp(team, principal),
+        }
+    }
+
+    fn stamped_grok(account_id: &str) -> ProviderSnapshot {
+        let mut grok = three_window_snapshot(Provider::Grok);
+        grok.account_id = Some(account_id.to_string());
+        grok
+    }
+
+    /// Live `xai-oauth` sessions count toward the Grok row only by the xAI
+    /// principal stamp of the login the row's snapshot belongs to. A snapshot
+    /// of another login, an unstamped one, another family's snapshot, or no
+    /// login proves nothing, and the mailbox is not even scanned for them.
+    #[test]
+    fn hermes_sessions_count_toward_the_grok_row_only_by_xai_principal_stamp() {
+        use crate::providers::hermes::xai_principal_stamp;
+        let grok = stamped_grok("p-1");
+        let me = grok_login("p-1", "team-1", "p-1");
+        let mine = xai_principal_stamp("team-1", "p-1");
+        // Another team's principal and another principal of the team.
+        let other_team = xai_principal_stamp("team-2", "p-1");
+        let other = xai_principal_stamp("team-1", "p-2");
+        let live = || {
+            vec![
+                mine.clone(),
+                other_team.clone(),
+                other.clone(),
+                mine.clone(),
+            ]
+        };
+        assert_eq!(
+            grok_sessions_on_row(std::slice::from_ref(&grok), Some(&me), live),
+            Some((Provider::Grok, 2))
+        );
+        assert_eq!(
+            grok_sessions_on_row(std::slice::from_ref(&grok), Some(&me), || {
+                vec![other_team.clone(), other.clone()]
+            }),
+            None
+        );
+        assert_eq!(
+            grok_sessions_on_row(std::slice::from_ref(&grok), Some(&me), Vec::new),
+            None
+        );
+        // The raw id is never what is compared.
+        assert_eq!(
+            grok_sessions_on_row(std::slice::from_ref(&grok), Some(&me), || {
+                vec!["p-1".to_string()]
+            }),
+            None
+        );
+        let unstamped = three_window_snapshot(Provider::Grok);
+        let codex = stamped_codex("p-1");
+        let unscanned = || -> Vec<String> { panic!("scanned without a login to compare") };
+        for (rows, login) in [
+            (vec![unstamped], Some(&me)),
+            (vec![codex], Some(&me)),
+            (Vec::new(), Some(&me)),
+            (vec![stamped_grok("p-2")], Some(&me)),
+            (vec![grok], None),
+        ] {
+            assert_eq!(grok_sessions_on_row(&rows, login, unscanned), None);
         }
     }
 

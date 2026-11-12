@@ -1031,14 +1031,14 @@ pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
     let account_id = tokens
         .account_id
         .or(tokens.chatgpt_account_id)
-        .filter(|value| !value.is_empty())?;
+        .filter(|value| !value.is_empty() && !value.contains('\0'))?;
     let claims = tokens.access_token.as_deref().and_then(jwt_claims)?;
     let auth = claims.get("https://api.openai.com/auth")?;
     let claimed = auth.get("chatgpt_account_id").and_then(Value::as_str)?;
     let subject = auth
         .get("chatgpt_account_user_id")
         .and_then(Value::as_str)
-        .filter(|subject| !subject.is_empty())?;
+        .filter(|subject| !subject.is_empty() && !subject.contains('\0'))?;
     (claimed == account_id).then(|| LoginPrincipal {
         stamp: crate::providers::hermes::chatgpt_principal_stamp(&account_id, subject),
         account_id,
@@ -1047,7 +1047,7 @@ pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
 
 /// The claims of a JWT, without checking its signature. `None` for anything
 /// that is not one.
-fn jwt_claims(token: &str) -> Option<Value> {
+pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
     use base64::Engine as _;
     const MAX_TOKEN_BYTES: usize = 16 * 1024;
     if token.len() > MAX_TOKEN_BYTES {
@@ -1263,6 +1263,11 @@ mod tests {
         write_auth(&path, "acc-1", &claims("acc-1", None));
         assert_eq!(login_principal_from_auth(&path), None);
         write_auth(&path, "acc-1", &claims("acc-1", Some("")));
+        assert_eq!(login_principal_from_auth(&path), None);
+        // A NUL is the stamp's separator: it names nothing.
+        write_auth(&path, "acc-1", &claims("acc-1", Some("user\u{0}1")));
+        assert_eq!(login_principal_from_auth(&path), None);
+        write_auth(&path, "acc\u{0}1", &claims("acc\u{0}1", Some("user-1")));
         assert_eq!(login_principal_from_auth(&path), None);
         // Not a JWT at all, or not one whose payload is an object.
         for token in [
