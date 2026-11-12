@@ -2126,7 +2126,9 @@ pub(crate) fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String
         if account.gap {
             crate::presentation::lines_icon(account.family.icon)
         } else {
-            account.family.icon.to_string()
+            // The mark draws wider than one cell and would touch the next
+            // text; U+2800 survives Herdr's trim and takes the overflow.
+            format!("{}\u{2800}", account.family.icon)
         },
     );
     for (slot, segment) in account.segments.iter().take(3).enumerate() {
@@ -2950,7 +2952,7 @@ mod tests {
     #[test]
     fn summary_tokens_carry_the_family_row_under_their_own_names() {
         let desired = desired_summary_tokens(&claude_summary(0.0));
-        let mark = crate::icons::for_harness(Harness::Claude).to_string();
+        let mark = format!("{}\u{2800}", crate::icons::for_harness(Harness::Claude));
         let expected = [
             ("quota_acct_cl_icon", mark.as_str()),
             ("quota_acct_cl_reset", "2d2h"),
@@ -3195,7 +3197,7 @@ mod tests {
     }
 
     #[test]
-    fn lines_mode_icon_carries_the_blank_reserve_and_other_formats_stay_bare() {
+    fn lines_mode_icon_carries_the_blank_reserve_and_one_row_formats_end_in_one_blank() {
         let mark = crate::icons::for_harness(Harness::Claude);
         let lines = desired_summary_tokens(&lines_claude());
         assert_eq!(lines["quota_acct_cl_icon"], format!("{mark}  \u{2800}"));
@@ -3204,7 +3206,7 @@ mod tests {
             crate::icons::sidebar_mark(Harness::Claude)
         );
         let compact = desired_summary_tokens(&claude_summary(90.0));
-        assert_eq!(compact["quota_acct_cl_icon"], mark.to_string());
+        assert_eq!(compact["quota_acct_cl_icon"], format!("{mark}\u{2800}"));
     }
 
     #[test]
