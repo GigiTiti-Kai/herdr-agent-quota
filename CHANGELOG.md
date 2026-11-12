@@ -20,6 +20,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bottom band: `compact`'s one row per account with 6-cell bars, the full-size
   vendor mark, and no 38-column cap on the row (HCM-177).
 
+### Fixed
+
+- Tests: `tests/hermes_plugin/test_real_hermes.py` checked for its sandbox only
+  under `__main__`, so `python -m unittest discover` ran it against the real
+  `~/.hermes` and overwrote its `config.yaml`. The check now runs when the
+  module is loaded and skips every test outside `real_hermes_sandbox.sh`;
+  `write_config` and `install_fixture_home` refuse to write outside it too
+  (HCM-177).
+
 ### Changed
 
 - Account summary: on a `wide` row that shows the Hermes badge, the gap between
