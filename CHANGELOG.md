@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Account summary: in one-row footers (`compact`, `bars`, `numbers`) the vendor
+  mark is followed by one invisible blank cell (U+2800), so the wider-than-a-cell
+  mark no longer touches the window label after it (HCM-177).
 - Account summary: in the `lines` footer the Hermes badge no longer touches
   the marks around it. WezTerm draws the vendor marks larger than a row, so
   the badge now keeps one line with a blank icon column between it and the
