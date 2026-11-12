@@ -37,6 +37,16 @@ def fake_jwt(account_id, subject=None, signature="fake-signature", sub="auth0|fa
     return ".".join((segment({"alg": "none"}), segment(claims), signature))
 
 
+def fake_xai_jwt(team_id, principal_id, signature="fake-signature"):
+    """A made-up xAI access token: only its team and principal claims matter."""
+    def segment(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    claims = {"sub": principal_id, "principal_type": "User", "principal_id": principal_id,
+              "team_id": team_id}
+    return ".".join((segment({"alg": "none"}), segment(claims), signature))
+
+
 KEY_A = "fake-token-AAAAAAAAAAAAAAAAAAAAAAAA"
 KEY_B = "fake-token-BBBBBBBBBBBBBBBBBBBBBBBB"
 ACCOUNT_X = "fake-account-XXXXXXXXXXXX"
@@ -52,8 +62,12 @@ JWT_Y = fake_jwt(ACCOUNT_Y)
 KEY_C = "sk-ant-oat01-fake-CCCCCCCCCCCCCCCCCCCCCCCC"
 KEY_C2 = "sk-ant-oat01-fake-cccccccccccccccccccccccc"
 KEY_D = "sk-ant-api03-fake-DDDDDDDDDDDDDDDDDDDDDDDD"
+XAI_BASE = "https://api.x.ai/v1"
+XAI_TEAM = "fake-team-TTTTTTTTTTTT"
+XAI_USER = "fake-principal-PPPPPPPP"
+XAI_JWT = fake_xai_jwt(XAI_TEAM, XAI_USER)
 SECRETS = (KEY_A, KEY_B, ACCOUNT_X, ACCOUNT_Y, SUBJECT_1, SUBJECT_2, JWT_X, JWT_X2, JWT_X_SEAT2,
-           JWT_Y, KEY_C, KEY_C2, KEY_D)
+           JWT_Y, KEY_C, KEY_C2, KEY_D, XAI_JWT, XAI_TEAM, XAI_USER)
 CODEX_BASE = "https://chatgpt.com/backend-api/codex"
 ANTHROPIC_BASE = "https://api.anthropic.com"
 HMAC_KEY = b"k" * 32
@@ -322,11 +336,66 @@ class RouteTests(unittest.TestCase):
             "c04c99582d1c677beac50010fc7e9d060fe8994bf50b45c80a9bfd8a45b7fab4",
         )
 
+    def test_the_xai_principal_stamp_is_pinned(self):
+        # src/providers/hermes.rs `the_xai_principal_stamp_is_pinned` asserts the same digest.
+        self.assertEqual(
+            bridge_module.xai_principal_stamp("team-1", "principal-1"),
+            "9b499e63af08336bd886c0038daa0fe82d8030f5bbfff8aaaffdaef1d292c40e",
+        )
+
+    def test_an_xai_route_is_unsupported_and_carries_only_the_principal_stamp(self):
+        agent = FakeAgent(key=XAI_JWT, provider="xai-oauth", base_url=XAI_BASE)
+        signature, _model, secret = bridge_module.read_route(agent, HMAC_KEY)
+        # Never supported, so no quota is fetched and no key is handed back.
+        self.assertEqual((signature.provider, signature.supported, signature.identity), ("xai-oauth", False, None))
+        self.assertIsNone(secret)
+        self.assertEqual(signature.xai_principal, bridge_module.xai_principal_stamp(XAI_TEAM, XAI_USER))
+        self.assertEqual((signature.principal, signature.claude_credentials), (None, None))
+        # A refreshed token of the same principal keeps the stamp; another principal or team does not.
+        same = bridge_module.read_route(FakeAgent(
+            key=fake_xai_jwt(XAI_TEAM, XAI_USER, signature="fake-signature-refreshed"),
+            provider="xai-oauth", base_url=XAI_BASE), HMAC_KEY)[0]
+        self.assertEqual(same.xai_principal, signature.xai_principal)
+        for key in (fake_xai_jwt(XAI_TEAM, "other"), fake_xai_jwt("other", XAI_USER)):
+            other = bridge_module.read_route(
+                FakeAgent(key=key, provider="xai-oauth", base_url=XAI_BASE), HMAC_KEY)[0]
+            self.assertNotEqual(other.xai_principal, signature.xai_principal)
+
+    def test_an_xai_route_that_is_not_plainly_xai_names_no_principal(self):
+        def segment(raw):
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+        no_team = ".".join(("e30", segment(b'{"principal_id": "p"}'), "sig"))
+        no_principal = ".".join(("e30", segment(b'{"team_id": "t"}'), "sig"))
+        empty = fake_xai_jwt("", XAI_USER)
+        not_a_string = ".".join(("e30", segment(b'{"principal_id": 7, "team_id": "t"}'), "sig"))
+        for key in (KEY_A, no_team, no_principal, empty, not_a_string, "a.b", "a.b.c.d"):
+            signature = bridge_module.read_route(
+                FakeAgent(key=key, provider="xai-oauth", base_url=XAI_BASE), HMAC_KEY)[0]
+            self.assertIsNone(signature.xai_principal, key[:40])
+        for overrides in (
+            dict(base_url="https://relay.example/v1"),
+            dict(base_url="https://api.x.ai.evil.example/v1"),
+            dict(base_url="http://api.x.ai/v1"),
+            dict(api_mode="chat_completions"),
+        ):
+            agent = FakeAgent(key=XAI_JWT, provider="xai-oauth", **{"base_url": XAI_BASE, **overrides})
+            self.assertIsNone(bridge_module.read_route(agent, HMAC_KEY)[0].xai_principal, overrides)
+        # The client must really send this key to the same endpoint.
+        agent = FakeAgent(key=XAI_JWT, provider="xai-oauth", base_url=XAI_BASE)
+        agent._client_kwargs["api_key"] = KEY_A
+        self.assertIsNone(bridge_module.read_route(agent, HMAC_KEY)[0].xai_principal)
+        agent = FakeAgent(key=XAI_JWT, provider="xai-oauth", base_url=XAI_BASE)
+        agent._client_kwargs.pop("base_url")
+        self.assertIsNone(bridge_module.read_route(agent, HMAC_KEY)[0].xai_principal)
+        # The same token on the Codex route is not an xAI principal.
+        self.assertIsNone(bridge_module.read_route(FakeAgent(key=XAI_JWT), HMAC_KEY)[0].xai_principal)
+
     def test_a_native_anthropic_route_is_unsupported_and_read_as_one_key(self):
         agent = FakeClaudeAgent()
         signature, model, secret = bridge_module.read_route(agent, HMAC_KEY)
         # Nothing is ever fetched for it, and `read_route` alone never names a file.
-        self.assertEqual(tuple(signature), ("anthropic", False, None, None, None))
+        self.assertEqual(tuple(signature), ("anthropic", False, None, None, None, None))
         self.assertEqual((model, secret), ("claude-a", None))
         identity, key = bridge_module.read_claude_route(agent, HMAC_KEY)
         self.assertEqual(key, KEY_C)
@@ -465,7 +534,7 @@ class MailboxTests(BridgeCase):
         )
         self.assertIs(record["pane_scoped"], True)  # not a shared gateway: the pane is this session's
         self.assertEqual(set(record["route"]), {"epoch", "provider", "supported", "identity", "principal",
-                                                "claude_credentials", "observed_at"})
+                                                "claude_credentials", "xai_principal", "observed_at"})
         # A token that is not a ChatGPT access token names no principal.
         self.assertIsNone(record["route"]["principal"])
         # A Codex route never names a Claude credentials file, and never looks for one.
@@ -811,6 +880,37 @@ class MailboxTests(BridgeCase):
             self.assertEqual(len(self.notified), nudges)
         finally:
             os.chmod(self.dir, 0o700)
+
+
+class XaiMailboxTests(BridgeCase):
+    """An `xai-oauth` session names its principal as a stamp and never has a quota fetched."""
+
+    def setUp(self):
+        super().setUp()
+        self.agents["s1"] = FakeAgent(key=XAI_JWT, provider="xai-oauth", base_url=XAI_BASE)
+
+    def test_the_record_names_the_principal_and_fetches_nothing(self):
+        self.bridge.observe("s1", activity=True)
+        for _ in range(3):
+            self.advance(bridge_module.DEBOUNCE_SECONDS + 1)
+            self.bridge.observe("s1", activity=True)
+            self.bridge.tick()
+        record = self.record()
+        route = record["route"]
+        self.assertEqual((route["provider"], route["supported"], route["identity"]), ("xai-oauth", False, None))
+        self.assertEqual(route["xai_principal"], bridge_module.xai_principal_stamp(XAI_TEAM, XAI_USER))
+        self.assertEqual((route["principal"], route["claude_credentials"]), (None, None))
+        self.assertIsNone(record["quota"])
+        self.assertEqual(self.fetched, [])
+        # A refreshed token keeps the stamp; a switch to another provider drops it.
+        self.agents["s1"].set_key(fake_xai_jwt(XAI_TEAM, XAI_USER, signature="fake-signature-refreshed"))
+        self.bridge.observe("s1")
+        self.assertEqual(self.record()["route"]["xai_principal"], route["xai_principal"])
+        agent = self.agents["s1"]
+        agent.provider, agent.api_mode, agent.base_url = "openai-codex", "codex_responses", CODEX_BASE
+        agent._client_kwargs["base_url"] = CODEX_BASE
+        self.bridge.tick()
+        self.assertIsNone(self.record()["route"]["xai_principal"])
 
 
 class ClaudeMailboxTests(BridgeCase):

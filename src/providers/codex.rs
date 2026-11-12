@@ -1047,7 +1047,7 @@ pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
 
 /// The claims of a JWT, without checking its signature. `None` for anything
 /// that is not one.
-fn jwt_claims(token: &str) -> Option<Value> {
+pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
     use base64::Engine as _;
     const MAX_TOKEN_BYTES: usize = 16 * 1024;
     if token.len() > MAX_TOKEN_BYTES {

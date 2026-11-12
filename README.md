@@ -299,6 +299,18 @@ a different account, a Hermes session still holding the previous login's key
 keeps its badge until Hermes picks up a new key (its next refresh or a
 rejected request), because no account id is available on either side.
 
+The Grok row carries the same badge for Hermes sessions on the `xai-oauth`
+route (`api.x.ai`) that run on the Grok CLI's own account. Both access tokens
+name an xAI team (`team_id`) and principal (`principal_id`). The bridge writes
+one domain-separated sha256 of that pair for the session's live token; the
+plugin hashes the same two claims of the Grok CLI login its Grok row belongs to
+(a pure read of `auth.json`: nothing is refreshed and the refresh token is
+never read), and the badge counts the live sessions whose stamp matches. A
+Grok login whose token names no team or principal, or whose `user_id` disagrees
+with it, gives no badge. No quota is fetched for the `xai-oauth` route. The
+stamp proves the same xAI account, not a shared credit pool. A Hermes process
+started before the bridge was updated reports no stamp until it restarts.
+
 Native Codex, Grok, Devin, Muse, and Cursor collectors follow the plugin's current login,
 not separate accounts for each pane. Claude/Agy do not report a reliable serving
 account ID, so their observations are not shared across sessions. Unknown
