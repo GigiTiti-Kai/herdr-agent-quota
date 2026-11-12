@@ -1519,6 +1519,7 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
             )));
             continue;
         }
+        append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes"), id);
         for slot in 1..=3 {
             append_window_style_tokens(&mut row, &format!("quota_acct_{id}_w{slot}"), palette);
         }
@@ -1528,14 +1529,13 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
             Some(false),
             Some(true),
         ));
-        append_hermes_badge(&mut row, &format!("quota_acct_{id}_hermes"), id);
         rows.push(Value::Array(row));
     }
     rows
 }
 
-/// The Hermes badge token `name`, inked like the footer marks: last on a
-/// one-row format's line, first on each line of a lines block below the
+/// The Hermes badge token `name`, inked like the footer marks: right after
+/// the icon on a one-row format's line, first on each line of a lines block below the
 /// mark (`quota_acct_<id>_hermes_l<line>`, the badge or a blank). Only rows
 /// that can be proven to share a live Hermes session's account carry it
 /// (`AccountFamily::HERMES_BADGED`).
@@ -3763,7 +3763,7 @@ mod field_tests {
     }
 
     /// Only the Claude and Codex rows can carry the Hermes badge, inked like
-    /// the footer marks: last on the one-row formats' row, in the icon column
+    /// the footer marks: right after the icon on the one-row formats' row, in the icon column
     /// of a lines block (one slot on each of lines 2 and 3). The Hermes row
     /// itself stays for a Hermes session whose account no other row shows.
     #[test]
@@ -3804,11 +3804,12 @@ mod field_tests {
                         assert_eq!(carrier.first(), Some(name), "{summary:?}");
                         assert!(!carrier.contains(&format!("$quota_acct_{id}_icon")));
                     } else {
-                        assert_eq!(carrier.last(), Some(name), "{summary:?}");
-                        assert!(
-                            carrier.contains(&format!("$quota_acct_{id}_icon")),
+                        assert_eq!(
+                            carrier.first().map(String::as_str),
+                            Some(format!("$quota_acct_{id}_icon").as_str()),
                             "{summary:?}"
                         );
+                        assert_eq!(carrier.get(1), Some(name), "{summary:?}");
                     }
                     let badge = updated
                         .split(&format!("{{ token = \"{name}\""))

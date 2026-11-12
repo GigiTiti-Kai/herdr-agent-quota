@@ -657,7 +657,7 @@ fn headroom(windows: &[UsageWindow], fields: FieldSet) -> Option<u8> {
 /// rows above and below it for the terminal's enlarged marks
 /// ([`hermes_badge_lines`]); a window on the badge's line drops the pad the
 /// badge stands in for, so nothing on the right moves. The one-row formats:
-/// last on the row, after Herdr's join space; their ETA is shortened to make
+/// right after the icon, before the windows; their ETA is shortened to make
 /// room, and a badge that would not fit even then is left off rather than
 /// pushing the row past the footer width.
 fn account_summary(
@@ -727,7 +727,7 @@ fn account_summary(
             .iter()
             .map(|segment| 1 + segment.text.chars().count())
             .sum::<usize>();
-    // The badge and the join space before it, last on a one-row format.
+    // The badge and its join space, right after the icon on a one-row format.
     let badge_cells = |badge: &String| badge.chars().count() + 1;
     let hermes_badge = if lines {
         badge
@@ -813,7 +813,7 @@ pub(crate) fn hermes_block_lines() -> usize {
 }
 
 /// The tokens that draw the Hermes badge of `account`, or none without one.
-/// The one-row formats end the row with `quota_acct_<id>_hermes`. Lines mode
+/// The one-row formats put `quota_acct_<id>_hermes` right after the icon. Lines mode
 /// puts the badge in the icon column, on `quota_acct_<id>_hermes_l<line>`
 /// ([`hermes_badge_lines`]), and a U+2800 on each other line of the badged
 /// block that has no window, so those lines are drawn blank instead of being
@@ -1961,11 +1961,10 @@ mod tests {
         );
     }
 
-    /// The one-row formats end the row with the badge, after Herdr's join
-    /// space, and the row with it still fits the footer: their shared reset
+    /// The one-row formats put the badge right after the icon, and the row with it still fits the footer: their shared reset
     /// is shortened first.
     #[test]
-    fn the_hermes_badge_ends_a_one_row_format_and_the_row_still_fits() {
+    fn the_hermes_badge_follows_the_icon_on_a_one_row_format_and_the_row_still_fits() {
         let snapshot = codex_two_windows();
         for summary in [
             SummaryFormat::Compact,

@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Account summary: in one-row footers (`compact`, `bars`, `numbers`) the Hermes
+  badge now sits right after the vendor mark instead of at the end of the row
+  (HCM-177).
 - Account summary: in one-row footers (`compact`, `bars`, `numbers`) the vendor
   mark is followed by one invisible blank cell (U+2800), so the wider-than-a-cell
   mark no longer touches the window label after it (HCM-177).
