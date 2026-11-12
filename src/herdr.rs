@@ -2123,7 +2123,11 @@ pub(crate) fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String
     tokens.insert(SUMMARY_TITLE_TOKEN.to_string(), SUMMARY_TITLE.to_string());
     tokens.insert(
         format!("quota_acct_{id}_icon"),
-        if account.gap || account.roomy_icon {
+        if account.roomy_icon && !account.gap && account.hermes_badge.is_some() {
+            // The Hermes badge follows the mark on a wide row; one blank cell
+            // less than the full reserve, still enough for the mark to overflow.
+            format!("{} \u{2800}", account.family.icon)
+        } else if account.gap || account.roomy_icon {
             crate::presentation::lines_icon(account.family.icon)
         } else {
             // The mark draws wider than one cell and would touch the next
@@ -2967,6 +2971,31 @@ mod tests {
         assert_eq!(
             wide(SummaryFormat::Compact).get("quota_acct_cl_icon"),
             Some(&format!("{icon}\u{2800}"))
+        );
+    }
+
+    /// With a Hermes badge after it, a `wide` mark keeps one blank cell instead
+    /// of two; without a badge, and in `lines`, the full reserve stays.
+    #[test]
+    fn a_wide_row_with_a_hermes_badge_tightens_the_icon_reserve_by_one_cell() {
+        let icon = crate::icons::for_harness(Harness::Claude);
+        let icon_value = |roomy: bool, gap: bool, badge: Option<&str>| {
+            let mut values = claude_summary(0.0);
+            let account = values.account.as_mut().unwrap();
+            account.roomy_icon = roomy;
+            account.gap = gap;
+            account.hermes_badge = badge.map(str::to_string);
+            desired_summary_tokens(&values)["quota_acct_cl_icon"].clone()
+        };
+        let reserve = crate::icons::SIDEBAR_RESERVE;
+        assert_eq!(
+            icon_value(true, false, Some("Ⓗ 3")),
+            format!("{icon} \u{2800}")
+        );
+        assert_eq!(icon_value(true, false, None), format!("{icon}{reserve}"));
+        assert_eq!(
+            icon_value(false, true, Some("Ⓗ 3")),
+            format!("{icon}{reserve}")
         );
     }
 

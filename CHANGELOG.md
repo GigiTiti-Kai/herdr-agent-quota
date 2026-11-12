@@ -14,6 +14,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Account summary: on a `wide` row that shows the Hermes badge, the gap between
+  the vendor mark and the badge is one cell narrower (HCM-177).
 - Account summary: in one-row footers (`compact`, `bars`, `numbers`) the Hermes
   badge now sits right after the vendor mark instead of at the end of the row
   (HCM-177).
