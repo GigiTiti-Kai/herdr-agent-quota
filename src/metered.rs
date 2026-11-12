@@ -349,6 +349,7 @@ pub fn overlay(
             ],
             reset: String::new(),
             gap: lines,
+            roomy_icon: row.summary == SummaryFormat::Wide,
             hermes_badge: None,
             hermes_clearance: 0,
             same_account_as: None,

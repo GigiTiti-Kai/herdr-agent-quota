@@ -3920,6 +3920,15 @@ mod field_tests {
         }
     }
 
+    /// `wide` is `compact`'s footer: one row per family, no lines-style gap rows.
+    #[test]
+    fn the_wide_footer_has_the_compact_shape() {
+        let (_, wide) = written_footer(SummaryFormat::Wide);
+        let (_, compact) = written_footer(SummaryFormat::Compact);
+        assert_eq!(wide, compact);
+        assert!(wide.iter().flatten().all(|name| !name.ends_with("_gap")));
+    }
+
     #[test]
     fn every_footer_row_has_at_most_sixteen_tokens() {
         for summary in SummaryFormat::CHOICES.into_iter().filter(|s| s.is_on()) {

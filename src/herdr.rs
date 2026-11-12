@@ -2123,7 +2123,7 @@ pub(crate) fn desired_summary_tokens(values: &MetadataTokens) -> BTreeMap<String
     tokens.insert(SUMMARY_TITLE_TOKEN.to_string(), SUMMARY_TITLE.to_string());
     tokens.insert(
         format!("quota_acct_{id}_icon"),
-        if account.gap {
+        if account.gap || account.roomy_icon {
             crate::presentation::lines_icon(account.family.icon)
         } else {
             // The mark draws wider than one cell and would touch the next
@@ -2945,6 +2945,29 @@ mod tests {
                 ..RowStyle::default()
             },
         )
+    }
+
+    /// `wide` publishes the icon with the full blank reserve (so WezTerm can
+    /// draw the mark full size) but no lines-style gap token.
+    #[test]
+    fn a_wide_row_publishes_the_reserved_icon_and_no_gap() {
+        let wide = |summary| {
+            let mut values = claude_summary(0.0);
+            let account = values.account.as_mut().unwrap();
+            account.roomy_icon = summary == SummaryFormat::Wide;
+            desired_summary_tokens(&values)
+        };
+        let icon = crate::icons::for_harness(Harness::Claude);
+        let desired = wide(SummaryFormat::Wide);
+        assert_eq!(
+            desired.get("quota_acct_cl_icon"),
+            Some(&format!("{icon}{}", crate::icons::SIDEBAR_RESERVE))
+        );
+        assert!(!desired.contains_key("quota_acct_cl_gap"));
+        assert_eq!(
+            wide(SummaryFormat::Compact).get("quota_acct_cl_icon"),
+            Some(&format!("{icon}\u{2800}"))
+        );
     }
 
     /// R6 names, one severity variant per window, every key and value inside

@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Account summary: a `wide` footer format (`--account-summary wide`) for a wide
+  bottom band: `compact`'s one row per account with 6-cell bars, the full-size
+  vendor mark, and no 38-column cap on the row (HCM-177).
+
 ### Changed
 
 - Account summary: in one-row footers (`compact`, `bars`, `numbers`) the Hermes

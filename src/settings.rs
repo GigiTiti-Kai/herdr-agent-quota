@@ -202,6 +202,7 @@ impl Settings {
                 SummaryFormat::Bars => "footer: 4-cell bars",
                 SummaryFormat::Numbers => "footer: numbers + reset",
                 SummaryFormat::Lines => "footer: one line per window + reset",
+                SummaryFormat::Wide => "footer: 6-cell bars, no width cap",
             },
         }
     }
@@ -798,13 +799,14 @@ mod tests {
     /// The footer format steps through all five choices in both directions,
     /// and every hint keeps the row inside the pane width.
     #[test]
-    fn the_account_summary_cycles_five_ways_and_its_hint_fits() {
+    fn the_account_summary_cycles_six_ways_and_its_hint_fits() {
         let mut draft = settings();
         for expected in [
             SummaryFormat::Compact,
             SummaryFormat::Bars,
             SummaryFormat::Numbers,
             SummaryFormat::Lines,
+            SummaryFormat::Wide,
             SummaryFormat::Off,
         ] {
             draft.cycle(Row::Choice(Choice::Summary), 1);
@@ -814,7 +816,7 @@ mod tests {
             assert!(row.trim_end().chars().count() <= 70, "too wide: {row}");
         }
         draft.cycle(Row::Choice(Choice::Summary), -1);
-        assert_eq!(draft.summary, SummaryFormat::Lines);
+        assert_eq!(draft.summary, SummaryFormat::Wide);
     }
 
     /// "Applied." alone must not hide an icon size that did not export, and
