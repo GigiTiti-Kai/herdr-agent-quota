@@ -217,6 +217,18 @@ def xai_principal_stamp(team_id, principal_id):
     return hashlib.sha256(XAI_PRINCIPAL_STAMP_DOMAIN + material).hexdigest()
 
 
+def _claim_text(value):
+    """A claim usable in a stamp: a non-empty string with no NUL (the stamp's separator) that
+    encodes as UTF-8. A lone surrogate does not; the error is dropped, as its text holds the value."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return None
+    return value
+
+
 def token_xai_stamp(api_key):
     """The stamp of the xAI team and principal this access token names, or None.
 
@@ -226,8 +238,8 @@ def token_xai_stamp(api_key):
     claims = _jwt_claims(api_key)
     if claims is None:
         return None
-    team, principal = claims.get("team_id"), claims.get("principal_id")
-    if not isinstance(team, str) or not team or not isinstance(principal, str) or not principal:
+    team, principal = _claim_text(claims.get("team_id")), _claim_text(claims.get("principal_id"))
+    if team is None or principal is None:
         return None
     return xai_principal_stamp(team, principal)
 
@@ -247,9 +259,9 @@ def token_principal_stamp(api_key):
     if claims is None:
         return None
     auth = claims.get(OPENAI_AUTH_CLAIM)
-    account = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
-    subject = auth.get("chatgpt_account_user_id") if isinstance(auth, dict) else None
-    if not isinstance(account, str) or not account or not isinstance(subject, str) or not subject:
+    account = _claim_text(auth.get("chatgpt_account_id") if isinstance(auth, dict) else None)
+    subject = _claim_text(auth.get("chatgpt_account_user_id") if isinstance(auth, dict) else None)
+    if account is None or subject is None:
         return None
     return chatgpt_principal_stamp(account, subject)
 

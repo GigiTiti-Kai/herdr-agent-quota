@@ -22,11 +22,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Hermes bridge: a claim that cannot be hashed (a lone surrogate, or a NUL, the
+  stamp's separator) now yields no principal stamp instead of raising in the
+  hook; the Rust side rejects a NUL claim too (HCM-177).
 - Tests: `tests/hermes_plugin/test_real_hermes.py` checked for its sandbox only
   under `__main__`, so `python -m unittest discover` ran it against the real
-  `~/.hermes` and overwrote its `config.yaml`. The check now runs when the
-  module is loaded and skips every test outside `real_hermes_sandbox.sh`;
-  `write_config` and `install_fixture_home` refuse to write outside it too
+  `~/.hermes` and overwrote its `config.yaml`. When tests run, `setUpModule`,
+  `setUpClass` and `setUp` check it and skip every test outside
+  `real_hermes_sandbox.sh`; `write_config`, `install_fixture_home` and
+  `write_claude_credentials` refuse to write outside it too
   (HCM-177).
 
 ### Changed

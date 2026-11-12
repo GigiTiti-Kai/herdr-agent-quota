@@ -229,7 +229,7 @@ pub fn login_principal_from_auth(path: &Path) -> Option<LoginPrincipal> {
         claims
             .get(name)
             .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && !value.contains('\0'))
     };
     let (team, principal) = (claim("team_id")?, claim("principal_id")?);
     if credentials
@@ -1116,6 +1116,15 @@ mod tests {
                 Some("principal-2"),
             ),
             ("not-a-jwt".to_string(), Some("principal-1")),
+            // A NUL is the stamp's separator: it names nothing.
+            (
+                fake_xai_token(Some("team\u{0}1"), Some("principal-1")),
+                Some("principal-1"),
+            ),
+            (
+                fake_xai_token(Some("team-1"), Some("principal\u{0}1")),
+                None,
+            ),
         ] {
             write_login(&path, &key, user_id);
             assert_eq!(login_principal_from_auth(&path), None, "{key}");

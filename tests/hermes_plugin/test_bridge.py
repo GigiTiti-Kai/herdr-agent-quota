@@ -361,6 +361,22 @@ class RouteTests(unittest.TestCase):
                 FakeAgent(key=key, provider="xai-oauth", base_url=XAI_BASE), HMAC_KEY)[0]
             self.assertNotEqual(other.xai_principal, signature.xai_principal)
 
+    def test_a_claim_that_cannot_be_stamped_names_no_principal_and_raises_nothing(self):
+        def segment(raw):
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+        # json.loads keeps a lone surrogate, which .encode("utf-8") rejects; a NUL is the separator.
+        for claim in ("\\ud800", "team\\u00001"):
+            xai = ".".join(("e30", segment(('{"team_id": "%s", "principal_id": "p"}' % claim).encode()), "sig"))
+            openai = ".".join(("e30", segment((
+                '{"https://api.openai.com/auth": {"chatgpt_account_id": "%s", '
+                '"chatgpt_account_user_id": "u"}}' % claim).encode()), "sig"))
+            self.assertIsNone(bridge_module.token_xai_stamp(xai), claim)
+            self.assertIsNone(bridge_module.token_principal_stamp(openai), claim)
+            signature = bridge_module.read_route(
+                FakeAgent(key=xai, provider="xai-oauth", base_url=XAI_BASE), HMAC_KEY)[0]
+            self.assertIsNone(signature.xai_principal, claim)
+
     def test_an_xai_route_that_is_not_plainly_xai_names_no_principal(self):
         def segment(raw):
             return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()

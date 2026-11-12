@@ -32,6 +32,27 @@ for call in (lambda: t.write_config("x"), t.install_fixture_home):
         print("WROTE")
 """
 
+DIRECT_RUN = """
+import sys, unittest
+sys.path.insert(0, sys.argv[1])
+import test_real_hermes as t
+result = unittest.TestResult()
+t.RealHermes("test_1_real_discovery_loads_the_plugin_and_its_hooks").run(result)
+print(result.testsRun, len(result.skipped), len(result.errors) + len(result.failures))
+"""
+
+CLAUDE_CREDENTIALS = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import test_real_hermes as t
+try:
+    t.write_claude_credentials("x")
+except RuntimeError:
+    print("refused")
+else:
+    print("WROTE")
+"""
+
 
 def run_child(script, home):
     return subprocess.run(
@@ -53,6 +74,17 @@ class RealHermesGuardTests(unittest.TestCase):
             child = run_child(DIRECT_WRITES, home)
             self.assertEqual(child.stdout.split(), ["refused", "refused"], child.stderr)
             self.assertEqual(list(Path(home).rglob("*")), [])
+
+    def test_a_test_run_directly_skips_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as home:
+            child = run_child(DIRECT_RUN, home)
+            self.assertEqual(child.stdout.split(), ["1", "1", "0"], child.stderr)
+            self.assertEqual(list(Path(home).rglob("*")), [])
+
+    def test_the_claude_credentials_helper_refuses_outside_the_sandbox(self):
+        with tempfile.TemporaryDirectory() as home:
+            child = run_child(CLAUDE_CREDENTIALS, home)
+            self.assertEqual(child.stdout.split(), ["refused"], child.stderr)
 
 
 if __name__ == "__main__":

@@ -114,21 +114,30 @@ def refuse_outside_sandbox():
     SANDBOX_VERIFIED = True
 
 
-def setUpModule():
-    """Loaded by `unittest discover` or `-m unittest`, `__main__` never runs: skip every test here
-    rather than run them against the real Hermes home."""
+def skip_outside_sandbox():
+    """Skip the caller unless the sandbox's boundaries are observable (or `__main__` verified them)."""
     if not SANDBOX_VERIFIED:
         problems = sandbox_problems()
         if problems:
             raise unittest.SkipTest("not inside real_hermes_sandbox.sh: " + "; ".join(problems))
 
 
-def require_sandbox_write(path):
-    """Second guard, checked at each write: the target is inside the Hermes home and the sandbox's
-    read-only mounts are observable. Cheap, so it needs no network probe."""
+def setUpModule():
+    """Loaded by `unittest discover` or `-m unittest`, where `__main__` never runs: skip every test
+    here rather than run them against the real Hermes home. `RealHermes.setUpClass` and `setUp`
+    check again, for a test run without its module's fixtures."""
+    skip_outside_sandbox()
+
+
+def require_sandbox_write(path, root=HOME):
+    """Second guard, checked at each write: the sandbox's read-only mounts are observable (cheap,
+    no network probe) and `path` resolves to somewhere under `root`, the Hermes home unless a
+    caller names the scratch directory it writes to. Raises RuntimeError before anything is written."""
     problems = sandbox_problems(probe_network=False)
-    inside = os.path.abspath(path).startswith(str(HOME) + os.sep)
-    if problems or not inside:
+    inside = os.path.realpath(path).startswith(os.path.realpath(root) + os.sep)
+    if not inside:
+        problems.append(f"{path} is not under {root}")
+    if problems:
         raise RuntimeError(f"refusing to write {path} outside real_hermes_sandbox.sh: " + "; ".join(problems))
 
 
@@ -226,6 +235,7 @@ def claude_record():
 
 def write_claude_credentials(token):
     """Claude Code's credentials file, where `CLAUDE_CONFIG_DIR` points Hermes."""
+    require_sandbox_write(CLAUDE_DIR / ".credentials.json", root=CLAUDE_DIR)
     CLAUDE_DIR.mkdir(mode=0o700, exist_ok=True)
     path = CLAUDE_DIR / ".credentials.json"
     path.write_text(json.dumps({"claudeAiOauth": {
@@ -257,6 +267,13 @@ class RealHermes(unittest.TestCase):
     """One session's life, in order. Each step builds on the one before."""
 
     state = types.SimpleNamespace(observed=[], requests=[])
+
+    @classmethod
+    def setUpClass(cls):
+        skip_outside_sandbox()
+
+    def setUp(self):
+        skip_outside_sandbox()
 
     def test_1_real_discovery_loads_the_plugin_and_its_hooks(self):
         from hermes_cli import plugins
