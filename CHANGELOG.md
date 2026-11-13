@@ -32,6 +32,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `real_hermes_sandbox.sh`; `write_config`, `install_fixture_home` and
   `write_claude_credentials` refuse to write outside it too
   (HCM-177).
+- `rusqlite` 0.32.1 → 0.42.0, which takes the bundled `libsqlite3-sys` from
+  0.30.1 to 0.40.0 (`RUSTSEC-2026-0459`, a C SQLite CVE), and `rustix` 1.1.4 →
+  1.1.6 (`RUSTSEC-2026-0486`, unsound xattr calls; a `tempfile` dev
+  dependency). Both failed `cargo audit --deny warnings`. No source change was
+  needed (HAQ-9).
 
 ### Changed
 
