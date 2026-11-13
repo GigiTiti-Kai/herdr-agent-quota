@@ -12,7 +12,7 @@ anything that talks to Herdr.
 3. Prefer the smallest surgical change that creates a checkable behavior. Add
    abstractions only when two real callers or adapters need the same seam.
 4. Give every implementation step a verification condition and run the
-   repository gates before calling it complete.
+   checks [Verifying](#verifying) asks for before calling it complete.
 5. For multi-goal work, keep the decision record and dispatch prompts under
    the ignored `.agents/` directory. Public documentation must describe shipped
    behavior, not private execution state.
@@ -613,10 +613,39 @@ a substitute for checking these invariants.
 
 ## Verifying
 
+The full check is the pull request's CI (`.github/workflows/ci.yml`): fmt,
+clippy, every test and a release build on `ubuntu-latest` and `macos-latest`,
+plus `dependency audit` and `plugin manifest`. The work board waits for those
+jobs before it merges (`merge.checks: github`), so locally you run only what
+your change reaches. Pull requests go into `dev`.
+
+Pick the first case that applies:
+
+1. **Nothing to build.** A change that touches no Rust source, test, `Cargo.*`,
+   `.cargo/`, asset, script, or `herdr-plugin.toml` runs no cargo command.
+2. **CI not proven.** CI counts only once its four jobs actually ran and passed
+   on a pull request into `dev`: your own if it is open, otherwise the newest
+   merged one. `no checks reported` is not proven.
+
+   ```
+   gh pr checks "$(gh pr list --base dev --state merged --limit 1 --json number -q '.[0].number')"
+   ```
+
+   Until then, run the full check from
+   [CONTRIBUTING.md](CONTRIBUTING.md#development) locally, through the lock
+   below.
+3. **CI proven.** Run `cargo fmt --all` and only the tests your change reaches,
+   named by target and filter (`cargo test --test <file> <filter>`,
+   `cargo test --lib <module>::`). Leave clippy and the whole suite to CI.
+
+Every `cargo` build, test, or clippy is a heavy job: one at a time across every
+repo and worktree on the machine, so never build in two worktrees at once. When
+`command -v heavy-run` finds the shared fleet lock, run each such command
+through it. It starts the job in your home directory with a bare `PATH`, so
+pass both:
+
 ```
-cargo fmt
-cargo test
-cargo clippy --release
+heavy-run -- env -C "$PWD" PATH="$PATH" cargo test --test <file> <filter>
 ```
 
 Reloading the plugin after a rebuild:
