@@ -29,6 +29,10 @@ home="$(mktemp -d "$scratch/home.XXXXXX")"
 work="$(mktemp -d "$scratch/work.XXXXXX")"
 echo "sandbox home: $home"
 echo "sandbox work: $work"
+# test_real_hermes.py writes only into a Hermes home holding this run's token, which the real
+# ~/.hermes never does: the read-only checks alone would pass on a host whose install is read-only.
+token="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+printf '%s' "$token" >"$home/.real-hermes-sandbox-home"
 
 # Hermes' dependency activation opens its install lock read-write and creates a lease file
 # beside the selected environment; on the read-only mounts both fail and nothing past the
@@ -70,6 +74,7 @@ bwrap \
     --ro-bind "$here" /tests \
     --bind "$work" /work \
     --setenv HOME "$HOME" --setenv PATH /usr/bin:/bin \
+    --setenv HERDR_AGENT_QUOTA_SANDBOX_HOME_TOKEN "$token" \
     --setenv HERMES_DISABLE_LAZY_INSTALLS 1 --setenv PYTHONDONTWRITEBYTECODE 1 \
     --chdir /work \
     -- "$@" || status=$?

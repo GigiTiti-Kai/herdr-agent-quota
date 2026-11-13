@@ -93,6 +93,16 @@ def sandbox_problems(probe_network=True):
     for name in ("auth.json", ".env"):
         if (HOME / name).exists():
             problems.append(f"{HOME / name} is present")
+    token = os.environ.get("HERDR_AGENT_QUOTA_SANDBOX_HOME_TOKEN", "")
+    try:
+        marked = len(token) >= 32 and (HOME / ".real-hermes-sandbox-home").read_text() == token
+    except OSError:
+        marked = False
+    if not marked:
+        problems.append(f"{HOME} is not the fresh Hermes home real_hermes_sandbox.sh made for this run")
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home and os.path.realpath(hermes_home) != os.path.realpath(HOME):
+        problems.append(f"HERMES_HOME points at {hermes_home}, not {HOME}")
     if not (Path("/plugin-src") / "__init__.py").is_file() or not WORK.is_dir():
         problems.append("sandbox mounts /plugin-src and /work are missing")
     if probe_network and not problems:  # never opened on a host that already failed the checks above

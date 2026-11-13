@@ -50,7 +50,7 @@ fn the_real_hermes_tests_refuse_to_run_outside_the_sandbox() {
         "python3",
         &["tests/hermes_plugin/test_real_hermes_guard.py"],
     );
-    assert!(ran >= 4, "only {ran} guard tests ran");
+    assert!(ran >= 6, "only {ran} guard tests ran");
 }
 
 /// An earlier version of this file would run a Hermes interpreter straight on
