@@ -17,18 +17,22 @@ plugin_src="$(cd "$here/../../assets/hermes/herdr-agent-quota" && pwd)"
 hermes="$HOME/.hermes"
 launchers=("$hermes/hermes-agent/.hermes/bin/hermes" "$hermes/hermes-agent/.hermes/bin/hermes-acp")
 
-case "$(realpath "$scratch")" in
-"$hermes/cache/scratch/"*) ;;
-*)
-    echo "sandbox: scratch must be an existing directory under $hermes/cache/scratch" >&2
+# The real Hermes home is only ever mounted read-only: nothing of a run is written under it.
+real_scratch="$(cd "$scratch" 2>/dev/null && pwd -P)" || real_scratch=""
+real_hermes="$(cd "$hermes" 2>/dev/null && pwd -P)" || real_hermes="$hermes"
+if [[ -z "$real_scratch" || "$real_scratch" == "$real_hermes" || "$real_scratch" == "$real_hermes/"* ]]; then
+    echo "sandbox: scratch must be an existing directory outside $hermes" >&2
     exit 2
-    ;;
-esac
+fi
 # A fresh, empty Hermes home and work directory for every run.
 home="$(mktemp -d "$scratch/home.XXXXXX")"
 work="$(mktemp -d "$scratch/work.XXXXXX")"
 echo "sandbox home: $home"
 echo "sandbox work: $work"
+# test_real_hermes.py writes only into a Hermes home holding this run's token, which the real
+# ~/.hermes never does: the read-only checks alone would pass on a host whose install is read-only.
+token="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+printf '%s' "$token" >"$home/.real-hermes-sandbox-home"
 
 # Hermes' dependency activation opens its install lock read-write and creates a lease file
 # beside the selected environment; on the read-only mounts both fail and nothing past the
@@ -70,6 +74,7 @@ bwrap \
     --ro-bind "$here" /tests \
     --bind "$work" /work \
     --setenv HOME "$HOME" --setenv PATH /usr/bin:/bin \
+    --setenv HERDR_AGENT_QUOTA_SANDBOX_HOME_TOKEN "$token" \
     --setenv HERMES_DISABLE_LAZY_INSTALLS 1 --setenv PYTHONDONTWRITEBYTECODE 1 \
     --chdir /work \
     -- "$@" || status=$?
