@@ -201,14 +201,19 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
 /// Herdr runs hooks, actions, and the watcher with its server's PATH, which
 /// on macOS can be launchd's `/usr/bin:/bin:/usr/sbin:/sbin`. A bare `codex`
 /// then never starts, every fetch keeps the cached snapshot, and pane models
-/// stop following new sessions. Fall back to the usual install directories,
-/// and put the chosen one on the child's PATH so an npm `env node` shim finds
-/// the `node` installed beside it.
+/// stop following new sessions. Also locate Node when a wrapper is on PATH
+/// but its npm runtime is only available in interactive shells.
 fn codex_command() -> Command {
     let path = std::env::var_os("PATH");
     let fallbacks = std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".local/bin"))
         .into_iter()
+        .chain(
+            std::env::var_os("FNM_DIR")
+                .map(PathBuf::from)
+                .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.data_dir().join("fnm")))
+                .map(|root| root.join("aliases/default/bin")),
+        )
         .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
         .collect::<Vec<_>>();
     let (executable, directory) = resolve_codex_executable(
@@ -217,9 +222,24 @@ fn codex_command() -> Command {
         &fallbacks,
     );
     let mut command = Command::new(executable);
-    if let Some(directory) = directory {
-        let paths = std::iter::once(directory)
+    let node_directory = if path
+        .iter()
+        .flat_map(std::env::split_paths)
+        .any(|directory| directory.join("node").is_file())
+    {
+        None
+    } else {
+        fallbacks
+            .iter()
+            .find(|directory| directory.join("node").is_file())
+            .cloned()
+    };
+    if directory.is_some() || node_directory.is_some() {
+        let paths = directory
+            .into_iter()
             .chain(path.iter().flat_map(std::env::split_paths))
+            // Keep the selected Codex wrapper ahead of fnm's own Codex.
+            .chain(node_directory)
             .collect::<Vec<_>>();
         if let Ok(joined) = std::env::join_paths(paths) {
             command.env("PATH", joined);
