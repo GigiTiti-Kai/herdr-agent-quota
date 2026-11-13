@@ -66,18 +66,55 @@ fn a_hermes_interpreter_on_the_host_is_refused() {
     );
 }
 
+/// The sandbox writes its fresh home and work directory into the scratch it is
+/// given, so a scratch inside the Hermes home (or a missing one) is refused
+/// before anything is created. HOME is a temporary directory, never the caller's.
+#[test]
+fn the_sandbox_refuses_a_scratch_inside_the_hermes_home() {
+    let home = tempfile::tempdir().unwrap();
+    let inside = home.path().join(".hermes/cache/scratch/run");
+    std::fs::create_dir_all(&inside).unwrap();
+    let linked = home.path().join("linked");
+    std::os::unix::fs::symlink(&inside, &linked).unwrap();
+    let missing = home.path().join("missing");
+    let hermes = home.path().join(".hermes");
+    for scratch in [&inside, &linked, &missing, &hermes] {
+        let output = Command::new("bash")
+            .arg("tests/hermes_plugin/real_hermes_sandbox.sh")
+            .arg(scratch)
+            .arg("/bin/true")
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{scratch:?} was not refused");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("outside"),
+            "{scratch:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let names = |dir: &Path| -> Vec<_> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect()
+    };
+    assert_eq!(names(&inside), Vec::<std::ffi::OsString>::new());
+    assert_eq!(names(&hermes), ["cache"]);
+}
+
 /// The plugin inside the real Hermes checkout of this machine: real bootstrap,
 /// discovery, hooks, agent, model switch and usage parser, in a bubblewrap
 /// sandbox with no network and Hermes mounted read-only. The usage answer and
 /// the notify executable are stubs.
 ///
-/// `HERDR_AGENT_QUOTA_SANDBOX_SCRATCH=<dir under ~/.hermes/cache/scratch> cargo test -- --ignored`
+/// `HERDR_AGENT_QUOTA_SANDBOX_SCRATCH=<existing dir outside ~/.hermes> cargo test -- --ignored`
 #[test]
 #[ignore = "needs a local Hermes install and bubblewrap"]
 fn the_bridge_plugin_works_inside_real_hermes_in_a_sandbox() {
-    let scratch = std::env::var("HERDR_AGENT_QUOTA_SANDBOX_SCRATCH").expect(
-        "set HERDR_AGENT_QUOTA_SANDBOX_SCRATCH to a directory under ~/.hermes/cache/scratch",
-    );
+    let scratch = std::env::var("HERDR_AGENT_QUOTA_SANDBOX_SCRATCH")
+        .expect("set HERDR_AGENT_QUOTA_SANDBOX_SCRATCH to an existing directory outside ~/.hermes");
     let sandbox = "tests/hermes_plugin/real_hermes_sandbox.sh";
     let python = "/usr/bin/python3";
 
