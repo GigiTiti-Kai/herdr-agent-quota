@@ -83,19 +83,10 @@ fn a_pane_less_claude_footer_reaches_every_workspace_and_matching_ones_are_left_
     let cache = CacheStore::new(root);
     cache.set_account_summary(SummaryFormat::Compact).unwrap();
     let now = CacheStore::now_unix();
+    // Keep the no-op metadata comparison independent of reset countdowns.
     let windows = vec![
-        UsageWindow::new(
-            WindowKind::FiveHour,
-            20.0,
-            Some(ResetAt::from_unix_seconds(now + 3_600)),
-        )
-        .unwrap(),
-        UsageWindow::new(
-            WindowKind::Weekly,
-            35.0,
-            Some(ResetAt::from_unix_seconds(now + 86_400)),
-        )
-        .unwrap(),
+        UsageWindow::new(WindowKind::FiveHour, 20.0, None).unwrap(),
+        UsageWindow::new(WindowKind::Weekly, 35.0, None).unwrap(),
     ];
     cache
         .save(

@@ -201,14 +201,19 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
 /// Herdr runs hooks, actions, and the watcher with its server's PATH, which
 /// on macOS can be launchd's `/usr/bin:/bin:/usr/sbin:/sbin`. A bare `codex`
 /// then never starts, every fetch keeps the cached snapshot, and pane models
-/// stop following new sessions. Fall back to the usual install directories,
-/// and put the chosen one on the child's PATH so an npm `env node` shim finds
-/// the `node` installed beside it.
+/// stop following new sessions. Also locate Node when a wrapper is on PATH
+/// but its npm runtime is only available in interactive shells.
 fn codex_command() -> Command {
     let path = std::env::var_os("PATH");
     let fallbacks = std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".local/bin"))
         .into_iter()
+        .chain(
+            std::env::var_os("FNM_DIR")
+                .map(PathBuf::from)
+                .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.data_dir().join("fnm")))
+                .map(|root| root.join("aliases/default/bin")),
+        )
         .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
         .collect::<Vec<_>>();
     let (executable, directory) = resolve_codex_executable(
@@ -217,15 +222,46 @@ fn codex_command() -> Command {
         &fallbacks,
     );
     let mut command = Command::new(executable);
-    if let Some(directory) = directory {
-        let paths = std::iter::once(directory)
+    let node_directory = if path
+        .iter()
+        .flat_map(std::env::split_paths)
+        .any(|directory| is_executable_file(&directory.join("node")))
+    {
+        None
+    } else {
+        fallbacks
+            .iter()
+            .find(|directory| is_executable_file(&directory.join("node")))
+            .cloned()
+    };
+    if directory.is_some() || node_directory.is_some() {
+        let paths = directory
+            .into_iter()
             .chain(path.iter().flat_map(std::env::split_paths))
+            // Keep the selected Codex wrapper ahead of fnm's own Codex.
+            .chain(node_directory)
             .collect::<Vec<_>>();
         if let Ok(joined) = std::env::join_paths(paths) {
             command.env("PATH", joined);
         }
     }
     command
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn resolve_codex_executable(
