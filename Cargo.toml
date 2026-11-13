@@ -38,7 +38,7 @@ ureq = { version = "2.12", features = ["json"] }
 # Used for exact session-id lookups in OpenCode's local opencode.db, omp's
 # models.db, Devin CLI's sessions.db, and Cursor IDE's state.vscdb
 # (`cursorAuth/accessToken` only).
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.42.0", features = ["bundled"] }
 # Codex can archive rollouts as .jsonl.zst. Read the first record for identity
 # and stream a bounded recent window for model/context observations.
 zstd = { version = "0.14", default-features = false }
