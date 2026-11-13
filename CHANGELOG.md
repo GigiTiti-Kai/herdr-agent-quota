@@ -24,8 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Codex quota: manual refresh and the watcher now find fnm's default Node
   runtime when Herdr's server PATH contains a Codex wrapper but no `node`.
-  Existing PATH commands keep precedence, so the footer gets fresh readings
-  without changing which Codex wrapper runs.
+  Node candidates must be executable; an unusable file on PATH or in an
+  earlier fallback no longer prevents discovery of a usable runtime. Existing
+  PATH commands keep precedence, so the footer gets fresh readings without
+  changing which Codex wrapper runs.
 - Hermes bridge: a claim that cannot be hashed (a lone surrogate, or a NUL, the
   stamp's separator) now yields no principal stamp instead of raising in the
   hook; the Rust side rejects a NUL claim too (HCM-177).

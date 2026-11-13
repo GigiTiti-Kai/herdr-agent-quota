@@ -124,12 +124,56 @@ fn finding_node_does_not_replace_the_codex_wrapper_selected_on_path() {
 #[test]
 fn an_existing_node_on_path_wins_over_the_fnm_default() {
     let fixture = Fixture::new();
+    // A non-executable earlier name must not hide the usable PATH runtime.
+    let blocked = fixture.dir.path().join("blocked");
+    executable(&blocked.join("node"), "#!/bin/sh\nexit 77\n");
+    fs::set_permissions(blocked.join("node"), fs::Permissions::from_mode(0o644)).unwrap();
     fs::copy(
         fixture.runtime.join("node"),
         fixture.dir.path().join("bin/node"),
     )
     .unwrap();
     executable(&fixture.runtime.join("node"), "#!/bin/sh\nexit 77\n");
+    let output = fixture
+        .command()
+        .env(
+            "PATH",
+            std::env::join_paths([blocked, fixture.dir.path().join("bin")]).unwrap(),
+        )
+        .args(["refresh", "--provider", "codex", "--force"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fixture.assert_usage(20.0);
+}
+
+#[test]
+fn a_non_executable_node_on_path_does_not_stop_quota_updates() {
+    let fixture = Fixture::new();
+    let refresh = || {
+        let output = fixture
+            .command()
+            .args(["refresh", "--provider", "codex", "--force"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    refresh();
+    fixture.assert_usage(20.0);
+    let blocked = fixture.dir.path().join("bin/node");
+    executable(&blocked, "#!/bin/sh\nexit 77\n");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(fixture.dir.path().join("usage"), "65\n").unwrap();
+    refresh();
+    fixture.assert_usage(65.0);
+}
+
+#[test]
+fn a_non_executable_node_in_an_earlier_fallback_does_not_hide_fnm() {
+    let fixture = Fixture::new();
+    let blocked = fixture.dir.path().join("home/.local/bin/node");
+    executable(&blocked, "#!/bin/sh\nexit 77\n");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).unwrap();
     let output = fixture
         .command()
         .args(["refresh", "--provider", "codex", "--force"])

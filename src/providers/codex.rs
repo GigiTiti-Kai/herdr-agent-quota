@@ -225,13 +225,13 @@ fn codex_command() -> Command {
     let node_directory = if path
         .iter()
         .flat_map(std::env::split_paths)
-        .any(|directory| directory.join("node").is_file())
+        .any(|directory| is_executable_file(&directory.join("node")))
     {
         None
     } else {
         fallbacks
             .iter()
-            .find(|directory| directory.join("node").is_file())
+            .find(|directory| is_executable_file(&directory.join("node")))
             .cloned()
     };
     if directory.is_some() || node_directory.is_some() {
@@ -246,6 +246,22 @@ fn codex_command() -> Command {
         }
     }
     command
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn resolve_codex_executable(
