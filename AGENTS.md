@@ -628,7 +628,8 @@ Pick the first case that applies:
    merged one. `no checks reported` is not proven.
 
    ```
-   gh pr checks "$(gh pr list --base dev --state merged --limit 1 --json number -q '.[0].number')"
+   n=$(gh pr view --json number,state -q 'select(.state=="OPEN").number' 2>/dev/null)
+   gh pr checks "${n:-$(gh pr list --base dev --state merged --limit 1 --json number -q '.[0].number')}"
    ```
 
    Until then, run the full check from
