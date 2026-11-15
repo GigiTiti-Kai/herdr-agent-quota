@@ -402,9 +402,24 @@ fn resolve_executable(
     let in_home = home.map(|home| std::path::Path::new(&home).join(".local/bin/herdr"));
     on_path
         .chain(in_home)
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
         .map(Into::into)
         .unwrap_or_else(|| "herdr".into())
+}
+
+/// Skip a non-executable `herdr` the way a shell's PATH search does, so it
+/// cannot hide a working one later in the list.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Show one Herdr notification.
@@ -2847,7 +2862,15 @@ mod tests {
         let home_bin = dir.path().join("home/.local/bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&home_bin).unwrap();
-        std::fs::write(home_bin.join("herdr"), "").unwrap();
+        let write_herdr = |path: std::path::PathBuf, mode: u32| {
+            std::fs::write(&path, "").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        write_herdr(home_bin.join("herdr"), 0o755);
         let home = Some(dir.path().join("home").into_os_string());
         let resolve = |configured: Option<&str>, path: Option<&std::path::Path>| {
             resolve_executable(
@@ -2861,8 +2884,23 @@ mod tests {
         // No PATH, or a PATH without herdr: the user-local install.
         assert_eq!(resolve(None, None), home_bin.join("herdr"));
         assert_eq!(resolve(Some(""), Some(&bin)), home_bin.join("herdr"));
+        // A non-executable herdr on PATH is skipped, not chosen.
+        #[cfg(unix)]
+        {
+            let bad = dir.path().join("bad");
+            std::fs::create_dir_all(&bad).unwrap();
+            write_herdr(bad.join("herdr"), 0o644);
+            write_herdr(bin.join("herdr"), 0o755);
+            let path = std::env::join_paths([&bad, &bin]).unwrap();
+            assert_eq!(
+                resolve(None, Some(std::path::Path::new(&path))),
+                bin.join("herdr")
+            );
+            std::fs::remove_file(bin.join("herdr")).unwrap();
+            assert_eq!(resolve(None, Some(&bad)), home_bin.join("herdr"));
+        }
         // PATH comes first, so a test's fake herdr is never bypassed.
-        std::fs::write(bin.join("herdr"), "").unwrap();
+        write_herdr(bin.join("herdr"), 0o755);
         assert_eq!(resolve(None, Some(&bin)), bin.join("herdr"));
         // Nothing anywhere: a bare name, so the spawn error names it.
         assert_eq!(
