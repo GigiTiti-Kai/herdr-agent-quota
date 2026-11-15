@@ -31,6 +31,7 @@ use std::os::unix::process::CommandExt;
 const MAX_ACTIVE_TURN_WATCH: Duration = Duration::from_secs(60 * 60);
 const TURN_WATCH_LOCK: &str = "turn.lock";
 const WATCH_HERDR_ENV: &str = "watch-herdr.json";
+const WATCH_LOG: &str = "watch.log";
 
 /// A detached watcher outlives the server that supplied its environment.
 /// Server-owned entry points record only connection fields, never credentials.
@@ -138,6 +139,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
         .collect::<Vec<_>>();
     let mut settling = BTreeMap::new();
     let mut last_inventory = started;
+    let mut last_inventory_error: Option<String> = None;
     loop {
         if !cache.root().is_dir() || cache.turn_watchers_stopped_after(started_millis)? {
             break;
@@ -153,13 +155,28 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
         // A transient Herdr failure should not terminate a live watcher; an
         // hour without a good inventory still ends an orphaned process. The
         // next poll retries the single inventory call.
-        let Ok(mut state) = list_agent_state() else {
-            if last_inventory.elapsed() >= MAX_ACTIVE_TURN_WATCH {
-                break;
+        let mut state = match list_agent_state() {
+            Ok(state) => state,
+            Err(error) => {
+                // Logged once per distinct failure, not once per tick.
+                let message = format!("{error:#}");
+                if last_inventory_error.as_deref() != Some(message.as_str()) {
+                    eprintln!(
+                        "herdr-agent-quota: watch: {} agent list failed: {message}",
+                        crate::herdr::executable().to_string_lossy()
+                    );
+                    last_inventory_error = Some(message);
+                }
+                if last_inventory.elapsed() >= MAX_ACTIVE_TURN_WATCH {
+                    break;
+                }
+                wait_for_watch_tick(&cache, interval, started_at, started_millis);
+                continue;
             }
-            wait_for_watch_tick(&cache, interval, started_at, started_millis);
-            continue;
         };
+        if last_inventory_error.take().is_some() {
+            eprintln!("herdr-agent-quota: watch: agent list recovered");
+        }
         last_inventory = Instant::now();
         let enabled = AgentSelection::from_args_or_env(&[]);
         state.panes.retain(|pane| enabled.contains(&pane.harness));
@@ -2519,6 +2536,27 @@ fn reexec_watch(server: Option<&WatchHerdrEnvironment>, interval_seconds: u64) -
     }
 }
 
+/// A detached watcher has no terminal. Its stderr goes to `watch.log` in the
+/// state directory, so a failure such as a missing Herdr CLI is visible
+/// instead of silent. The file starts over once it passes 256 KiB.
+fn watch_log() -> Stdio {
+    let Some(cache) = CacheStore::from_env()
+        .ok()
+        .filter(|cache| cache.ensure().is_ok())
+    else {
+        return Stdio::null();
+    };
+    let path = cache.root().join(WATCH_LOG);
+    let oversized = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 256 * 1024);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(!oversized)
+        .write(true)
+        .truncate(oversized)
+        .open(path)
+        .map_or_else(|_| Stdio::null(), Stdio::from)
+}
+
 fn spawn_watch(defer: bool) -> Result<()> {
     let executable = std::env::current_exe().context("resolve plugin executable")?;
     let mut command = Command::new(executable);
@@ -2526,7 +2564,7 @@ fn spawn_watch(defer: bool) -> Result<()> {
         .args(["watch", "--provider", "all"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(watch_log());
     if defer {
         command.arg("--defer");
     }

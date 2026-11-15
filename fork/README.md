@@ -114,8 +114,10 @@ theirs.
 
 ## After a sync
 
-The plugin runs from `target/release/herdr-agent-usage` in this checkout, so a
-rebuild is enough — Herdr does not need reinstalling. Pick the new binary up with:
+The plugin runs `bin/herdr-agent-usage` in this checkout (falling back to
+`target/release/herdr-agent-usage` until `./install.sh` has made that copy), so
+a rebuild plus `sh scripts/install-binary.sh` is enough — Herdr does not need
+reinstalling. Pick the new binary up with:
 
     herdr plugin action invoke refresh --plugin herdr-agent-usage
 

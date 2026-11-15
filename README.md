@@ -54,6 +54,14 @@ of the new binary adopts the same directories. Run `./install.sh` after
 pulling so the Cursor hook command is rewritten; until then the previous hook
 script keeps running.
 
+Hooks and actions run `bin/herdr-agent-usage`, a copy `./install.sh` (and
+Herdr's build step) makes after `cargo build`, so `cargo clean` or a cleanup
+of `target/` does not take the plugin down. A checkout built before that copy
+existed keeps running `target/release/herdr-agent-usage` until the next
+`./install.sh`. The plugin finds the Herdr CLI through `HERDR_BIN_PATH`, then
+`PATH`, then `~/.local/bin/herdr`; a detached watcher writes its errors to
+`watch.log` in the plugin state directory.
+
 To enable a subset, use `./install.sh --agent claude,codex,omp`.
 Existing sessions need restarting only when newly installed hooks or Herdr
 integrations must be loaded.

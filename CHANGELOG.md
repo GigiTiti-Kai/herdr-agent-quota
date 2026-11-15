@@ -22,6 +22,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Watcher and hooks no longer depend on `PATH` to find Herdr: the CLI is
+  `HERDR_BIN_PATH`, then `PATH`, then `~/.local/bin/herdr`, and the manifest's
+  `server reload-config` uses `HERDR_BIN_PATH` too. A detached watcher's
+  stderr goes to `watch.log` in the state directory, with one line per
+  distinct `agent list` failure, so a missing CLI is no longer silent.
+- Hooks and actions run `bin/herdr-agent-usage` through `scripts/run.sh`;
+  `./install.sh` and Herdr's build step copy the release build there, so
+  `cargo clean` or a `target/` cleanup no longer removes the running plugin.
+  Without that copy, `target/release` is still used. Hermes keeps the binary
+  path it loaded until it restarts.
+
 - Codex quota: manual refresh and the watcher now find fnm's default Node
   runtime when Herdr's server PATH contains a Codex wrapper but no `node`.
   Node candidates must be executable; an unusable file on PATH or in an

@@ -287,3 +287,78 @@ fn remove_state_after_watchers_stop(dir: tempfile::TempDir) {
     dir.close().unwrap();
     drop(lock);
 }
+
+/// Herdr can start a hook or a detached watcher with neither
+/// `HERDR_BIN_PATH` nor a `PATH`. The watcher must still find the user-local
+/// Herdr CLI and publish, and say so when there is none.
+#[test]
+fn a_watcher_without_path_or_herdr_bin_path_still_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let local_bin = home.join(".local/bin");
+    fs::create_dir_all(&local_bin).unwrap();
+    let log = dir.path().join("calls");
+    let herdr = local_bin.join("herdr");
+    // Built-ins only: there is no PATH to find `touch` or `cat` on.
+    fs::write(
+        &herdr,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_LOG"
+case "$1 $2" in
+  'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","workspace_id":"w1","agent":"agy","agent_status":"working"}]}}' ;;
+  *) printf '%s\n' '{"result":{}}' ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+    let watch = |home: &std::path::Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"));
+        command
+            .args(["watch", "--provider", "agy", "--interval-seconds", "30"])
+            .env_clear()
+            .env("PATH", "")
+            .env("HOME", home)
+            .env("HERDR_PLUGIN_STATE_DIR", dir.path())
+            .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
+            .env("HERDR_AGENT_QUOTA_AGENT_ORDER", "default")
+            .env("TEST_LOG", &log)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        command.spawn().unwrap()
+    };
+
+    let mut child = watch(&home);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let published = loop {
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        if calls
+            .lines()
+            .any(|line| line.starts_with("pane report-metadata w1:p1") && line.contains("--token"))
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        published,
+        "no tokens reached Herdr: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    // No Herdr anywhere: the failure names the CLI instead of vanishing.
+    let mut child = watch(&dir.path().join("no-home"));
+    thread::sleep(Duration::from_millis(500));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("watch: herdr agent list failed"),
+        "{stderr}"
+    );
+}

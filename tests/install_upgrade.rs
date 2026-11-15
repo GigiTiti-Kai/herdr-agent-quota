@@ -1,5 +1,30 @@
 #![cfg(unix)]
-use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+/// A copy of the installer under `dir/plugin`, so the binary it copies into
+/// `bin/` lands in the fixture and never in this checkout.
+fn plugin_checkout(dir: &Path) -> PathBuf {
+    let root = dir.join("plugin");
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    for file in [
+        "install.sh",
+        "scripts/herdr-action.sh",
+        "scripts/install-binary.sh",
+        "scripts/run.sh",
+    ] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(file),
+            root.join(file),
+        )
+        .unwrap();
+    }
+    root
+}
 
 #[test]
 fn normal_upgrade_preserves_preferences_and_runs_recovery_in_the_server_environment() {
@@ -50,7 +75,7 @@ esac
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let output = Command::new("bash")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .arg(plugin_checkout(dir.path()).join("install.sh"))
         .env_remove("HERDR_SOCKET_PATH")
         .env(
             "PATH",
@@ -76,6 +101,11 @@ esac
     assert_eq!(
         fs::read_to_string(log).unwrap(),
         "configure --apply\nreload-config\nstartup --provider all\n"
+    );
+    // Hooks run the copy in bin/, which `cargo clean` leaves alone.
+    assert_eq!(
+        fs::read(dir.path().join("plugin/bin/herdr-agent-usage")).unwrap(),
+        fs::read(plugin.join("herdr-agent-usage")).unwrap()
     );
     assert_eq!(
         fs::read_to_string(config.join("agents")).unwrap(),
@@ -137,7 +167,7 @@ esac
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let output = Command::new("bash")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .arg(plugin_checkout(dir.path()).join("install.sh"))
         .args(["--agent", "claude,codex,grok,agy,opencode,pi,omp,devin"])
         .env_remove("HERDR_SOCKET_PATH")
         .env(
@@ -225,7 +255,7 @@ esac
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let output = Command::new("bash")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .arg(plugin_checkout(dir.path()).join("install.sh"))
         .env_remove("HERDR_SOCKET_PATH")
         .env(
             "PATH",
@@ -322,7 +352,7 @@ esac
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let output = Command::new("bash")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
+        .arg(plugin_checkout(dir.path()).join("install.sh"))
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("XDG_CONFIG_HOME")
         .env(

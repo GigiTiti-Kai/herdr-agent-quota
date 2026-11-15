@@ -44,6 +44,13 @@ GitHub 仓库名和 Herdr 插件 id 都是 `herdr-agent-usage`。`./install.sh` 
 目录。拉取之后请再跑一次 `./install.sh`，Cursor 的 hook 命令才会改写；在那之前旧脚本
 继续生效。
 
+hook 与 action 运行的是 `bin/herdr-agent-usage`：`./install.sh`（以及 Herdr 的 build
+步骤）在 `cargo build` 之后把二进制复制到这里，所以 `cargo clean` 或清理 `target/`
+不会让插件失效。在这份复制出现之前编译的 checkout，会继续运行
+`target/release/herdr-agent-usage`，直到下一次 `./install.sh`。插件按
+`HERDR_BIN_PATH`、`PATH`、`~/.local/bin/herdr` 的顺序寻找 Herdr CLI；后台 watcher 的错误
+写在插件 state 目录的 `watch.log` 里。
+
 只启用部分 agent：`./install.sh --agent claude,codex,omp`。
 仅在需要加载新安装的 hook 或 Herdr integration 时，才需重启已经运行的 agent 会话。
 
