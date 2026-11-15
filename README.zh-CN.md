@@ -133,7 +133,7 @@ docs/agent-setup.zh-CN.md（中文）或 docs/agent-setup.md（英文）执行�
      用了 ZWNJ，需要升级。
    - macOS 上的 Cursor：若 ~/.cursor/cli-config.json 有 authInfo，且没有
      ~/.cursor/.herdr-keychain-approved，先告诉我，再运行
-     ./target/release/herdr-agent-usage refresh --provider cursor --keychain-approve --force
+     ./scripts/run.sh refresh --provider cursor --keychain-approve --force
      并让我点 Always Allow（不要点 Allow）。
    - macOS 上 Muse 的 keychain 登录：同样用 --provider muse。
    - herdr plugin action invoke refresh --plugin herdr-agent-usage 并等待结束。

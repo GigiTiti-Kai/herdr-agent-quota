@@ -312,7 +312,7 @@ esac
     )
     .unwrap();
     fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
-    let watch = |home: &std::path::Path| {
+    let watch = |home: &std::path::Path, stderr: Stdio| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"));
         command
             .args(["watch", "--provider", "agy", "--interval-seconds", "30"])
@@ -324,11 +324,11 @@ esac
             .env("HERDR_AGENT_QUOTA_AGENT_ORDER", "default")
             .env("TEST_LOG", &log)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(stderr);
         command.spawn().unwrap()
     };
 
-    let mut child = watch(&home);
+    let mut child = watch(&home, Stdio::null());
     let deadline = Instant::now() + Duration::from_secs(5);
     let published = loop {
         let calls = fs::read_to_string(&log).unwrap_or_default();
@@ -352,13 +352,23 @@ esac
     );
 
     // No Herdr anywhere: the failure names the CLI instead of vanishing.
-    let mut child = watch(&dir.path().join("no-home"));
-    thread::sleep(Duration::from_millis(500));
+    let stderr = dir.path().join("stderr");
+    let mut child = watch(
+        &dir.path().join("no-home"),
+        fs::File::create(&stderr).unwrap().into(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let logged = loop {
+        let text = fs::read_to_string(&stderr).unwrap_or_default();
+        if text.contains("watch: herdr agent list failed") || Instant::now() >= deadline {
+            break text;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
     child.kill().unwrap();
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    child.wait().unwrap();
     assert!(
-        stderr.contains("watch: herdr agent list failed"),
-        "{stderr}"
+        logged.contains("watch: herdr agent list failed"),
+        "{logged}"
     );
 }

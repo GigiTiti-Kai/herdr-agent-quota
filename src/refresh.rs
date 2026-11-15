@@ -2540,9 +2540,10 @@ fn reexec_watch(server: Option<&WatchHerdrEnvironment>, interval_seconds: u64) -
 /// state directory, so a failure such as a missing Herdr CLI is visible
 /// instead of silent. The file starts over once it passes 256 KiB.
 fn watch_log() -> Stdio {
+    // Never create the state dir here: `watch` refuses to run without one.
     let Some(cache) = CacheStore::from_env()
         .ok()
-        .filter(|cache| cache.ensure().is_ok())
+        .filter(|cache| cache.root().is_dir())
     else {
         return Stdio::null();
     };

@@ -148,7 +148,7 @@ Rules:
      used ZWNJ — upgrade.
    - macOS Cursor: if ~/.cursor/cli-config.json has authInfo and
      ~/.cursor/.herdr-keychain-approved is missing, warn the user, then
-     ./target/release/herdr-agent-usage refresh --provider cursor --keychain-approve --force
+     ./scripts/run.sh refresh --provider cursor --keychain-approve --force
      and tell them to click Always Allow (not Allow).
    - macOS Muse keychain login: same with --provider muse.
    - herdr plugin action invoke refresh --plugin herdr-agent-usage and wait.
