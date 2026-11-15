@@ -375,117 +375,244 @@ esac
 
 /// A watcher started outside Herdr (a terminal, a systemd unit) carries no
 /// `HERDR_PLUGIN_STATE_DIR`. It must still land on Herdr's state directory and
-/// its `turn.lock`, so Herdr's own watcher stays the only publisher. When it
-/// fell back to a separate ProjectDirs cache, both watchers published with
-/// different preferences and the bar flipped between footer and pane.
+/// its `turn.lock`. When it fell back to a separate ProjectDirs cache, both
+/// watchers published with different preferences and the bar flipped between
+/// footer and pane (HAQ-15, measured again in HAQ-16).
+///
+/// While Herdr's watcher holds the lock the outside one stays alive and makes
+/// no Herdr call; when Herdr's ends it takes over with the same preferences,
+/// so the footer never moves back into the pane.
 #[test]
-fn a_watcher_without_the_state_dir_variable_does_not_publish_beside_herdrs() {
-    assert_outside_watcher_never_publishes("herdr-agent-usage", false);
-    assert_outside_watcher_never_publishes("state/herdr-agent-usage", false);
+fn an_outside_watcher_waits_silently_and_takes_over_without_moving_the_footer() {
+    for herdr_dir in ["herdr-agent-usage", "state/herdr-agent-usage"] {
+        let fixture = OutsideFixture::new(herdr_dir, false);
+        let mut herdrs = fixture.watch(Some(&fixture.state));
+        fixture.wait_for_report_from(herdrs.id());
+        let mut outside = fixture.watch(None);
+        thread::sleep(Duration::from_secs(3));
+        assert!(
+            outside.try_wait().unwrap().is_none(),
+            "{herdr_dir}: the outside watcher exited instead of waiting"
+        );
+        let outside_pid = outside.id();
+        let calls = fixture.calls();
+        assert!(
+            !calls.iter().any(|call| call.pid == outside_pid),
+            "{herdr_dir}: the outside watcher called Herdr while Herdr's held the lock"
+        );
+
+        herdrs.kill().unwrap();
+        herdrs.wait().unwrap();
+        fixture.wait_for_report_from(outside_pid);
+        outside.kill().unwrap();
+        outside.wait().unwrap();
+
+        let calls = fixture.calls();
+        let footer = |pid: u32| {
+            calls
+                .iter()
+                .filter(|call| {
+                    call.pid == pid && call.args.starts_with("workspace report-metadata")
+                })
+                .flat_map(|call| call.tokens("--token"))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let herdrs_footer = footer(herdrs.id());
+        assert!(
+            herdrs_footer.contains("quota_acct_cl_icon"),
+            "{herdr_dir}: no footer: {calls:#?}"
+        );
+        assert_eq!(footer(outside_pid), herdrs_footer, "{herdr_dir}");
+        for call in &calls {
+            assert!(
+                !call
+                    .tokens("--clear-token")
+                    .any(|name| name.starts_with("quota_acct_")),
+                "{herdr_dir}: footer cleared: {call:?}"
+            );
+            assert!(
+                !(call.args.starts_with("pane ")
+                    && call
+                        .tokens("--token")
+                        .any(|name| name.starts_with("quota_acct_"))),
+                "{herdr_dir}: account row moved into the pane: {call:?}"
+            );
+        }
+        assert!(
+            !fixture.legacy.join("turn.lock").exists(),
+            "{herdr_dir}: the outside watcher used the old cache"
+        );
+    }
 }
 
 /// Both candidate directories exist and Herdr uses the second: no guess is
 /// safe, so the outside watcher must stop instead of taking the other lock.
 #[test]
 fn an_ambiguous_state_dir_stops_the_outside_watcher() {
-    assert_outside_watcher_never_publishes("state/herdr-agent-usage", true);
-    assert_outside_watcher_never_publishes("herdr-agent-usage", true);
+    for herdr_dir in ["state/herdr-agent-usage", "herdr-agent-usage"] {
+        let fixture = OutsideFixture::new(herdr_dir, true);
+        let mut herdrs = fixture.watch(Some(&fixture.state));
+        fixture.wait_for_report_from(herdrs.id());
+        let mut outside = fixture.watch(None);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = outside.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                outside.kill().unwrap();
+                outside.wait().unwrap();
+                panic!("{herdr_dir}: the outside watcher kept running");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        herdrs.kill().unwrap();
+        herdrs.wait().unwrap();
+        // Ambiguity is an error, so the failure is visible in watch.log.
+        assert!(!status.success(), "{herdr_dir}");
+        assert!(
+            !fixture.calls().iter().any(|call| call.pid == outside.id()),
+            "{herdr_dir}: the outside watcher called Herdr"
+        );
+        for other in ["herdr-agent-usage", "state/herdr-agent-usage"] {
+            if other != herdr_dir {
+                assert!(
+                    !fixture.plugins.join(other).join("turn.lock").exists(),
+                    "{herdr_dir}: the outside watcher took the other lock"
+                );
+            }
+        }
+        assert!(!fixture.legacy.join("turn.lock").exists());
+    }
 }
 
-fn assert_outside_watcher_never_publishes(herdr_dir: &str, both_exist: bool) {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
-    let plugins = home.join(".local/state/herdr/plugins");
-    let state = plugins.join(herdr_dir);
-    fs::create_dir_all(&state).unwrap();
-    if both_exist {
-        for other in ["herdr-agent-usage", "state/herdr-agent-usage"] {
-            fs::create_dir_all(plugins.join(other)).unwrap();
-        }
+#[derive(Debug)]
+struct HerdrCall {
+    pid: u32,
+    args: String,
+}
+
+impl HerdrCall {
+    /// Token names following `flag` (`--token name=value`, `--clear-token name`).
+    fn tokens<'a>(&'a self, flag: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        let words: Vec<&str> = self.args.split(' ').collect();
+        words
+            .windows(2)
+            .filter(move |pair| pair[0] == flag)
+            .map(|pair| pair[1].split('=').next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .into_iter()
     }
-    // The old fallback directory exists on a machine that ran the CLI before.
-    let legacy = home.join(".local/share/herdr-agent-usage");
-    fs::create_dir_all(&legacy).unwrap();
-    let log = dir.path().join("calls");
-    let herdr = dir.path().join("herdr");
-    fs::write(
-        &herdr,
-        r#"#!/bin/sh
+}
+
+struct OutsideFixture {
+    dir: tempfile::TempDir,
+    home: std::path::PathBuf,
+    plugins: std::path::PathBuf,
+    state: std::path::PathBuf,
+    legacy: std::path::PathBuf,
+}
+
+impl OutsideFixture {
+    fn new(herdr_dir: &str, both_exist: bool) -> Self {
+        use herdr_agent_quota::cache::CacheStore;
+        use herdr_agent_quota::cli::SummaryFormat;
+        use herdr_agent_quota::model::{Provider, ProviderSnapshot, UsageWindow, WindowKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let plugins = home.join(".local/state/herdr/plugins");
+        let state = plugins.join(herdr_dir);
+        fs::create_dir_all(&state).unwrap();
+        if both_exist {
+            for other in ["herdr-agent-usage", "state/herdr-agent-usage"] {
+                fs::create_dir_all(plugins.join(other)).unwrap();
+            }
+        }
+        // The footer is on in Herdr's state dir and backed by a usable reading.
+        let cache = CacheStore::new(&state);
+        cache.set_account_summary(SummaryFormat::Compact).unwrap();
+        let windows = vec![UsageWindow::new(WindowKind::Weekly, 35.0, None).unwrap()];
+        cache
+            .save(
+                &ProviderSnapshot::new(Provider::Claude, windows.clone(), CacheStore::now_unix())
+                    .session_local()
+                    .with_account_windows(windows),
+            )
+            .unwrap();
+        // Herdr's workspace already shows a footer row, so a publisher whose
+        // summary is off has something to clear.
+        // The old fallback directory exists on a machine that ran the CLI
+        // before, with no summary preference: publishing from it clears the
+        // footer.
+        let legacy = home.join(".local/share/herdr-agent-usage");
+        fs::create_dir_all(&legacy).unwrap();
+        let herdr = dir.path().join("herdr");
+        fs::write(
+            &herdr,
+            r#"#!/bin/sh
 printf '%s %s\n' "$PPID" "$*" >> "$TEST_LOG"
 case "$1 $2" in
   'agent list') printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","workspace_id":"w1","agent":"agy","agent_status":"working"}]}}' ;;
+  'workspace list') printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","label":"api","tokens":{"quota_acct_cl_icon":"old"}}]}}' ;;
   *) printf '%s\n' '{"result":{}}' ;;
 esac
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
-    let watch = |state_dir: Option<&std::path::Path>| {
+        )
+        .unwrap();
+        fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            dir,
+            home,
+            plugins,
+            state,
+            legacy,
+        }
+    }
+
+    fn watch(&self, state_dir: Option<&std::path::Path>) -> std::process::Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"));
         command
             .args(["watch", "--provider", "agy", "--interval-seconds", "30"])
             .env_clear()
             .env("PATH", "")
-            .env("HOME", &home)
-            .env("HERDR_BIN_PATH", &herdr)
-            .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
+            .env("HOME", &self.home)
+            .env("HERDR_BIN_PATH", self.dir.path().join("herdr"))
+            .env("HERDR_PLUGIN_CONFIG_DIR", self.dir.path())
             .env("HERDR_AGENT_QUOTA_AGENT_ORDER", "default")
-            .env("TEST_LOG", &log)
+            .env("TEST_LOG", self.dir.path().join("calls"))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(state_dir) = state_dir {
             command.env("HERDR_PLUGIN_STATE_DIR", state_dir);
         }
         command.spawn().unwrap()
-    };
+    }
 
-    let mut herdrs = watch(Some(&state));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !fs::read_to_string(&log)
-        .unwrap_or_default()
-        .contains("report-metadata")
-    {
-        assert!(Instant::now() < deadline, "Herdr's watcher never published");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let mut outside = watch(None);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let outside_status = loop {
-        if let Some(status) = outside.try_wait().unwrap() {
-            break Some(status);
-        }
-        if Instant::now() >= deadline {
-            outside.kill().unwrap();
-            outside.wait().unwrap();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let outside_pid = outside.id().to_string();
-    herdrs.kill().unwrap();
-    herdrs.wait().unwrap();
-    let calls = fs::read_to_string(&log).unwrap_or_default();
-    let case = format!("{herdr_dir} both={both_exist}");
-    let status = outside_status
-        .unwrap_or_else(|| panic!("{case}: a second watcher kept running beside Herdr's: {calls}"));
-    // Ambiguity is an error, so the failure is visible in watch.log.
-    assert_eq!(status.success(), !both_exist, "{case}");
-    assert!(
-        !calls
+    fn calls(&self) -> Vec<HerdrCall> {
+        fs::read_to_string(self.dir.path().join("calls"))
+            .unwrap_or_default()
             .lines()
-            .any(|line| line.starts_with(&format!("{outside_pid} "))),
-        "{case}: the outside watcher called Herdr: {calls}"
-    );
-    for other in ["herdr-agent-usage", "state/herdr-agent-usage"] {
-        if other != herdr_dir {
-            assert!(
-                !plugins.join(other).join("turn.lock").exists(),
-                "{case}: the outside watcher took the other lock"
-            );
+            .filter_map(|line| {
+                let (pid, args) = line.split_once(' ')?;
+                Some(HerdrCall {
+                    pid: pid.parse().ok()?,
+                    args: args.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// Until `pid` has sent its workspace footer, the last report of a pass.
+    fn wait_for_report_from(&self, pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self
+            .calls()
+            .iter()
+            .any(|call| call.pid == pid && call.args.starts_with("workspace report-metadata"))
+        {
+            assert!(Instant::now() < deadline, "watcher {pid} never published");
+            thread::sleep(Duration::from_millis(20));
         }
     }
-    assert!(
-        !legacy.join("turn.lock").exists(),
-        "{case}: the outside watcher used the old cache"
-    );
 }

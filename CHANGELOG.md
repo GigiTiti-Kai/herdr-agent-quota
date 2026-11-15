@@ -41,6 +41,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the summary row flipped between the footer and the pane. When both
   candidates exist the command stops with an error naming them instead of
   guessing; set `HERDR_PLUGIN_STATE_DIR` (HAQ-15).
+- An outside watcher that finds Herdr's watcher holding `turn.lock` now waits,
+  making no Herdr call, and takes over when that watcher ends, instead of
+  exiting. A systemd unit running `watch` therefore stays up beside Herdr's
+  watcher without a second publisher (HAQ-16).
 
 - Codex quota: manual refresh and the watcher now find fnm's default Node
   runtime when Herdr's server PATH contains a Codex wrapper but no `node`.

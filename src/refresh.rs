@@ -120,7 +120,16 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
     if !cache.root().is_dir() {
         return Ok(());
     }
-    let Some(_lock) = cache.try_lock_named(TURN_WATCH_LOCK)? else {
+    let Some(_lock) = (match cache.try_lock_named(TURN_WATCH_LOCK)? {
+        Some(lock) => Some(lock),
+        // Herdr starts a watcher on every working event, so its losers exit.
+        // A watcher started outside Herdr (a systemd unit) is meant to stay:
+        // it waits silently and takes over when Herdr's watcher ends.
+        None if std::env::var_os("HERDR_PLUGIN_STATE_DIR").is_none() => {
+            standby_for_turn_lock(&cache, interval_seconds)?
+        }
+        None => None,
+    }) else {
         return Ok(());
     };
 
@@ -489,6 +498,33 @@ fn identity_has_drifted(pane: &AgentPane, identity: &crate::herdr::PaneIdentity)
     shown("quota_model").unwrap_or_default() != identity.model
         // A narrow sidebar publishes the model alone.
         || shown("quota_provider").is_some_and(|provider| provider != identity.provider)
+}
+
+/// Wait for `turn.lock` without calling Herdr, fetching, or writing: the
+/// holder is the only publisher, so two watchers never disagree on screen.
+/// `None` when the state dir is removed or a stop marker is written.
+fn standby_for_turn_lock(
+    cache: &CacheStore,
+    interval_seconds: u64,
+) -> Result<Option<std::fs::File>> {
+    let started_at = SystemTime::now();
+    let started_millis = CacheStore::now_millis();
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        if !cache.root().is_dir() || cache.turn_watchers_stopped_after(started_millis)? {
+            return Ok(None);
+        }
+        if watch_binary_is_newer(started_at, current_exe_modified()) {
+            return reexec_watch(
+                WatchHerdrEnvironment::load(cache).as_ref(),
+                interval_seconds,
+            )
+            .map(|()| None);
+        }
+        if let Some(lock) = cache.try_lock_named(TURN_WATCH_LOCK)? {
+            return Ok(Some(lock));
+        }
+    }
 }
 
 fn wait_for_watch_tick(

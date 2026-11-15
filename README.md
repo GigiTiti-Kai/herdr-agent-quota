@@ -65,6 +65,8 @@ without `HERDR_PLUGIN_STATE_DIR` uses Herdr's state directory for the plugin
 when it exists, so it shares the watcher lock and preferences. If both
 `plugins/herdr-agent-usage` and `plugins/state/herdr-agent-usage` exist it
 stops with an error; set `HERDR_PLUGIN_STATE_DIR` to the one Herdr uses.
+Such an outside `watch` (a systemd unit, say) waits while Herdr's watcher holds
+the lock, without calling Herdr, and takes over when that one ends.
 
 To enable a subset, use `./install.sh --agent claude,codex,omp`.
 Existing sessions need restarting only when newly installed hooks or Herdr

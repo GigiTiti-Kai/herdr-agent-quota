@@ -54,6 +54,8 @@ hook 与 action 运行的是 `bin/herdr-agent-usage`：`./install.sh`（以及 H
 目录存在时使用它，因此与 watcher 共用同一把锁和同一份偏好设置。
 若 `plugins/herdr-agent-usage` 与 `plugins/state/herdr-agent-usage` 同时存在，则报错退出；
 请把 `HERDR_PLUGIN_STATE_DIR` 设为 Herdr 实际使用的那个。
+这种在 Herdr 之外启动的 `watch`（例如 systemd unit）在 Herdr 的 watcher 持有锁时等待，
+不调用 Herdr，待其结束后再接手。
 
 只启用部分 agent：`./install.sh --agent claude,codex,omp`。
 仅在需要加载新安装的 hook 或 Herdr integration 时，才需重启已经运行的 agent 会话。
