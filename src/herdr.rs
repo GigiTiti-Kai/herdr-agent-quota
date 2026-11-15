@@ -412,9 +412,12 @@ fn resolve_executable(
 fn is_executable_file(path: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        // access(2) judges this process's own uid/gid, which mode bits cannot.
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        path.is_file() && unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0
     }
     #[cfg(not(unix))]
     {
@@ -2892,6 +2895,12 @@ mod tests {
             write_herdr(bad.join("herdr"), 0o644);
             write_herdr(bin.join("herdr"), 0o755);
             let path = std::env::join_paths([&bad, &bin]).unwrap();
+            assert_eq!(
+                resolve(None, Some(std::path::Path::new(&path))),
+                bin.join("herdr")
+            );
+            // Executable by others only: still not runnable by its owner.
+            write_herdr(bad.join("herdr"), 0o641);
             assert_eq!(
                 resolve(None, Some(std::path::Path::new(&path))),
                 bin.join("herdr")
