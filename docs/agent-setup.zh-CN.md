@@ -204,13 +204,13 @@ iTerm2、Terminal.app、Alacritty、Warp：没有可靠的按码位映射。如�
 `~/.cursor/.herdr-keychain-approved`：
 
 ```sh
-./target/release/herdr-agent-usage refresh --provider cursor --keychain-approve --force
+./scripts/run.sh refresh --provider cursor --keychain-approve --force
 ```
 
 **Muse**：登录走钥匙串，且 Muse 配置目录旁还没有批准标记：
 
 ```sh
-./target/release/herdr-agent-usage refresh --provider muse --keychain-approve --force
+./scripts/run.sh refresh --provider muse --keychain-approve --force
 ```
 
 **先告诉用户**再跑：系统会弹窗，必须点 **Always Allow**，不要点 Allow。

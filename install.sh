@@ -207,6 +207,8 @@ esac
 
 printf '%s\n' '→ building herdr-agent-usage'
 cargo build --release --locked --manifest-path "$ROOT/Cargo.toml"
+# Hooks run bin/herdr-agent-usage, which `cargo clean` does not remove.
+sh "$ROOT/scripts/install-binary.sh"
 
 printf '%s\n' '→ linking and enabling the Herdr plugin'
 collect_alias_plugin_dirs

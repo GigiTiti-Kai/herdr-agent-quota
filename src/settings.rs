@@ -514,7 +514,7 @@ fn apply(settings: Settings, removed: &[Harness]) -> Result<Option<String>> {
         .find(|line| line.starts_with("Icon size "))
         .map(str::to_string);
 
-    let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+    let herdr = crate::herdr::executable();
     let reload = Command::new(herdr)
         .args(["server", "reload-config"])
         .output()

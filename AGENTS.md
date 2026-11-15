@@ -649,8 +649,11 @@ pass both:
 heavy-run -- env -C "$PWD" PATH="$PATH" cargo test --test <file> <filter>
 ```
 
-Reloading the plugin after a rebuild:
+Reloading the plugin after a rebuild. Herdr runs `bin/herdr-agent-usage`
+through `scripts/run.sh` once `install.sh` has made that copy, so copy the new
+build there first:
 
 ```
+sh scripts/install-binary.sh
 herdr plugin disable herdr-agent-usage && herdr plugin enable herdr-agent-usage
 ```

@@ -372,13 +372,66 @@ pub struct PaneTokens {
     pub show_account_quota: bool,
 }
 
+/// The Herdr CLI every call in this plugin runs.
+///
+/// `HERDR_BIN_PATH` wins even when it names a missing file. Without it, a
+/// `herdr` on `PATH`, then `~/.local/bin/herdr`: a Herdr startup hook or a
+/// detached watcher can run with neither `HERDR_BIN_PATH` nor a usable
+/// `PATH`, and a bare `herdr` then fails with "No such file or directory".
+pub fn executable() -> std::ffi::OsString {
+    resolve_executable(
+        std::env::var_os("HERDR_BIN_PATH"),
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn resolve_executable(
+    configured: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return configured;
+    }
+    let on_path = path
+        .iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("herdr"));
+    let in_home = home.map(|home| std::path::Path::new(&home).join(".local/bin/herdr"));
+    on_path
+        .chain(in_home)
+        .find(|candidate| is_executable_file(candidate))
+        .map(Into::into)
+        .unwrap_or_else(|| "herdr".into())
+}
+
+/// Skip a non-executable `herdr` the way a shell's PATH search does, so it
+/// cannot hide a working one later in the list.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        // access(2) judges this process's own uid/gid, which mode bits cannot.
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        path.is_file() && unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 /// Show one Herdr notification.
 ///
 /// Failure is reported to the caller but is never worth aborting a publish
 /// for: a missed toast costs the user nothing that the sidebar does not
 /// already show.
 pub fn notify(title: &str, body: &str) -> Result<()> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(&executable)
         .args(["notification", "show", title, "--body", body])
         .args(["--sound", "request"])
@@ -582,7 +635,7 @@ fn attach_codex_sessions(panes: &mut [AgentPane]) {
 }
 
 fn codex_foreground_process(pane_id: &str) -> Option<Value> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(executable)
         .args(["pane", "process-info", "--pane", pane_id])
         .output()
@@ -774,7 +827,7 @@ fn attach_muse_sessions_with(
 }
 
 fn list_agent_value() -> Result<Value> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(&executable)
         .args(["agent", "list"])
         .output()
@@ -791,7 +844,7 @@ fn list_agent_value() -> Result<Value> {
 /// learn which pane the user moved to. Herdr answers with the pane id, which
 /// is what keeps `focus` scoped to exactly one pane.
 pub fn current_focused_pane() -> Result<Option<(String, Harness)>> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(executable)
         .args(["pane", "current"])
         .output()
@@ -818,7 +871,7 @@ pub fn focused_pane_in_snapshot(
     workspace_id: Option<&str>,
     tab_id: Option<&str>,
 ) -> Result<Option<String>> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(executable)
         .args(["api", "snapshot"])
         .output()
@@ -873,7 +926,7 @@ pub fn focused_pane_in_snapshot(
 // terminal. Only the pane that fired the event is worth that cost; every other
 // pane keeps the topic it last published.
 pub fn refresh_pane_topic(pane: &mut AgentPane) {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     if let Some(topic) = read_pane_topic(&executable, pane) {
         pane.topic = topic;
     }
@@ -1094,7 +1147,7 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
     if panes.is_empty() {
         return Ok(());
     }
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     // `report_icon_metadata` writes only `ICON_TOKEN_NAMES`, so head election
     // here would be dead work (one `agent list` per focus event). Pass no
     // heads; the group tokens it changes in `desired` are never reported.
@@ -1139,7 +1192,7 @@ fn publish_pane_tokens_inner(
     allow_while_scrolled: bool,
     workspace_summary: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     // One `workspace list` per pass serves both the Space labels and the
     // workspace-scope footer comparison.
     let workspaces = list_workspaces();
@@ -1515,7 +1568,7 @@ struct WorkspaceEntry {
 }
 
 fn list_workspaces() -> Result<Vec<WorkspaceEntry>> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(&executable)
         .args(["workspace", "list"])
         .output()
@@ -2804,6 +2857,66 @@ mod tests {
         CacheUsage, ContextUsage, ProviderSnapshot, ResetAt, UsageWindow, WindowKind,
     };
     use serde_json::json;
+
+    #[test]
+    fn herdr_executable_does_not_depend_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let home_bin = dir.path().join("home/.local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home_bin).unwrap();
+        let write_herdr = |path: std::path::PathBuf, mode: u32| {
+            std::fs::write(&path, "").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        write_herdr(home_bin.join("herdr"), 0o755);
+        let home = Some(dir.path().join("home").into_os_string());
+        let resolve = |configured: Option<&str>, path: Option<&std::path::Path>| {
+            resolve_executable(
+                configured.map(Into::into),
+                path.map(|path| path.as_os_str().to_owned()),
+                home.clone(),
+            )
+        };
+        // An explicit setting is authoritative, even for a missing file.
+        assert_eq!(resolve(Some("/absent/herdr"), Some(&bin)), "/absent/herdr");
+        // No PATH, or a PATH without herdr: the user-local install.
+        assert_eq!(resolve(None, None), home_bin.join("herdr"));
+        assert_eq!(resolve(Some(""), Some(&bin)), home_bin.join("herdr"));
+        // A non-executable herdr on PATH is skipped, not chosen.
+        #[cfg(unix)]
+        {
+            let bad = dir.path().join("bad");
+            std::fs::create_dir_all(&bad).unwrap();
+            write_herdr(bad.join("herdr"), 0o644);
+            write_herdr(bin.join("herdr"), 0o755);
+            let path = std::env::join_paths([&bad, &bin]).unwrap();
+            assert_eq!(
+                resolve(None, Some(std::path::Path::new(&path))),
+                bin.join("herdr")
+            );
+            // Executable by others only: still not runnable by its owner.
+            write_herdr(bad.join("herdr"), 0o641);
+            assert_eq!(
+                resolve(None, Some(std::path::Path::new(&path))),
+                bin.join("herdr")
+            );
+            std::fs::remove_file(bin.join("herdr")).unwrap();
+            assert_eq!(resolve(None, Some(&bad)), home_bin.join("herdr"));
+        }
+        // PATH comes first, so a test's fake herdr is never bypassed.
+        write_herdr(bin.join("herdr"), 0o755);
+        assert_eq!(resolve(None, Some(&bin)), bin.join("herdr"));
+        // Nothing anywhere: a bare name, so the spawn error names it.
+        assert_eq!(
+            resolve_executable(None, None, Some(dir.path().join("x").into())),
+            "herdr"
+        );
+    }
 
     /// Fork: two same-vendor panes in one Space stay two flat panes, each
     /// with its own cache, TTL and 5h/7d/30d (`fork/README.md`).

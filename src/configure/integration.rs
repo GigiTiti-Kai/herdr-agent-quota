@@ -67,7 +67,7 @@ pub fn ensure_omp(agents: &[Harness], full_selection: bool) -> Result<()> {
     if !needs_omp_install(agents, &status) {
         return Ok(());
     }
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(executable)
         .args(["integration", "install", "omp"])
         .output()?;
@@ -94,7 +94,7 @@ fn needs_omp_install(agents: &[Harness], status: &str) -> bool {
 }
 
 fn read_status() -> Option<String> {
-    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let executable = crate::herdr::executable();
     let output = Command::new(executable)
         .args(["integration", "status"])
         .output()

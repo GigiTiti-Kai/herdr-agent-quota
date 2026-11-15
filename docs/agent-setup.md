@@ -215,14 +215,14 @@ CLI logins (Keychain item `cursor-access-token` / `cursor-user`) and Muse
 `~/.cursor/.herdr-keychain-approved` is missing:
 
 ```sh
-./target/release/herdr-agent-usage refresh --provider cursor --keychain-approve --force
+./scripts/run.sh refresh --provider cursor --keychain-approve --force
 ```
 
 **Muse** — auth is keychain-backed and the marker beside the Muse config dir
 is missing:
 
 ```sh
-./target/release/herdr-agent-usage refresh --provider muse --keychain-approve --force
+./scripts/run.sh refresh --provider muse --keychain-approve --force
 ```
 
 Warn the user **before** running this: a system dialog will appear. They
