@@ -60,7 +60,9 @@ of `target/` does not take the plugin down. A checkout built before that copy
 existed keeps running `target/release/herdr-agent-usage` until the next
 `./install.sh`. The plugin finds the Herdr CLI through `HERDR_BIN_PATH`, then
 `PATH`, then `~/.local/bin/herdr`; a detached watcher writes its errors to
-`watch.log` in the plugin state directory.
+`watch.log` in the plugin state directory. A command run outside Herdr
+without `HERDR_PLUGIN_STATE_DIR` uses Herdr's state directory for the plugin
+when it exists, so it shares the watcher lock and preferences.
 
 To enable a subset, use `./install.sh --agent claude,codex,omp`.
 Existing sessions need restarting only when newly installed hooks or Herdr

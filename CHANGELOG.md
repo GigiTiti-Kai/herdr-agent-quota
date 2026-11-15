@@ -32,6 +32,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cargo clean` or a `target/` cleanup no longer removes the running plugin.
   Without that copy, `target/release` is still used. Hermes keeps the binary
   path it loaded until it restarts.
+- A process Herdr did not start (a terminal, a systemd unit) without
+  `HERDR_PLUGIN_STATE_DIR` now uses Herdr's state directory for this plugin
+  (`$XDG_STATE_HOME/herdr/plugins/herdr-agent-usage`, else `…/plugins/state/…`)
+  when it exists, instead of a separate `~/.local/share/herdr-agent-usage`
+  cache. Such a watcher kept its own `turn.lock` and default preferences, ran
+  beside Herdr's watcher, and the two rewrote each other's tokens every pass:
+  the summary row flipped between the footer and the pane (HAQ-15).
 
 - Codex quota: manual refresh and the watcher now find fnm's default Node
   runtime when Herdr's server PATH contains a Codex wrapper but no `node`.

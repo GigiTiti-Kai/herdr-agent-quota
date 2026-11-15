@@ -50,6 +50,8 @@ hook 与 action 运行的是 `bin/herdr-agent-usage`：`./install.sh`（以及 H
 `target/release/herdr-agent-usage`，直到下一次 `./install.sh`。插件按
 `HERDR_BIN_PATH`、`PATH`、`~/.local/bin/herdr` 的顺序寻找 Herdr CLI；后台 watcher 的错误
 写在插件 state 目录的 `watch.log` 里。
+不经 Herdr 启动、也没有 `HERDR_PLUGIN_STATE_DIR` 的命令，会在 Herdr 的插件 state
+目录存在时使用它，因此与 watcher 共用同一把锁和同一份偏好设置。
 
 只启用部分 agent：`./install.sh --agent claude,codex,omp`。
 仅在需要加载新安装的 hook 或 Herdr integration 时，才需重启已经运行的 agent 会话。

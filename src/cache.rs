@@ -66,10 +66,32 @@ pub struct StatuslineObservation {
     pub payload: Value,
 }
 
+/// The state directory Herdr gives this plugin, for a process Herdr did not
+/// start (a terminal, a systemd unit). Without it such a process kept its own
+/// cache and `turn.lock` under ProjectDirs, so a second watcher ran beside
+/// Herdr's, published with default preferences, and the two rewrote each
+/// other's tokens every pass. Same candidates as `scripts/herdr-action.sh`.
+fn installed_herdr_state_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    let plugins = base.join("herdr/plugins");
+    [
+        plugins.join(PLUGIN_ID),
+        plugins.join("state").join(PLUGIN_ID),
+    ]
+    .into_iter()
+    .find(|dir| dir.is_dir())
+}
+
 impl CacheStore {
     pub fn from_env() -> Result<Self> {
         let root = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
             .map(PathBuf::from)
+            .or_else(installed_herdr_state_dir)
             .or_else(|| {
                 ProjectDirs::from("dev", "herdr", PLUGIN_ID)
                     .map(|dirs| dirs.data_local_dir().to_path_buf())
