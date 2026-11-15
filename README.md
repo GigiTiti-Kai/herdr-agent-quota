@@ -62,7 +62,9 @@ existed keeps running `target/release/herdr-agent-usage` until the next
 `PATH`, then `~/.local/bin/herdr`; a detached watcher writes its errors to
 `watch.log` in the plugin state directory. A command run outside Herdr
 without `HERDR_PLUGIN_STATE_DIR` uses Herdr's state directory for the plugin
-when it exists, so it shares the watcher lock and preferences.
+when it exists, so it shares the watcher lock and preferences. If both
+`plugins/herdr-agent-usage` and `plugins/state/herdr-agent-usage` exist it
+stops with an error; set `HERDR_PLUGIN_STATE_DIR` to the one Herdr uses.
 
 To enable a subset, use `./install.sh --agent claude,codex,omp`.
 Existing sessions need restarting only when newly installed hooks or Herdr

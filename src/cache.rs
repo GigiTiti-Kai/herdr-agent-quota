@@ -71,32 +71,47 @@ pub struct StatuslineObservation {
 /// cache and `turn.lock` under ProjectDirs, so a second watcher ran beside
 /// Herdr's, published with default preferences, and the two rewrote each
 /// other's tokens every pass. Same candidates as `scripts/herdr-action.sh`.
-fn installed_herdr_state_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
+///
+/// When both candidates exist nothing on disk says which one the running
+/// Herdr uses, and guessing wrong is that same second publisher, so it is an
+/// error rather than a pick.
+fn installed_herdr_state_dir() -> Result<Option<PathBuf>> {
+    let Some(base) = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+    else {
+        return Ok(None);
+    };
     let plugins = base.join("herdr/plugins");
-    [
+    let mut found = [
         plugins.join(PLUGIN_ID),
         plugins.join("state").join(PLUGIN_ID),
     ]
     .into_iter()
-    .find(|dir| dir.is_dir())
+    .filter(|dir| dir.is_dir());
+    let first = found.next();
+    if let (Some(first), Some(second)) = (&first, found.next()) {
+        anyhow::bail!(
+            "both {} and {} exist; set HERDR_PLUGIN_STATE_DIR to the one Herdr uses",
+            first.display(),
+            second.display()
+        );
+    }
+    Ok(first)
 }
 
 impl CacheStore {
     pub fn from_env() -> Result<Self> {
-        let root = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
-            .map(PathBuf::from)
-            .or_else(installed_herdr_state_dir)
-            .or_else(|| {
-                ProjectDirs::from("dev", "herdr", PLUGIN_ID)
-                    .map(|dirs| dirs.data_local_dir().to_path_buf())
-            })
-            .context("cannot determine plugin state directory")?;
+        let root = match std::env::var_os("HERDR_PLUGIN_STATE_DIR") {
+            Some(dir) => Some(PathBuf::from(dir)),
+            None => installed_herdr_state_dir()?,
+        }
+        .or_else(|| {
+            ProjectDirs::from("dev", "herdr", PLUGIN_ID)
+                .map(|dirs| dirs.data_local_dir().to_path_buf())
+        })
+        .context("cannot determine plugin state directory")?;
         Ok(Self { root })
     }
 

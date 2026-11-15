@@ -380,12 +380,31 @@ esac
 /// different preferences and the bar flipped between footer and pane.
 #[test]
 fn a_watcher_without_the_state_dir_variable_does_not_publish_beside_herdrs() {
+    assert_outside_watcher_never_publishes("herdr-agent-usage", false);
+    assert_outside_watcher_never_publishes("state/herdr-agent-usage", false);
+}
+
+/// Both candidate directories exist and Herdr uses the second: no guess is
+/// safe, so the outside watcher must stop instead of taking the other lock.
+#[test]
+fn an_ambiguous_state_dir_stops_the_outside_watcher() {
+    assert_outside_watcher_never_publishes("state/herdr-agent-usage", true);
+    assert_outside_watcher_never_publishes("herdr-agent-usage", true);
+}
+
+fn assert_outside_watcher_never_publishes(herdr_dir: &str, both_exist: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
-    let state = home.join(".local/state/herdr/plugins/herdr-agent-usage");
+    let plugins = home.join(".local/state/herdr/plugins");
+    let state = plugins.join(herdr_dir);
+    fs::create_dir_all(&state).unwrap();
+    if both_exist {
+        for other in ["herdr-agent-usage", "state/herdr-agent-usage"] {
+            fs::create_dir_all(plugins.join(other)).unwrap();
+        }
+    }
     // The old fallback directory exists on a machine that ran the CLI before.
     let legacy = home.join(".local/share/herdr-agent-usage");
-    fs::create_dir_all(&state).unwrap();
     fs::create_dir_all(&legacy).unwrap();
     let log = dir.path().join("calls");
     let herdr = dir.path().join("herdr");
@@ -431,14 +450,14 @@ esac
     }
     let mut outside = watch(None);
     let deadline = Instant::now() + Duration::from_secs(3);
-    let outside_exited = loop {
-        if outside.try_wait().unwrap().is_some() {
-            break true;
+    let outside_status = loop {
+        if let Some(status) = outside.try_wait().unwrap() {
+            break Some(status);
         }
         if Instant::now() >= deadline {
             outside.kill().unwrap();
             outside.wait().unwrap();
-            break false;
+            break None;
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -446,18 +465,27 @@ esac
     herdrs.kill().unwrap();
     herdrs.wait().unwrap();
     let calls = fs::read_to_string(&log).unwrap_or_default();
-    assert!(
-        outside_exited,
-        "a second watcher kept running beside Herdr's: {calls}"
-    );
+    let case = format!("{herdr_dir} both={both_exist}");
+    let status = outside_status
+        .unwrap_or_else(|| panic!("{case}: a second watcher kept running beside Herdr's: {calls}"));
+    // Ambiguity is an error, so the failure is visible in watch.log.
+    assert_eq!(status.success(), !both_exist, "{case}");
     assert!(
         !calls
             .lines()
             .any(|line| line.starts_with(&format!("{outside_pid} "))),
-        "the outside watcher called Herdr: {calls}"
+        "{case}: the outside watcher called Herdr: {calls}"
     );
+    for other in ["herdr-agent-usage", "state/herdr-agent-usage"] {
+        if other != herdr_dir {
+            assert!(
+                !plugins.join(other).join("turn.lock").exists(),
+                "{case}: the outside watcher took the other lock"
+            );
+        }
+    }
     assert!(
         !legacy.join("turn.lock").exists(),
-        "the outside watcher used the old cache"
+        "{case}: the outside watcher used the old cache"
     );
 }

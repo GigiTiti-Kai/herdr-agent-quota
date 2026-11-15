@@ -38,7 +38,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when it exists, instead of a separate `~/.local/share/herdr-agent-usage`
   cache. Such a watcher kept its own `turn.lock` and default preferences, ran
   beside Herdr's watcher, and the two rewrote each other's tokens every pass:
-  the summary row flipped between the footer and the pane (HAQ-15).
+  the summary row flipped between the footer and the pane. When both
+  candidates exist the command stops with an error naming them instead of
+  guessing; set `HERDR_PLUGIN_STATE_DIR` (HAQ-15).
 
 - Codex quota: manual refresh and the watcher now find fnm's default Node
   runtime when Herdr's server PATH contains a Codex wrapper but no `node`.
