@@ -334,10 +334,16 @@ impl MetadataTokens {
         let context =
             session_id.and_then(|session_id| snapshot.context_for_session(Some(session_id)));
         let account_windows = snapshot.windows_for_session(session_id);
-        // An Agy pane shows the pool its model draws; the footer row keeps
-        // every window. No session means the account footer itself.
-        let model_windows = (snapshot.provider == Provider::Agy && session_id.is_some())
-            .then(|| crate::providers::agy::windows_for_model(quota_model, account_windows));
+        // An Agy pane shows the pool the model of its own observation draws
+        // (not the shared settings model another pane's `/model` wrote); the
+        // footer row keeps every window. No session means the account footer.
+        let model_windows =
+            (snapshot.provider == Provider::Agy && session_id.is_some()).then(|| {
+                crate::providers::agy::windows_for_model(
+                    snapshot.observed_model_for_session(session_id),
+                    account_windows,
+                )
+            });
         Self::from_snapshot_parts(
             snapshot,
             now_unix,
@@ -465,6 +471,14 @@ impl MetadataTokens {
             // genuinely fresh observation can re-arm it.
             quota_headroom: if has_stale_quota {
                 None
+            } else if snapshot.provider == Provider::Agy {
+                // Agy's `api` row is another pool: shown, never the pane's limit.
+                let own: Vec<UsageWindow> = windows
+                    .iter()
+                    .filter(|window| !crate::providers::agy::is_other_pool(window))
+                    .cloned()
+                    .collect();
+                headroom(&own, fields)
             } else {
                 headroom(windows, fields)
             },
@@ -1619,7 +1633,7 @@ mod tests {
     use super::*;
     use crate::model::{ProviderSnapshot, SessionQuotaObservation, UsageWindow};
 
-    /// One Agy observation: 5h 30 used, 7d 45 used, Arg 80 used, from `model`.
+    /// One Agy Gemini observation: 5h 30 used, 7d 45, Arg 80, api 97.
     fn agy_windows() -> Vec<UsageWindow> {
         vec![
             window(WindowKind::FiveHour, 30.0, 14_820),
@@ -1627,6 +1641,7 @@ mod tests {
             UsageWindow::new(WindowKind::WeeklyScoped, 80.0, None)
                 .unwrap()
                 .with_source_window("Arg", None),
+            window(WindowKind::Monthly, 97.0, 518_400).with_source_window("api", None),
         ]
     }
 
@@ -1657,6 +1672,8 @@ mod tests {
         assert_eq!(neon.quota_week_scoped_severity, None);
         assert_ne!(neon.quota_5h, "");
         assert_ne!(neon.quota_week, "");
+        // `api` is shown but is another pool: 3 left there is not this limit.
+        assert!(neon.quota_month.starts_with("api"), "{neon:?}");
         assert_eq!(neon.quota_headroom, Some(55));
 
         let argon = MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("b"), row);
@@ -1665,11 +1682,45 @@ mod tests {
         assert_eq!(argon.quota_week, "");
         assert_eq!(argon.quota_headroom, Some(20));
 
+        // Orchestrator (Neon) draws the Gemini pool, never api's headroom.
+        let mut orchestrator = snapshot.clone();
+        orchestrator
+            .session_models
+            .insert("a".to_string(), "Orchestrator (Neon)".to_string());
+        let orchestrator =
+            MetadataTokens::from_snapshot_for_pane_with_row(&orchestrator, 0, Some("a"), row);
+        assert_eq!(orchestrator.quota_week_scoped, "");
+        assert_eq!(orchestrator.quota_headroom, Some(55));
+
         // The footer row an Argon pane supplies still carries every window.
         let summary = summary_style(SummaryFormat::Compact);
         let argon =
             MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("b"), summary);
         assert_eq!(argon.account.unwrap().segments.len(), 3);
+    }
+
+    /// Agy's `settings.json` is shared: `/model` in pane b rewrites it, and
+    /// pane a's identity row may show that model until a's next turn. Its
+    /// windows still came from a's own Neon observation, so no `Arg`.
+    #[test]
+    fn another_panes_model_switch_does_not_move_agy_windows() {
+        let mut snapshot = agy_two_sessions();
+        snapshot.session_seen_unix.insert("a".to_string(), 50);
+        snapshot.session_seen_unix.insert("b".to_string(), 50);
+        snapshot.settings_model = Some(("Gemini 4 Argon (High)".to_string(), 100));
+        assert_eq!(
+            snapshot.model_for_session(Some("a")),
+            Some("Gemini 4 Argon (High)")
+        );
+        let neon = MetadataTokens::from_snapshot_for_pane_with_row(
+            &snapshot,
+            0,
+            Some("a"),
+            RowStyle::default(),
+        );
+        assert_eq!(neon.quota_week_scoped, "");
+        assert_ne!(neon.quota_5h, "");
+        assert_eq!(neon.quota_headroom, Some(55));
     }
 
     #[test]

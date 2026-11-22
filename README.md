@@ -228,12 +228,14 @@ normal quota percentage instead of guessing.
 Agy's `gemini-argon-wtu-weekly` bucket uses the `week-scoped` field and the
 `Arg` label. Orchestrator models (`Orchestrator (Neon)`, `Orchestrator (Argon)`)
 count against the Gemini pool. Each pane shows the windows its model draws
-from, and only those decide its headroom, icon colour, ordering, and low-quota
-alert: an Argon pane shows `Arg` alone (5h and 7d when the account has no Argon
-bucket), `Orchestrator (Argon)` shows 5h, 7d, and `Arg`, and every other Gemini
-model shows 5h and 7d without `Arg`. The account footer shows every window of
-the latest Agy observation, whatever its model; in the `lines` footer `Arg`
-follows `7d`. After an upgrade,
+from, picked by the model of that pane's own latest observation: an Argon pane
+shows `Arg` alone (5h and 7d when the account has no Argon bucket),
+`Orchestrator (Argon)` shows 5h, 7d, and `Arg`, and every other Gemini model
+shows 5h and 7d without `Arg`. A Gemini pane still shows `api` but, as another
+pool, it never decides the pane's headroom, ordering, or low-quota alert. The
+account footer shows up to three windows of the latest Agy observation — 5h,
+7d, and `Arg` on a Gemini reading — whatever its model; in the `lines` footer
+`Arg` follows `7d`. After an upgrade,
 refresh reparses the latest stored payload immediately; other panes gain the
 new window on their next StatusLine observation.
 

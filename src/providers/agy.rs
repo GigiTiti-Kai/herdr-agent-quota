@@ -75,6 +75,12 @@ fn active_pool(model: Option<&str>) -> Option<Pool> {
     }
 }
 
+/// Whether `window` is the third-party pool a Gemini session shows as `api`.
+/// It is not what the pane's model spends, so it never decides headroom.
+pub(crate) fn is_other_pool(window: &UsageWindow) -> bool {
+    window.kind == WindowKind::Monthly && window.source_label.as_deref() == Some("api")
+}
+
 /// The windows a pane running `model` draws from, out of one observation.
 ///
 /// An Argon model has its own weekly allowance (`Arg`), so its pane shows only
