@@ -1681,6 +1681,10 @@ mod tests {
         assert_eq!(argon.quota_5h, "");
         assert_eq!(argon.quota_week, "");
         assert_eq!(argon.quota_headroom, Some(20));
+        // The row colour on an Argon pane comes from Arg alone.
+        assert!(argon.quota_week_scoped_severity.is_some(), "{argon:?}");
+        assert_eq!(argon.quota_5h_severity, None);
+        assert_eq!(argon.quota_week_severity, None);
 
         // Orchestrator (Neon) draws the Gemini pool, never api's headroom.
         let mut orchestrator = snapshot.clone();
