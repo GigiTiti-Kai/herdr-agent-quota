@@ -483,7 +483,10 @@ load bearing:
   to every pane, and it adds no writes, because it only moves when a quota
   token beside it moves anyway.
 - It is scoped to the windows the sidebar actually **shows**. A window without
-  a token never decides the sort or an alert.
+  a token never decides the sort or an alert. Agy's `api` row (the
+  third-party pool on a Gemini session) is shown but is another pool, so it
+  never decides either; an Agy pane's windows follow the model of its own
+  observation (`agy::windows_for_model`), the account footer keeps them all.
 
 **Low quota notifications** fire from both publish paths (`publish_resolved`
 and `handle_named_pane`) so a warning lands at the end of the turn that spent
