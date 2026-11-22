@@ -284,17 +284,19 @@ impl MetadataTokens {
         style: PercentStyle,
         shape: SidebarShape,
     ) -> Self {
+        let windows = if session_id.is_none() {
+            &snapshot.windows
+        } else {
+            snapshot.windows_for_session(session_id)
+        };
         Self::from_snapshot_parts(
             snapshot,
             now_unix,
             session_id,
             snapshot.model_for_session(session_id),
             snapshot.context_for_session(session_id),
-            if session_id.is_none() {
-                &snapshot.windows
-            } else {
-                snapshot.windows_for_session(session_id)
-            },
+            windows,
+            windows,
             RowStyle::new(style, shape),
         )
     }
@@ -331,18 +333,26 @@ impl MetadataTokens {
         let quota_model = snapshot.model_for_session(session_id);
         let context =
             session_id.and_then(|session_id| snapshot.context_for_session(Some(session_id)));
-        let windows = snapshot.windows_for_session(session_id);
+        let account_windows = snapshot.windows_for_session(session_id);
+        // An Agy pane shows the pool its model draws; the footer row keeps
+        // every window. No session means the account footer itself.
+        let model_windows = (snapshot.provider == Provider::Agy && session_id.is_some())
+            .then(|| crate::providers::agy::windows_for_model(quota_model, account_windows));
         Self::from_snapshot_parts(
             snapshot,
             now_unix,
             session_id,
             quota_model,
             context,
-            windows,
+            model_windows.as_deref().unwrap_or(account_windows),
+            account_windows,
             row,
         )
     }
 
+    /// `windows` feed the agent rows and headroom; `account_windows` feed the
+    /// summary footer row, which always shows the whole account.
+    #[allow(clippy::too_many_arguments)]
     fn from_snapshot_parts(
         snapshot: &ProviderSnapshot,
         now_unix: u64,
@@ -350,6 +360,7 @@ impl MetadataTokens {
         model: Option<&str>,
         context: Option<&crate::model::ContextUsage>,
         windows: &[UsageWindow],
+        account_windows: &[UsageWindow],
         row: RowStyle,
     ) -> Self {
         let style = row.percent;
@@ -494,7 +505,7 @@ impl MetadataTokens {
         if row.summary.is_on() {
             values.account = Some(account_summary(
                 AccountFamily::for_provider(snapshot.provider),
-                all_windows,
+                account_windows,
                 now_unix,
                 row,
                 None,
@@ -1607,6 +1618,76 @@ mod tests {
     }
     use super::*;
     use crate::model::{ProviderSnapshot, SessionQuotaObservation, UsageWindow};
+
+    /// One Agy observation: 5h 30 used, 7d 45 used, Arg 80 used, from `model`.
+    fn agy_windows() -> Vec<UsageWindow> {
+        vec![
+            window(WindowKind::FiveHour, 30.0, 14_820),
+            window(WindowKind::Weekly, 45.0, 518_400),
+            UsageWindow::new(WindowKind::WeeklyScoped, 80.0, None)
+                .unwrap()
+                .with_source_window("Arg", None),
+        ]
+    }
+
+    fn agy_two_sessions() -> ProviderSnapshot {
+        let mut snapshot = ProviderSnapshot::new(Provider::Agy, agy_windows(), 0)
+            .session_local()
+            .with_model(Some("Gemini 4 Argon (High)".to_string()));
+        for (session, model) in [
+            ("a", "Gemini 4 Neon (High)"),
+            ("b", "Gemini 4 Argon (High)"),
+        ] {
+            snapshot
+                .session_windows
+                .insert(session.to_string(), agy_windows());
+            snapshot
+                .session_models
+                .insert(session.to_string(), model.to_string());
+        }
+        snapshot
+    }
+
+    #[test]
+    fn agy_pane_tokens_follow_the_pane_model() {
+        let snapshot = agy_two_sessions();
+        let row = RowStyle::default();
+        let neon = MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("a"), row);
+        assert_eq!(neon.quota_week_scoped, "");
+        assert_eq!(neon.quota_week_scoped_severity, None);
+        assert_ne!(neon.quota_5h, "");
+        assert_ne!(neon.quota_week, "");
+        assert_eq!(neon.quota_headroom, Some(55));
+
+        let argon = MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("b"), row);
+        assert!(argon.quota_week_scoped.contains("Arg"), "{argon:?}");
+        assert_eq!(argon.quota_5h, "");
+        assert_eq!(argon.quota_week, "");
+        assert_eq!(argon.quota_headroom, Some(20));
+
+        // The footer row an Argon pane supplies still carries every window.
+        let summary = summary_style(SummaryFormat::Compact);
+        let argon =
+            MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("b"), summary);
+        assert_eq!(argon.account.unwrap().segments.len(), 3);
+    }
+
+    #[test]
+    fn footer_keeps_all_agy_windows_after_an_argon_observation() {
+        let snapshot = agy_two_sessions();
+        assert_eq!(
+            snapshot.model_for_session(None),
+            Some("Gemini 4 Argon (High)")
+        );
+        let account = summarised(&snapshot, 0, SummaryFormat::Compact)
+            .account
+            .unwrap();
+        let texts: Vec<&str> = account.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(texts[0].starts_with("5h"), "{texts:?}");
+        assert!(texts[1].starts_with("7d"), "{texts:?}");
+        assert!(texts[2].starts_with("Arg"), "{texts:?}");
+    }
 
     fn window(kind: WindowKind, used: f64, reset: u64) -> UsageWindow {
         UsageWindow::new(kind, used, Some(ResetAt::from_unix_seconds(reset))).unwrap()

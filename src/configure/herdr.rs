@@ -104,6 +104,8 @@ const QUOTA_WARNING_COLOR: &str = "#e4b957";
 /// `state_icon` palette so the brand glyph replaces the ring without a second
 /// circle on the row.
 const IDLE_ICON_COLOR: &str = "#e9e9f0";
+/// Footer title and reset ink: bright, undimmed, legible without a band fill.
+const FOOTER_TEXT_COLOR: &str = "#bac2de";
 const WORKING_ICON_COLOR: &str = "#f9e2af";
 const DONE_ICON_COLOR: &str = "#94e2d5";
 const BLOCKED_ICON_COLOR: &str = "#f38ba8";
@@ -1466,9 +1468,9 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
     let mut rows = Array::new();
     rows.push(Value::Array(styled_row(
         "$quota_acct_title",
-        None,
+        Some(FOOTER_TEXT_COLOR),
         Some(true),
-        Some(true),
+        Some(false),
     )));
     if summary == SummaryFormat::Lines {
         let mut gap = Array::new();
@@ -1525,9 +1527,9 @@ fn footer_rows(layout: SidebarLayout, summary: SummaryFormat) -> Array {
         }
         row.push(styled_token(
             &format!("$quota_acct_{id}_reset"),
-            None,
+            Some(FOOTER_TEXT_COLOR),
             Some(false),
-            Some(true),
+            Some(false),
         ));
         rows.push(Value::Array(row));
     }
@@ -3702,6 +3704,41 @@ mod field_tests {
                 assert!(row.len() <= 16, "{row}");
             }
             assert!(updated.contains("$quota_acct_hm_w3_danger"), "{updated}");
+        }
+    }
+
+    #[test]
+    fn footer_reset_and_title_are_bright_and_not_dim() {
+        let updated = summary_install("", SummaryFormat::Compact);
+        let document = updated.parse::<DocumentMut>().unwrap();
+        let footer = document["ui"]["sidebar"]["agents"]["footer"]
+            .as_array()
+            .unwrap();
+        let tokens: Vec<&InlineTable> = footer
+            .iter()
+            .filter_map(Value::as_array)
+            .flat_map(|row| row.iter().filter_map(Value::as_inline_table))
+            .collect();
+        let find = |name: &str| {
+            *tokens
+                .iter()
+                .find(|token| token.get("token").and_then(Value::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("{name} missing:\n{updated}"))
+        };
+        let title = find("$quota_acct_title");
+        assert_eq!(
+            title.get("fg").and_then(Value::as_str),
+            Some(FOOTER_TEXT_COLOR)
+        );
+        assert_eq!(title.get("bold").and_then(Value::as_bool), Some(true));
+        assert_eq!(title.get("dim").and_then(Value::as_bool), Some(false));
+        for id in AccountFamily::IDS {
+            let reset = find(&format!("$quota_acct_{id}_reset"));
+            assert_eq!(
+                reset.get("fg").and_then(Value::as_str),
+                Some(FOOTER_TEXT_COLOR)
+            );
+            assert_eq!(reset.get("dim").and_then(Value::as_bool), Some(false));
         }
     }
 

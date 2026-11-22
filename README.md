@@ -226,10 +226,14 @@ normal quota percentage instead of guessing.
 | Hermes Agent | A bridge plugin inside Hermes | ChatGPT/Codex sessions of the default profile only: the running session reports the limits of the key it holds. Other providers show provider, model, and topic without quota. Every session also shows its cache ratio from `state.db`, with Codex's `ttl≈` estimate on ChatGPT/Codex |
 
 Agy's `gemini-argon-wtu-weekly` bucket uses the `week-scoped` field and the
-`Arg` label. Like Claude's `Fab`, it is shown across its model family, including
-Gemini Flash, and contributes to headroom and quota ordering while visible and
-unexpired. In the `lines` footer it follows `7d`; the footer uses the latest Agy
-observation, while each pane keeps its own quota evidence. After an upgrade,
+`Arg` label. Orchestrator models (`Orchestrator (Neon)`, `Orchestrator (Argon)`)
+count against the Gemini pool. Each pane shows the windows its model draws
+from, and only those decide its headroom, icon colour, ordering, and low-quota
+alert: an Argon pane shows `Arg` alone (5h and 7d when the account has no Argon
+bucket), `Orchestrator (Argon)` shows 5h, 7d, and `Arg`, and every other Gemini
+model shows 5h and 7d without `Arg`. The account footer shows every window of
+the latest Agy observation, whatever its model; in the `lines` footer `Arg`
+follows `7d`. After an upgrade,
 refresh reparses the latest stored payload immediately; other panes gain the
 new window on their next StatusLine observation.
 
