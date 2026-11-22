@@ -19,6 +19,31 @@ use crate::model::Harness;
 pub const WORKING_TAG: &str = "\u{2061}";
 pub const DONE_TAG: &str = "\u{2060}";
 pub const BLOCKED_TAG: &str = "\u{2062}";
+/// Quota colour of an Agy pane's own pool, after any status tag. Status
+/// rules come first in the generated `rules`, and Herdr takes the first
+/// match, so working/done/blocked still win while the tag rides along.
+pub const QUOTA_WARNING_TAG: &str = "\u{2063}";
+pub const QUOTA_DANGER_TAG: &str = "\u{2064}";
+
+/// The quota tag for a severity: only warning and danger colour the icon.
+pub fn quota_tag(severity: Option<crate::model::Severity>) -> &'static str {
+    match severity {
+        Some(crate::model::Severity::Warning) => QUOTA_WARNING_TAG,
+        Some(crate::model::Severity::Danger) => QUOTA_DANGER_TAG,
+        _ => "",
+    }
+}
+
+/// The quota tag a published `$quota_icon` value carries, if any.
+pub fn quota_tag_in(value: &str) -> &'static str {
+    if value.contains(QUOTA_DANGER_TAG) {
+        QUOTA_DANGER_TAG
+    } else if value.contains(QUOTA_WARNING_TAG) {
+        QUOTA_WARNING_TAG
+    } else {
+        ""
+    }
+}
 
 /// One-cell mark for a harness.
 pub fn for_harness(harness: Harness) -> &'static str {
@@ -94,10 +119,17 @@ mod tests {
             WORKING_TAG, "\u{200c}",
             "ZWNJ extends U+E1AB and the icon font draws a replacement ?"
         );
-        assert_ne!(WORKING_TAG, DONE_TAG);
-        assert_ne!(WORKING_TAG, BLOCKED_TAG);
-        assert_ne!(DONE_TAG, BLOCKED_TAG);
-        for tag in [WORKING_TAG, DONE_TAG, BLOCKED_TAG] {
+        let tags = [
+            WORKING_TAG,
+            DONE_TAG,
+            BLOCKED_TAG,
+            QUOTA_WARNING_TAG,
+            QUOTA_DANGER_TAG,
+        ];
+        for (index, tag) in tags.iter().enumerate() {
+            assert!(!tags[index + 1..].contains(tag), "{tag:?} repeats");
+        }
+        for tag in tags {
             assert_ne!(tag, "\u{200c}");
             let marked = format!("{}{tag}", for_harness(Harness::Cursor));
             assert!(marked.starts_with('\u{e1ab}'));

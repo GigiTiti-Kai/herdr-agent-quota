@@ -202,6 +202,7 @@ Orchestrator 模型（`Orchestrator (Neon)`、`Orchestrator (Argon)`）计入 Ge
 Argon 窗格只显示 `Arg`（账号没有 Argon 额度时显示 5h 和 7d），
 `Orchestrator (Argon)` 显示 5h、7d 和 `Arg`，其他 Gemini 模型显示 5h 和 7d、不显示 `Arg`。
 Gemini 窗格仍显示 `api`，但它属于另一个额度池，不参与该窗格的剩余额度、排序和低额度提醒。
+同样的窗口决定 Agy 窗格图标的颜色：其中最紧的窗口偏低时显示黄色或红色；运行中、完成和阻塞的颜色优先（需执行 `configure --apply`）。
 账号底栏最多显示最新一次 Agy 观测的三个窗口（Gemini 观测为 5h、7d 和 `Arg`），与其模型无关；
 `lines` 底栏中 `Arg` 紧跟 `7d`。升级后 refresh 会立即
 重新解析最近一次保存的原始数据；其他窗格在下一次 StatusLine 观测后获得新窗口。

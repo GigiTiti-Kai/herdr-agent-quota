@@ -1084,7 +1084,7 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     )));
     match layout {
         SidebarLayout::Gauges => {
-            append_identity_row(rows);
+            append_identity_row(rows, layout);
             // Filled only on a nested vendor head so a single Cursor/Grok pane
             // keeps topic and context above its own 5h/7d/30d.
             append_share_window_rows(rows, layout);
@@ -1105,7 +1105,7 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
             append_pack_gap_row(rows);
         }
         SidebarLayout::Packed => {
-            append_identity_row(rows);
+            append_identity_row(rows, layout);
             rows.push(Value::Array(styled_row(
                 "$quota_topic",
                 None,
@@ -1116,7 +1116,11 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
             append_pack_gap_row(rows);
         }
         SidebarLayout::Stacked => {
-            rows.push(Value::Array(identity_cells("$quota_provider", Some(true))));
+            rows.push(Value::Array(identity_cells(
+                "$quota_provider",
+                Some(true),
+                layout,
+            )));
             rows.push(Value::Array(styled_row(
                 "$quota_model",
                 Some(IDLE_ICON_COLOR),
@@ -1144,10 +1148,11 @@ fn append_pack_gap_row(rows: &mut Array) {
     )));
 }
 
-fn append_identity_row(rows: &mut Array) {
+fn append_identity_row(rows: &mut Array, layout: SidebarLayout) {
     rows.push(Value::Array(identity_cells(
         "$quota_provider_model",
         Some(true),
+        layout,
     )));
 }
 
@@ -1157,9 +1162,9 @@ fn append_identity_row(rows: &mut Array) {
 /// identity token. A later `$quota_icon_done` twin on a Space-head row
 /// hang-indents one cell to the right. No `state_icon`: two circles on one
 /// row is what this replaces.
-fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
+fn identity_cells(name: &str, name_bold: Option<bool>, layout: SidebarLayout) -> Array {
     let mut row = Array::new();
-    row.push(identity_icon_token());
+    row.push(identity_icon_token(layout));
     row.push(styled_token(
         name,
         Some(IDLE_ICON_COLOR),
@@ -1169,7 +1174,8 @@ fn identity_cells(name: &str, name_bold: Option<bool>) -> Array {
     row
 }
 
-fn identity_icon_token() -> Value {
+fn identity_icon_token(layout: SidebarLayout) -> Value {
+    let [_, warning, danger] = severity_palette(layout);
     let mut value = InlineTable::new();
     value.insert("token", Value::from("$quota_icon"));
     value.insert("fg", Value::from(IDLE_ICON_COLOR));
@@ -1185,6 +1191,9 @@ fn identity_icon_token() -> Value {
         crate::icons::BLOCKED_TAG,
         BLOCKED_ICON_COLOR,
     ));
+    // After the status rules: Herdr takes the first match, so status wins.
+    rules.push(contains_fg_rule(crate::icons::QUOTA_DANGER_TAG, danger));
+    rules.push(contains_fg_rule(crate::icons::QUOTA_WARNING_TAG, warning));
     value.insert("rules", Value::Array(rules));
     Value::InlineTable(value)
 }
@@ -2548,7 +2557,18 @@ rows = [["state_icon", "agent"]]
                     updated.contains(&blocked_rule),
                     "{layout:?} is missing the blocked icon rule:\n{updated}"
                 );
-                let stable = updated.replace(&blocked_rule, "");
+                // Agy's quota band rules came after the digests, like blocked.
+                let quota_rules = format!(
+                    ", {{ contains = \"{}\", fg = \"{}\" }}, {{ contains = \"{}\", fg = \"{}\" }}",
+                    crate::icons::QUOTA_DANGER_TAG,
+                    QUOTA_DANGER_COLOR,
+                    crate::icons::QUOTA_WARNING_TAG,
+                    QUOTA_WARNING_COLOR
+                );
+                assert!(updated.contains(&quota_rules), "{layout:?}:\n{updated}");
+                let stable = updated
+                    .replace(&quota_rules, "")
+                    .replace(&blocked_rule, "");
                 assert_eq!(
                     format!("{:x}", Sha256::digest(stable.as_bytes())),
                     digest,
@@ -2732,7 +2752,19 @@ rows = [["state_icon", "agent"]]
             Some(IDLE_ICON_COLOR)
         );
         let rules = idle.get("rules").and_then(Value::as_array).unwrap();
-        assert_eq!(rules.len(), 3);
+        // Herdr takes the first matching rule: status before Agy's quota band.
+        assert_eq!(rules.len(), 5);
+        for (index, (tag, colour)) in [
+            (crate::icons::QUOTA_DANGER_TAG, QUOTA_DANGER_COLOR),
+            (crate::icons::QUOTA_WARNING_TAG, QUOTA_WARNING_COLOR),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rule = rules.get(3 + index).unwrap().as_inline_table().unwrap();
+            assert_eq!(rule.get("contains").and_then(Value::as_str), Some(tag));
+            assert_eq!(rule.get("fg").and_then(Value::as_str), Some(colour));
+        }
         let done = rules.get(0).unwrap().as_inline_table().unwrap();
         assert_eq!(
             done.get("contains").and_then(Value::as_str),

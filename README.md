@@ -233,6 +233,9 @@ shows `Arg` alone (5h and 7d when the account has no Argon bucket),
 `Orchestrator (Argon)` shows 5h, 7d, and `Arg`, and every other Gemini model
 shows 5h and 7d without `Arg`. A Gemini pane still shows `api` but, as another
 pool, it never decides the pane's headroom, ordering, or low-quota alert. The
+same windows colour an Agy pane's icon: yellow or red when the tightest of
+them is low, unless working, done, or blocked colours it first (after
+`configure --apply`). The
 account footer shows up to three windows of the latest Agy observation — 5h,
 7d, and `Arg` on a Gemini reading — whatever its model; in the `lines` footer
 `Arg` follows `7d`. After an upgrade,

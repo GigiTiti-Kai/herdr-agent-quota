@@ -1226,7 +1226,7 @@ fn publish_pane_tokens_inner(
         };
         let topic = display_topic(pane);
         let mut desired = match &pane_tokens.quota {
-            PaneQuotaUpdate::Replace(values) => desired_tokens(values, &topic, row.shape),
+            PaneQuotaUpdate::Replace(values) => desired_replaced(values, &topic, row.shape),
             PaneQuotaUpdate::Clear => desired_cleared_quota(pane),
             PaneQuotaUpdate::Preserve => pane.tokens.clone(),
         };
@@ -2049,9 +2049,18 @@ fn apply_group_and_icon(
             AgentStatus::Blocked => crate::icons::BLOCKED_TAG,
             _ => "",
         };
+        // An Agy pane's quota tag rides through: the full pass seeds it from
+        // the snapshot, icon-only and preserve passes keep the published one.
+        let quota = match desired.get("quota_icon") {
+            Some(value) if pane.harness == Harness::Agy => crate::icons::quota_tag_in(value),
+            _ => "",
+        };
         let glyph = crate::icons::for_harness(pane.harness);
         let reserve = crate::icons::SIDEBAR_RESERVE;
-        desired.insert("quota_icon".to_string(), format!("{glyph}{tag}{reserve}"));
+        desired.insert(
+            "quota_icon".to_string(),
+            format!("{glyph}{tag}{quota}{reserve}"),
+        );
         desired.remove("quota_icon_working");
         desired.remove("quota_icon_done");
         desired.remove(NEST_GAP_TOKEN);
@@ -2105,6 +2114,21 @@ const GROUP_GAP: &str = "\u{2800}";
 /// apart from it. Configure puts its row last in every managed layout.
 const GROUP_TAIL_TOKEN: &str = "quota_group_tail";
 const GROUP_TAIL: &str = "\u{2800}";
+
+/// [`desired_tokens`] plus an Agy pane's quota tag, seeded alone in
+/// `quota_icon`: [`apply_group_and_icon`] builds the icon around it.
+fn desired_replaced(
+    values: &MetadataTokens,
+    topic: &str,
+    shape: SidebarShape,
+) -> BTreeMap<String, String> {
+    let mut desired = desired_tokens(values, topic, shape);
+    let quota = crate::icons::quota_tag(values.quota_icon_severity);
+    if !quota.is_empty() {
+        desired.insert("quota_icon".to_string(), quota.to_string());
+    }
+    desired
+}
 
 fn desired_tokens(
     values: &MetadataTokens,
@@ -2581,8 +2605,14 @@ pub(crate) fn quota_rows_have_drifted(
     let desired_has_window = QUOTA_WINDOW_TOKEN_NAMES
         .into_iter()
         .any(|name| desired.contains_key(name));
-    let summary_drifted = plugin_quota_present(current)
-        && !summary_tokens_match(current, &desired_summary_tokens(values));
+    // Summary mode leaves an Agy pane no window row: its icon tag is then the
+    // only quota on the pane.
+    let icon_drifted = current.get("quota_icon").is_some_and(|icon| {
+        crate::icons::quota_tag_in(icon) != crate::icons::quota_tag(values.quota_icon_severity)
+    });
+    let summary_drifted = icon_drifted
+        || plugin_quota_present(current)
+            && !summary_tokens_match(current, &desired_summary_tokens(values));
     if !current_has_window {
         return summary_drifted || (desired_has_window && plugin_quota_present(current));
     }
@@ -4474,6 +4504,60 @@ mod tests {
             status: AgentStatus::Idle,
             focused: false,
         }
+    }
+
+    fn agy_icon(pane: &AgentPane, desired: &mut BTreeMap<String, String>) -> String {
+        let none = BTreeMap::new();
+        apply_group_and_icon(desired, pane, &none, &none, &none, VendorRow::Flat, None);
+        desired.get("quota_icon").cloned().unwrap_or_default()
+    }
+
+    /// An Agy pane's icon carries its own pool's band; status still wins in
+    /// config order, and an icon-only pass keeps the tag without a write.
+    #[test]
+    fn agy_icon_carries_its_quota_band_through_every_pass() {
+        use crate::icons::{QUOTA_DANGER_TAG, QUOTA_WARNING_TAG, WORKING_TAG};
+        let mut agy = group_pane("w1:p1", "001");
+        agy.harness = Harness::Agy;
+        let mut low = MetadataTokens::unavailable(Provider::Agy, "x");
+        low.quota_icon_severity = Some(crate::model::Severity::Danger);
+        low.quota_headroom = Some(1);
+        let mut full = low.clone();
+        full.quota_icon_severity = Some(crate::model::Severity::Normal);
+
+        let shape = SidebarShape::default();
+        let low_icon = agy_icon(&agy, &mut desired_replaced(&low, "", shape));
+        let full_icon = agy_icon(&agy, &mut desired_replaced(&full, "", shape));
+        assert!(low_icon.contains(QUOTA_DANGER_TAG), "{low_icon:?}");
+        assert_eq!(full_icon, crate::icons::sidebar_mark(Harness::Agy));
+        assert_ne!(low_icon, full_icon);
+
+        // Icon-only and preserve passes start from the published tokens.
+        agy.tokens
+            .insert("quota_icon".to_string(), low_icon.clone());
+        let mut again = agy.tokens.clone();
+        assert_eq!(agy_icon(&agy, &mut again), low_icon);
+        assert!(icon_tokens_match(&agy.tokens, &again));
+
+        // Working keeps both tags; the generated rules put status first.
+        let mut working = agy.clone();
+        working.status = AgentStatus::Working;
+        let icon = agy_icon(&working, &mut working.tokens.clone());
+        assert!(icon.contains(WORKING_TAG) && icon.contains(QUOTA_DANGER_TAG));
+
+        // A cleared quota drops the colour.
+        let icon = agy_icon(&agy, &mut desired_cleared_quota(&agy));
+        assert!(!icon.contains(QUOTA_DANGER_TAG) && !icon.contains(QUOTA_WARNING_TAG));
+
+        // Only Agy: another harness never carries a quota tag.
+        let mut claude = agy.clone();
+        claude.harness = Harness::Claude;
+        let icon = agy_icon(&claude, &mut desired_replaced(&low, "", shape));
+        assert_eq!(icon, crate::icons::sidebar_mark(Harness::Claude));
+
+        // An idle summary-mode pane has no window row; the tag is its drift.
+        assert!(quota_rows_have_drifted(&agy.tokens, &full, shape));
+        assert!(!quota_rows_have_drifted(&agy.tokens, &low, shape));
     }
 
     /// The tail is the last pane in the order the head is the first of; a

@@ -254,6 +254,10 @@ pub struct MetadataTokens {
     pub quota_cache_state: String,
     /// The plugin could not speak for this pane at all.
     pub quota_error: Option<String>,
+    /// Agy only: the worst band of the windows that decide this pane's
+    /// headroom, carried on `$quota_icon` as an invisible tag. Kept through
+    /// summary mode, where the window rows themselves are cleared.
+    pub quota_icon_severity: Option<Severity>,
     /// Remaining quota in the tightest window this pane knows about, as a
     /// whole percent. `None` when no window reported one.
     ///
@@ -465,6 +469,7 @@ impl MetadataTokens {
             quota_cache_ttl: sidebar_cache_ttl(cache, now_unix),
             quota_cache_state: sidebar_cache_state(cache, now_unix),
             quota_error: None,
+            quota_icon_severity: None,
             // Once any displayed Claude window is stale, there is no current
             // provider headroom to sort or use for alert recovery. Returning
             // None also preserves an already-fired low-quota alert until a
@@ -515,6 +520,27 @@ impl MetadataTokens {
             if all_windows.is_empty() && !row.summary.is_on() {
                 values.quota_error = Some(note.clone());
             }
+        }
+        // Agy only (Claude's Fab stays a row colour). Same windows as the
+        // headroom: the pane's model pool, shown fields, never Agy's only 30d
+        // row, `api`. No headroom (stale or failed) means no colour.
+        if snapshot.provider == Provider::Agy
+            && session_id.is_some()
+            && values.quota_headroom.is_some()
+        {
+            let bands = [
+                (SidebarField::FiveHour, values.quota_5h_severity),
+                (SidebarField::Week, values.quota_week_severity),
+                (SidebarField::WeekScoped, values.quota_week_scoped_severity),
+            ]
+            .into_iter()
+            .filter(|(field, _)| fields.contains(*field))
+            .filter_map(|(_, severity)| severity);
+            values.quota_icon_severity = bands.fold(None, |worst, severity| match severity {
+                Severity::Danger => Some(Severity::Danger),
+                Severity::Warning if worst != Some(Severity::Danger) => Some(Severity::Warning),
+                _ => worst,
+            });
         }
         if row.summary.is_on() {
             values.account = Some(account_summary(
@@ -571,6 +597,7 @@ impl MetadataTokens {
             quota_cache_ttl: String::new(),
             quota_cache_state: String::new(),
             quota_error: Some(reason.into().chars().take(80).collect()),
+            quota_icon_severity: None,
             quota_headroom: None,
             account: None,
         }
@@ -1661,6 +1688,48 @@ mod tests {
                 .insert(session.to_string(), model.to_string());
         }
         snapshot
+    }
+
+    /// The icon band is the pane's own pool: Arg alone on Argon, never Arg
+    /// on Neon, kept in summary mode, and never on Claude's Fab.
+    #[test]
+    fn agy_icon_severity_follows_the_pane_pool() {
+        let with_arg_used = |used: f64| {
+            let mut snapshot = agy_two_sessions();
+            for windows in snapshot.session_windows.values_mut() {
+                windows[2] = UsageWindow::new(WindowKind::WeeklyScoped, used, None)
+                    .unwrap()
+                    .with_source_window("Arg", None);
+            }
+            snapshot
+        };
+        let row = RowStyle::default();
+        let icon = |snapshot: &ProviderSnapshot, session: &str, row: RowStyle| {
+            MetadataTokens::from_snapshot_for_pane_with_row(snapshot, 0, Some(session), row)
+                .quota_icon_severity
+        };
+        let low = with_arg_used(99.0);
+        let full = with_arg_used(5.0);
+        assert_eq!(icon(&low, "b", row), Some(Severity::Danger));
+        assert_eq!(icon(&full, "b", row), None);
+        assert_eq!(icon(&agy_two_sessions(), "b", row), Some(Severity::Warning));
+        // Neon: 5h 70 left, 7d 55 left; a spent Arg is not its pool.
+        assert_eq!(icon(&low, "a", row), None);
+        // Summary mode clears the row severities, not the icon band.
+        let summary = summary_style(SummaryFormat::Compact);
+        assert_eq!(icon(&low, "b", summary), Some(Severity::Danger));
+
+        let mut claude = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![UsageWindow::new(WindowKind::WeeklyScoped, 99.0, None)
+                .unwrap()
+                .with_source_window("Fab", None)],
+            0,
+        );
+        claude
+            .session_windows
+            .insert("c".to_string(), claude.windows.clone());
+        assert_eq!(icon(&claude, "c", row), None);
     }
 
     #[test]
