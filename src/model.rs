@@ -851,6 +851,13 @@ impl ProviderSnapshot {
                 return Some(model);
             }
         }
+        self.observed_model_for_session(session_id)
+    }
+
+    /// The model named by the observation that produced this session's
+    /// windows, ignoring Agy's shared `settings.json`: another pane's `/model`
+    /// rewrites that file, so it cannot say which pool *these* windows are.
+    pub fn observed_model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
         if self.collector_disabled {
             return None;
         }

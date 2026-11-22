@@ -254,6 +254,10 @@ pub struct MetadataTokens {
     pub quota_cache_state: String,
     /// The plugin could not speak for this pane at all.
     pub quota_error: Option<String>,
+    /// Agy only: the worst band of the windows that decide this pane's
+    /// headroom, carried on `$quota_icon` as an invisible tag. Kept through
+    /// summary mode, where the window rows themselves are cleared.
+    pub quota_icon_severity: Option<Severity>,
     /// Remaining quota in the tightest window this pane knows about, as a
     /// whole percent. `None` when no window reported one.
     ///
@@ -284,17 +288,19 @@ impl MetadataTokens {
         style: PercentStyle,
         shape: SidebarShape,
     ) -> Self {
+        let windows = if session_id.is_none() {
+            &snapshot.windows
+        } else {
+            snapshot.windows_for_session(session_id)
+        };
         Self::from_snapshot_parts(
             snapshot,
             now_unix,
             session_id,
             snapshot.model_for_session(session_id),
             snapshot.context_for_session(session_id),
-            if session_id.is_none() {
-                &snapshot.windows
-            } else {
-                snapshot.windows_for_session(session_id)
-            },
+            windows,
+            windows,
             RowStyle::new(style, shape),
         )
     }
@@ -331,18 +337,32 @@ impl MetadataTokens {
         let quota_model = snapshot.model_for_session(session_id);
         let context =
             session_id.and_then(|session_id| snapshot.context_for_session(Some(session_id)));
-        let windows = snapshot.windows_for_session(session_id);
+        let account_windows = snapshot.windows_for_session(session_id);
+        // An Agy pane shows the pool the model of its own observation draws
+        // (not the shared settings model another pane's `/model` wrote); the
+        // footer row keeps every window. No session means the account footer.
+        let model_windows =
+            (snapshot.provider == Provider::Agy && session_id.is_some()).then(|| {
+                crate::providers::agy::windows_for_model(
+                    snapshot.observed_model_for_session(session_id),
+                    account_windows,
+                )
+            });
         Self::from_snapshot_parts(
             snapshot,
             now_unix,
             session_id,
             quota_model,
             context,
-            windows,
+            model_windows.as_deref().unwrap_or(account_windows),
+            account_windows,
             row,
         )
     }
 
+    /// `windows` feed the agent rows and headroom; `account_windows` feed the
+    /// summary footer row, which always shows the whole account.
+    #[allow(clippy::too_many_arguments)]
     fn from_snapshot_parts(
         snapshot: &ProviderSnapshot,
         now_unix: u64,
@@ -350,6 +370,7 @@ impl MetadataTokens {
         model: Option<&str>,
         context: Option<&crate::model::ContextUsage>,
         windows: &[UsageWindow],
+        account_windows: &[UsageWindow],
         row: RowStyle,
     ) -> Self {
         let style = row.percent;
@@ -448,12 +469,21 @@ impl MetadataTokens {
             quota_cache_ttl: sidebar_cache_ttl(cache, now_unix),
             quota_cache_state: sidebar_cache_state(cache, now_unix),
             quota_error: None,
+            quota_icon_severity: None,
             // Once any displayed Claude window is stale, there is no current
             // provider headroom to sort or use for alert recovery. Returning
             // None also preserves an already-fired low-quota alert until a
             // genuinely fresh observation can re-arm it.
             quota_headroom: if has_stale_quota {
                 None
+            } else if snapshot.provider == Provider::Agy {
+                // Agy's `api` row is another pool: shown, never the pane's limit.
+                let own: Vec<UsageWindow> = windows
+                    .iter()
+                    .filter(|window| !crate::providers::agy::is_other_pool(window))
+                    .cloned()
+                    .collect();
+                headroom(&own, fields)
             } else {
                 headroom(windows, fields)
             },
@@ -491,10 +521,31 @@ impl MetadataTokens {
                 values.quota_error = Some(note.clone());
             }
         }
+        // Agy only (Claude's Fab stays a row colour). Same windows as the
+        // headroom: the pane's model pool, shown fields, never Agy's only 30d
+        // row, `api`. No headroom (stale or failed) means no colour.
+        if snapshot.provider == Provider::Agy
+            && session_id.is_some()
+            && values.quota_headroom.is_some()
+        {
+            let bands = [
+                (SidebarField::FiveHour, values.quota_5h_severity),
+                (SidebarField::Week, values.quota_week_severity),
+                (SidebarField::WeekScoped, values.quota_week_scoped_severity),
+            ]
+            .into_iter()
+            .filter(|(field, _)| fields.contains(*field))
+            .filter_map(|(_, severity)| severity);
+            values.quota_icon_severity = bands.fold(None, |worst, severity| match severity {
+                Severity::Danger => Some(Severity::Danger),
+                Severity::Warning if worst != Some(Severity::Danger) => Some(Severity::Warning),
+                _ => worst,
+            });
+        }
         if row.summary.is_on() {
             values.account = Some(account_summary(
                 AccountFamily::for_provider(snapshot.provider),
-                all_windows,
+                account_windows,
                 now_unix,
                 row,
                 None,
@@ -546,6 +597,7 @@ impl MetadataTokens {
             quota_cache_ttl: String::new(),
             quota_cache_state: String::new(),
             quota_error: Some(reason.into().chars().take(80).collect()),
+            quota_icon_severity: None,
             quota_headroom: None,
             account: None,
         }
@@ -1607,6 +1659,159 @@ mod tests {
     }
     use super::*;
     use crate::model::{ProviderSnapshot, SessionQuotaObservation, UsageWindow};
+
+    /// One Agy Gemini observation: 5h 30 used, 7d 45, Arg 80, api 97.
+    fn agy_windows() -> Vec<UsageWindow> {
+        vec![
+            window(WindowKind::FiveHour, 30.0, 14_820),
+            window(WindowKind::Weekly, 45.0, 518_400),
+            UsageWindow::new(WindowKind::WeeklyScoped, 80.0, None)
+                .unwrap()
+                .with_source_window("Arg", None),
+            window(WindowKind::Monthly, 97.0, 518_400).with_source_window("api", None),
+        ]
+    }
+
+    fn agy_two_sessions() -> ProviderSnapshot {
+        let mut snapshot = ProviderSnapshot::new(Provider::Agy, agy_windows(), 0)
+            .session_local()
+            .with_model(Some("Gemini 4 Argon (High)".to_string()));
+        for (session, model) in [
+            ("a", "Gemini 4 Neon (High)"),
+            ("b", "Gemini 4 Argon (High)"),
+        ] {
+            snapshot
+                .session_windows
+                .insert(session.to_string(), agy_windows());
+            snapshot
+                .session_models
+                .insert(session.to_string(), model.to_string());
+        }
+        snapshot
+    }
+
+    /// The icon band is the pane's own pool: Arg alone on Argon, never Arg
+    /// on Neon, kept in summary mode, and never on Claude's Fab.
+    #[test]
+    fn agy_icon_severity_follows_the_pane_pool() {
+        let with_arg_used = |used: f64| {
+            let mut snapshot = agy_two_sessions();
+            for windows in snapshot.session_windows.values_mut() {
+                windows[2] = UsageWindow::new(WindowKind::WeeklyScoped, used, None)
+                    .unwrap()
+                    .with_source_window("Arg", None);
+            }
+            snapshot
+        };
+        let row = RowStyle::default();
+        let icon = |snapshot: &ProviderSnapshot, session: &str, row: RowStyle| {
+            MetadataTokens::from_snapshot_for_pane_with_row(snapshot, 0, Some(session), row)
+                .quota_icon_severity
+        };
+        let low = with_arg_used(99.0);
+        let full = with_arg_used(5.0);
+        assert_eq!(icon(&low, "b", row), Some(Severity::Danger));
+        assert_eq!(icon(&full, "b", row), None);
+        assert_eq!(icon(&agy_two_sessions(), "b", row), Some(Severity::Warning));
+        // Neon: 5h 70 left, 7d 55 left; a spent Arg is not its pool.
+        assert_eq!(icon(&low, "a", row), None);
+        // Summary mode clears the row severities, not the icon band.
+        let summary = summary_style(SummaryFormat::Compact);
+        assert_eq!(icon(&low, "b", summary), Some(Severity::Danger));
+
+        let mut claude = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![UsageWindow::new(WindowKind::WeeklyScoped, 99.0, None)
+                .unwrap()
+                .with_source_window("Fab", None)],
+            0,
+        );
+        claude
+            .session_windows
+            .insert("c".to_string(), claude.windows.clone());
+        assert_eq!(icon(&claude, "c", row), None);
+    }
+
+    #[test]
+    fn agy_pane_tokens_follow_the_pane_model() {
+        let snapshot = agy_two_sessions();
+        let row = RowStyle::default();
+        let neon = MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("a"), row);
+        assert_eq!(neon.quota_week_scoped, "");
+        assert_eq!(neon.quota_week_scoped_severity, None);
+        assert_ne!(neon.quota_5h, "");
+        assert_ne!(neon.quota_week, "");
+        // `api` is shown but is another pool: 3 left there is not this limit.
+        assert!(neon.quota_month.starts_with("api"), "{neon:?}");
+        assert_eq!(neon.quota_headroom, Some(55));
+
+        let argon = MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("b"), row);
+        assert!(argon.quota_week_scoped.contains("Arg"), "{argon:?}");
+        assert_eq!(argon.quota_5h, "");
+        assert_eq!(argon.quota_week, "");
+        assert_eq!(argon.quota_headroom, Some(20));
+        // The row colour on an Argon pane comes from Arg alone.
+        assert!(argon.quota_week_scoped_severity.is_some(), "{argon:?}");
+        assert_eq!(argon.quota_5h_severity, None);
+        assert_eq!(argon.quota_week_severity, None);
+
+        // Orchestrator (Neon) draws the Gemini pool, never api's headroom.
+        let mut orchestrator = snapshot.clone();
+        orchestrator
+            .session_models
+            .insert("a".to_string(), "Orchestrator (Neon)".to_string());
+        let orchestrator =
+            MetadataTokens::from_snapshot_for_pane_with_row(&orchestrator, 0, Some("a"), row);
+        assert_eq!(orchestrator.quota_week_scoped, "");
+        assert_eq!(orchestrator.quota_headroom, Some(55));
+
+        // The footer row an Argon pane supplies still carries every window.
+        let summary = summary_style(SummaryFormat::Compact);
+        let argon =
+            MetadataTokens::from_snapshot_for_pane_with_row(&snapshot, 0, Some("b"), summary);
+        assert_eq!(argon.account.unwrap().segments.len(), 3);
+    }
+
+    /// Agy's `settings.json` is shared: `/model` in pane b rewrites it, and
+    /// pane a's identity row may show that model until a's next turn. Its
+    /// windows still came from a's own Neon observation, so no `Arg`.
+    #[test]
+    fn another_panes_model_switch_does_not_move_agy_windows() {
+        let mut snapshot = agy_two_sessions();
+        snapshot.session_seen_unix.insert("a".to_string(), 50);
+        snapshot.session_seen_unix.insert("b".to_string(), 50);
+        snapshot.settings_model = Some(("Gemini 4 Argon (High)".to_string(), 100));
+        assert_eq!(
+            snapshot.model_for_session(Some("a")),
+            Some("Gemini 4 Argon (High)")
+        );
+        let neon = MetadataTokens::from_snapshot_for_pane_with_row(
+            &snapshot,
+            0,
+            Some("a"),
+            RowStyle::default(),
+        );
+        assert_eq!(neon.quota_week_scoped, "");
+        assert_ne!(neon.quota_5h, "");
+        assert_eq!(neon.quota_headroom, Some(55));
+    }
+
+    #[test]
+    fn footer_keeps_all_agy_windows_after_an_argon_observation() {
+        let snapshot = agy_two_sessions();
+        assert_eq!(
+            snapshot.model_for_session(None),
+            Some("Gemini 4 Argon (High)")
+        );
+        let account = summarised(&snapshot, 0, SummaryFormat::Compact)
+            .account
+            .unwrap();
+        let texts: Vec<&str> = account.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(texts[0].starts_with("5h"), "{texts:?}");
+        assert!(texts[1].starts_with("7d"), "{texts:?}");
+        assert!(texts[2].starts_with("Arg"), "{texts:?}");
+    }
 
     fn window(kind: WindowKind, used: f64, reset: u64) -> UsageWindow {
         UsageWindow::new(kind, used, Some(ResetAt::from_unix_seconds(reset))).unwrap()

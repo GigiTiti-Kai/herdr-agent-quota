@@ -197,9 +197,14 @@ Claude 状态栏节奏是独立开关，默认开启以保持升级前行为；�
 | Hermes Agent | Hermes 进程内的 bridge 插件 | 仅限默认 profile 的 ChatGPT/Codex 会话：由运行中的会话报告它所持密钥的额度。其他 provider 只显示 provider、模型和主题，不显示额度。所有会话都会显示来自 `state.db` 的缓存命中率，ChatGPT/Codex 会话另有 Codex 的 `ttl≈` 估算 |
 
 Agy 的 `gemini-argon-wtu-weekly` 使用 `week-scoped` 字段，标签为 `Arg`。
-与 Claude 的 `Fab` 一样，它在整个 Gemini 模型系列（包括 Flash）中显示，
-可见且未过期时参与剩余额度和排序计算。`lines` 底栏中它紧跟 `7d`；
-底栏采用最新的 Agy 观测，各窗格仍保留自己的额度证据。升级后 refresh 会立即
+Orchestrator 模型（`Orchestrator (Neon)`、`Orchestrator (Argon)`）计入 Gemini 额度池。
+每个窗格只显示其模型所用的窗口，模型取自该窗格自己最近一次的观测：
+Argon 窗格只显示 `Arg`（账号没有 Argon 额度时显示 5h 和 7d），
+`Orchestrator (Argon)` 显示 5h、7d 和 `Arg`，其他 Gemini 模型显示 5h 和 7d、不显示 `Arg`。
+Gemini 窗格仍显示 `api`，但它属于另一个额度池，不参与该窗格的剩余额度、排序和低额度提醒。
+同样的窗口决定 Agy 窗格图标的颜色：其中最紧的窗口偏低时显示黄色或红色；运行中、完成和阻塞的颜色优先（需执行 `configure --apply`）。
+账号底栏最多显示最新一次 Agy 观测的三个窗口（Gemini 观测为 5h、7d 和 `Arg`），与其模型无关；
+`lines` 底栏中 `Arg` 紧跟 `7d`。升级后 refresh 会立即
 重新解析最近一次保存的原始数据；其他窗格在下一次 StatusLine 观测后获得新窗口。
 
 Claude Code 状态栏始终保留用户自己的 statusLine 输出。**StatusLine pace** 默认开启以保持现有行为；

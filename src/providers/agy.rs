@@ -46,7 +46,8 @@ impl Pool {
 
 /// Detect which quota pool the active model draws from.
 ///
-/// Gemini-family model names contain `gemini`, `flash`, `learnlm`, or `argon`.
+/// Gemini-family model names contain `gemini`, `flash`, `learnlm`, `argon`,
+/// or `orchestrator` (Agy's `Orchestrator (Neon)` / `Orchestrator (Argon)`).
 /// Third-party model names include Claude variants (`claude`, `sonnet`,
 /// `haiku`, `opus`), GPT models, and OpenAI reasoning series (`o1`, `o3`,
 /// `o4`). Unknown names require an unambiguous single-pool response.
@@ -56,6 +57,7 @@ fn active_pool(model: Option<&str>) -> Option<Pool> {
         || lower.contains("flash")
         || lower.contains("learnlm")
         || lower.contains("argon")
+        || lower.contains("orchestrator")
     {
         Some(Pool::Gemini)
     } else if lower.contains("claude")
@@ -70,6 +72,34 @@ fn active_pool(model: Option<&str>) -> Option<Pool> {
         Some(Pool::ThirdParty)
     } else {
         None
+    }
+}
+
+/// Whether `window` is the third-party pool a Gemini session shows as `api`.
+/// It is not what the pane's model spends, so it never decides headroom.
+pub(crate) fn is_other_pool(window: &UsageWindow) -> bool {
+    window.kind == WindowKind::Monthly && window.source_label.as_deref() == Some("api")
+}
+
+/// The windows a pane running `model` draws from, out of one observation.
+///
+/// An Argon model has its own weekly allowance (`Arg`), so its pane shows only
+/// that, unless the account has no Argon bucket (then Argon counts against the
+/// Gemini pool). `Orchestrator (Argon)` plans on Argon and runs on another
+/// Gemini model, so it keeps every window. Any other Gemini model drops `Arg`.
+/// The account footer never goes through this: it shows every window.
+pub(crate) fn windows_for_model(model: Option<&str>, windows: &[UsageWindow]) -> Vec<UsageWindow> {
+    let is_arg = |window: &UsageWindow| window.source_label.as_deref() == Some("Arg");
+    let lower = model.unwrap_or_default().to_ascii_lowercase();
+    let argon = lower.contains("argon");
+    if argon && lower.contains("orchestrator") {
+        windows.to_vec()
+    } else if argon && windows.iter().any(is_arg) {
+        windows.iter().filter(|w| is_arg(w)).cloned().collect()
+    } else if !argon && matches!(active_pool(model), Some(Pool::Gemini)) {
+        windows.iter().filter(|w| !is_arg(w)).cloned().collect()
+    } else {
+        windows.to_vec()
     }
 }
 
@@ -629,6 +659,77 @@ mod tests {
             0
         )
         .is_err());
+    }
+
+    #[test]
+    fn orchestrator_names_draw_from_the_gemini_pool() {
+        for model in [
+            "Orchestrator (Neon)",
+            "Orchestrator (Argon)",
+            "Orchestrator",
+        ] {
+            let value = json!({
+                "model": {"display_name": model},
+                "quota": {
+                    "gemini-5h": {"remaining_fraction": 0.7},
+                    "gemini-weekly": {"remaining_fraction": 0.6},
+                    "gemini-argon-wtu-weekly": {"remaining_fraction": 0.5},
+                    "3p-5h": {"remaining_fraction": 0.4},
+                    "3p-weekly": {"remaining_fraction": 0.3}
+                }
+            });
+            let snapshot = parse_statusline(&value, 0).unwrap();
+            assert_remaining_pct(&snapshot, WindowKind::FiveHour, 70.0);
+            assert_remaining_pct(&snapshot, WindowKind::Weekly, 60.0);
+            assert_remaining_pct(&snapshot, WindowKind::WeeklyScoped, 50.0);
+        }
+    }
+
+    fn labels(windows: &[UsageWindow]) -> Vec<&str> {
+        windows.iter().map(UsageWindow::display_label).collect()
+    }
+
+    #[test]
+    fn windows_for_model_picks_the_pool_the_model_draws() {
+        let windows = [
+            UsageWindow::new(WindowKind::FiveHour, 10.0, None).unwrap(),
+            UsageWindow::new(WindowKind::Weekly, 20.0, None).unwrap(),
+            UsageWindow::new(WindowKind::WeeklyScoped, 30.0, None)
+                .unwrap()
+                .with_source_window("Arg", None),
+            UsageWindow::new(WindowKind::Monthly, 40.0, None)
+                .unwrap()
+                .with_source_window("api", None),
+        ];
+        let all = ["5h", "7d", "Arg", "api"];
+        for (model, expected) in [
+            (Some("Gemini 4 Argon (High)"), &["Arg"][..]),
+            (Some("Orchestrator (Argon)"), &all[..]),
+            (Some("Gemini 4 Neon (High)"), &["5h", "7d", "api"][..]),
+            (Some("Gemini 4 Hydrogen (High)"), &["5h", "7d", "api"][..]),
+            (Some("Gemini 3.8 Flash (High)"), &["5h", "7d", "api"][..]),
+            (Some("Orchestrator (Neon)"), &["5h", "7d", "api"][..]),
+            (Some("Claude Opus 5.5 (High)"), &all[..]),
+            (None, &all[..]),
+        ] {
+            assert_eq!(
+                labels(&windows_for_model(model, &windows)),
+                expected,
+                "{model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn argon_pane_without_arg_bucket_keeps_gemini_windows() {
+        let windows = [
+            UsageWindow::new(WindowKind::FiveHour, 10.0, None).unwrap(),
+            UsageWindow::new(WindowKind::Weekly, 20.0, None).unwrap(),
+        ];
+        assert_eq!(
+            labels(&windows_for_model(Some("Gemini 4 Argon (High)"), &windows)),
+            ["5h", "7d"]
+        );
     }
 
     fn assert_remaining_pct(snapshot: &ProviderSnapshot, kind: WindowKind, expected: f64) {

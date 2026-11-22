@@ -462,7 +462,11 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    by sidebar `rules`, not a later twin token — a later `$quota_icon_done`
    hang-indents one cell under the Space name. Colour replaces Herdr's `state_icon`
    ring: yellow while working, teal for an unseen completion, white after
-   focusing that pane or moving focus away from it. Do not trust CLI `agent_status` for the teal
+   focusing that pane or moving focus away from it. An Agy pane's icon also
+   carries a quota tag (`icons::quota_tag`, the worst band of the windows that
+   decide its headroom); its rules follow the status rules, and Herdr takes the
+   first match, so status still wins. Icon-only passes keep the published tag.
+   Do not trust CLI `agent_status` for the teal
    step — same-tab siblings finish as server `idle` while the TUI ring is
    still teal. Persist working/unseen pane ids in plugin state
    (`icon-attention.json`) and never call `herdr pane current` from
@@ -483,7 +487,10 @@ load bearing:
   to every pane, and it adds no writes, because it only moves when a quota
   token beside it moves anyway.
 - It is scoped to the windows the sidebar actually **shows**. A window without
-  a token never decides the sort or an alert.
+  a token never decides the sort or an alert. Agy's `api` row (the
+  third-party pool on a Gemini session) is shown but is another pool, so it
+  never decides either; an Agy pane's windows follow the model of its own
+  observation (`agy::windows_for_model`), the account footer keeps them all.
 
 **Low quota notifications** fire from both publish paths (`publish_resolved`
 and `handle_named_pane`) so a warning lands at the end of the turn that spent
