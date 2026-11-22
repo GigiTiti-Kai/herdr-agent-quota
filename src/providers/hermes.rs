@@ -543,7 +543,8 @@ pub(crate) mod testing {
     use serde_json::{json, Value};
     use std::fs::{self, File, OpenOptions};
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     pub const IDENTITY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -560,9 +561,28 @@ pub(crate) mod testing {
         })
     }
 
+    /// A test producer's held lock. flock is shared across fork, and a child
+    /// that a parallel test spawns keeps a copy of this fd until its exec, so
+    /// closing it alone can leave the lock held for a moment. Dropping waits
+    /// (up to 5 s) until a reader sees the producer gone.
+    pub struct Producer {
+        lock: Option<File>,
+        path: PathBuf,
+    }
+
+    impl Drop for Producer {
+        fn drop(&mut self) {
+            drop(self.lock.take());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while super::files::producer_is_alive(&self.path) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
     /// Write a record the way the producer does, and hold its lock. Dropping
-    /// the returned file is the producer going away.
-    pub fn write(state: &Path, session_id: &str, record: &Value) -> File {
+    /// the returned producer is the producer going away.
+    pub fn write(state: &Path, session_id: &str, record: &Value) -> Producer {
         let directory = state.join(MAILBOX_DIR);
         fs::create_dir_all(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -572,11 +592,13 @@ pub(crate) mod testing {
         options.write(true).create(true).truncate(true).mode(0o600);
         let file = options.open(&path).unwrap();
         serde_json::to_writer(file, record).unwrap();
-        let lock = options
-            .open(directory.join(format!("{session_id}.lock")))
-            .unwrap();
+        let path = directory.join(format!("{session_id}.lock"));
+        let lock = options.open(&path).unwrap();
         lock.try_lock().expect("the test producer takes its lock");
-        lock
+        Producer {
+            lock: Some(lock),
+            path,
+        }
     }
 }
 
