@@ -5,12 +5,15 @@
 use herdr_agent_quota::cache::CacheStore;
 use herdr_agent_quota::model::Provider;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 /// The `quota_icon` value one `refresh --provider agy` reports for an idle
-/// Argon pane whose Arg bucket has `arg_left` of 1 left.
+/// Argon pane whose Arg bucket has `arg_left` of 1 left. A second refresh
+/// over the published tokens must report nothing: a tagged icon that is
+/// rewritten every pass would repaint the pane every pass.
 fn published_icon(arg_left: f64) -> String {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -43,39 +46,59 @@ esac
     )
     .unwrap();
     fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
-    fs::write(
-        root.join("inventory.json"),
-        serde_json::to_vec(&json!({"result":{"agents":[{
-            "agent":"agy", "pane_id":"w1:p1", "agent_status":"idle", "tokens":{}
-        }]}}))
-        .unwrap(),
-    )
-    .unwrap();
-    fs::write(root.join("config.toml"), "").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
-        .args(["refresh", "--provider", "agy"])
-        .env("HERDR_PLUGIN_STATE_DIR", root)
-        .env("HERDR_PLUGIN_CONFIG_DIR", root)
-        .env("HERDR_BIN_PATH", root.join("herdr"))
-        .env("HERDR_CONFIG_FILE", root.join("config.toml"))
-        .env("HERDR_SOCKET_PATH", root.join("herdr.sock"))
-        .env("XDG_STATE_HOME", root.join("xdg-state"))
-        .env("HERDR_AGENT_QUOTA_AGENTS", "agy")
-        .env("TEST_INVENTORY", root.join("inventory.json"))
-        .env("TEST_REPORT", root.join("report"))
-        .output()
+    let refresh = |tokens: &BTreeMap<String, String>| {
+        fs::write(
+            root.join("inventory.json"),
+            serde_json::to_vec(&json!({"result":{"agents":[{
+                "agent":"agy", "pane_id":"w1:p1", "agent_status":"idle", "tokens":tokens
+            }]}}))
+            .unwrap(),
+        )
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report = fs::read_to_string(root.join("report")).unwrap_or_default();
-    report
-        .lines()
-        .find_map(|line| line.strip_prefix("quota_icon="))
+        fs::write(root.join("report"), "").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-usage"))
+            .args(["refresh", "--provider", "agy"])
+            .env("HERDR_PLUGIN_STATE_DIR", root)
+            .env("HERDR_PLUGIN_CONFIG_DIR", root)
+            .env("HERDR_BIN_PATH", root.join("herdr"))
+            .env("HERDR_CONFIG_FILE", root.join("config.toml"))
+            .env("HERDR_SOCKET_PATH", root.join("herdr.sock"))
+            .env("XDG_STATE_HOME", root.join("xdg-state"))
+            .env("HERDR_AGENT_QUOTA_AGENTS", "agy")
+            .env("TEST_INVENTORY", root.join("inventory.json"))
+            .env("TEST_REPORT", root.join("report"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(root.join("report")).unwrap()
+    };
+    fs::write(root.join("config.toml"), "").unwrap();
+    let report = refresh(&BTreeMap::new());
+    let args: Vec<_> = report.lines().collect();
+    let mut tokens = BTreeMap::new();
+    for pair in args.windows(2) {
+        match pair[0] {
+            "--token" => {
+                let (name, value) = pair[1].split_once('=').unwrap();
+                tokens.insert(name.to_string(), value.to_string());
+            }
+            "--clear-token" => {
+                tokens.remove(pair[1]);
+            }
+            _ => {}
+        }
+    }
+    let icon = tokens
+        .get("quota_icon")
         .unwrap_or_else(|| panic!("no quota_icon in the report:\n{report}"))
-        .to_string()
+        .clone();
+    let again = refresh(&tokens);
+    assert!(again.is_empty(), "second pass rewrote the pane:\n{again}");
+    icon
 }
 
 #[test]
